@@ -37,7 +37,7 @@
 [状态: 待消化]
 标签：后端 / API / 数据结构
 检索关键词：ResearchRequest, StructuredReport
-回答：输入是 `ResearchRequest`，主要包含 query、max_researchers、max_results_per_researcher、search_provider 和 seed。输出是 `StructuredReport`，里面有 brief、plan、answer、claims、findings、sources、citation_check、cost、metrics 和 trace_events。这样做是为了让报告可展示，过程也可调试。
+回答：输入是 `ResearchRequest`，主要包含 query、max_researchers、max_results_per_researcher、llm_provider、search_provider 和 seed。输出是 `StructuredReport`，里面有 brief、plan、answer、claims、findings、sources、citation_check、cost、metrics 和 trace_events。这样做是为了让报告可展示，过程也可调试。
 关联模块：`schemas.py`, `api.py`
 可追问：
 1. 为什么输出 trace_events？
@@ -48,7 +48,7 @@
 [状态: 待消化]
 标签：工程化 / 可复现
 检索关键词：Quickstart, mock provider, benchmark
-回答：默认 provider 是 mock，不需要 API key；README 用 `py -3.11 -m deepresearch_agent.cli` 这种不依赖 PATH 的命令。测试用 `py -3.11 -m pytest -q`，benchmark 用固定 seed 和 `data/benchmark_cases.jsonl`，输出到 `logs/` 和 `results/`。
+回答：默认 LLM 和 search 都是 mock，不需要 API key；README 用 `py -3.11 -m deepresearch_agent.cli` 这种不依赖 PATH 的命令。测试用 `py -3.11 -m pytest -q`，benchmark 用固定 seed 和 `data/benchmark_cases.jsonl`，输出到 `logs/` 和 `results/`。如果要跑真实 LLM，就显式传 `--llm-provider deepseek`，并只从环境变量 `DEEPSEEK_API_KEY` 读取 key。
 关联模块：`README.md`, `benchmark.py`, `data/benchmark_cases.jsonl`
 可追问：
 1. 为什么不用默认 Python 3.14？
@@ -61,7 +61,7 @@
 [状态: 待消化]
 标签：Planner / Agent
 检索关键词：planner, subquestion, research brief
-回答：Planner 接收 `ResearchBrief`，输出一组 `SubQuestion`。当前实现放在 `MockLLMProvider.plan`，会稳定生成背景、实现证据、取舍风险三类问题，目的是让后续 researcher 可以并发执行，并且每个子问题都有 rationale。
+回答：Planner 接收 `ResearchBrief`，输出一组 `SubQuestion`。默认 `MockLLMProvider.plan` 会稳定生成背景、实现证据、取舍风险三类问题；显式启用 DeepSeek 时，`DeepSeekLLMProvider.plan` 会用 JSON mode 输出同一套 Pydantic schema。这样后续 researcher 可以并发执行，并且每个子问题都有 rationale。
 关联模块：`llm.py`, `schemas.py`
 可追问：
 1. 为什么 planner 输出要结构化？
@@ -94,7 +94,7 @@
 [状态: 待消化]
 标签：Planner / 局限
 检索关键词：mock planner, limitation
-回答：当前 Planner 是 deterministic mock，不会真正理解领域，也不会根据搜索中间结果改 plan。这个选择是为了让测试和 benchmark 可复现。真实版本应该换成支持 structured output 的 LLM provider，并把 planner 输出 schema 固定住。
+回答：默认 Planner 是 deterministic mock，主要用于离线测试和 mock benchmark；DeepSeek Planner 已经实测能输出合法 JSON 并通过 Pydantic schema。当前局限不是“没有真实 LLM”，而是 planner 还不会根据搜索中间结果动态改 plan，也没有单独的 planner 质量评测集。
 关联模块：`llm.py`
 可追问：
 1. 如何防止 LLM planner 输出非法 JSON？
@@ -129,7 +129,7 @@
 [状态: 待消化]
 标签：Search / Adapter
 检索关键词：WikipediaSearchAdapter, real search
-回答：当前真实 adapter 是 `WikipediaSearchAdapter`，调用 Wikipedia Search API，不需要 API key。我实测过 `--search-provider wikipedia` 可以跑通，`fallback_count=0`。它的定位是证明工具层有真实外部 adapter，不是最终生产级搜索。
+回答：当前真实 adapter 是 `WikipediaSearchAdapter`，调用 Wikipedia Search API，不需要 API key。我实测过 DeepSeek + Wikipedia benchmark，最终 `fallback_count_total=0`。中间踩过一个坑：LLM planner 生成的长自然语言子问题会让 Wikipedia 返回空结果或超时，所以我加了 query candidate 压缩，先把长问题压成关键词查询。
 关联模块：`search.py`
 可追问：
 1. 为什么不用 Tavily？
@@ -232,7 +232,7 @@
 [状态: 待消化]
 标签：Synthesizer / Report
 检索关键词：synthesis, cited report
-回答：Synthesizer 接收 findings 和 sources，生成 markdown report、claims 和 sources 列表。当前实现是 mock 模板化生成，重点是每条 claim 都带 `[Sx]`，方便 citation checker 逐条验证。
+回答：Synthesizer 接收 findings 和 sources，生成 markdown report、claims 和 sources 列表。默认 mock synthesis 用模板保证测试稳定；DeepSeek synthesis 已经接入 JSON mode，要求模型输出 answer 和结构化 claims，并且每条 factual claim 使用输入 sources 中已有的 `[Sx]`。
 关联模块：`llm.py`
 可追问：
 1. 为什么 claim 要单独返回？
@@ -254,7 +254,7 @@
 [状态: 待消化]
 标签：Mock / 限制
 检索关键词：mock synthesis, deterministic
-回答：这是我有意的 MVP 取舍。当前重点是验证 pipeline、trace、cost、citation，不是展示自然语言写作能力。模板化输出让 tests 和 benchmark 稳定，真实写作质量要等接入真实 LLM 后再评测。
+回答：默认 mock 报告仍然比较模板化，这是为了保证离线测试和 mock plumbing benchmark 稳定。真实写作路径已经接入 DeepSeek，但我不会把它说成完全解决了幻觉，因为现在主要靠 prompt 约束和后置 lexical citation checker，还没有 LLM judge 或语义 entailment。
 关联模块：`llm.py`
 可追问：
 1. 面试时会不会被认为太简单？
@@ -300,7 +300,7 @@
 [状态: 待消化]
 标签：评测 / Citation
 检索关键词：citation_retention_rate
-回答：它是 supported_claims / total_claims。当前 benchmark 5 条 case 的平均 citation_retention_rate 是 1.0，因为 mock sources 和 mock synthesis 是为可复现验证设计的。这个指标不能代表真实 LLM 场景，只代表当前 pipeline 的引用链路没断。
+回答：它是 supported_claims / total_claims。mock benchmark 的平均 retention 是 1.0，只说明 mock 引用链路没断；DeepSeek + Wikipedia 真实 provider benchmark 的平均 retention 是 0.7494，5 条里有 2 条没有达到当前 success 条件。这个指标仍是 lexical overlap，不等于完整语义事实校验。
 关联模块：`citation.py`, `benchmark.py`, `results/benchmark_summary.json`
 可追问：
 1. 1.0 是否说明没有幻觉？
@@ -346,7 +346,7 @@
 [状态: 待消化]
 标签：成本控制 / Token
 检索关键词：CostTracker, token accounting
-回答：`CostTracker` 按阶段记录 input_tokens、output_tokens 和 estimated_cost_usd。当前阶段包括 brief_generation、planning、synthesis。mock provider 成本是 0，token 用字符数近似估算。
+回答：`CostTracker` 按阶段记录 input_tokens、output_tokens 和 estimated_cost_usd。当前阶段包括 brief_generation、planning、synthesis。mock provider 成本是 0，token 用字符数近似估算；DeepSeek provider 会读取 API 返回的 `prompt_tokens` / `completion_tokens`，并按官方价格估算成本。
 关联模块：`cost.py`, `llm.py`
 可追问：
 1. 真实 provider 的 usage 怎么接？
@@ -357,7 +357,7 @@
 [状态: 待消化]
 标签：成本控制 / 可观测性
 检索关键词：stage cost, attribution
-回答：多 Agent 系统里只知道总 token 没有太大调优价值。按阶段归因后，才能知道成本主要花在 planning、research compression 还是 synthesis。当前 benchmark 记录了每次 run 的 total_tokens，后续接真实 LLM 时可以直接换成 provider usage。
+回答：多 Agent 系统里只知道总 token 没有太大调优价值。按阶段归因后，才能知道成本主要花在 brief、planning 还是 synthesis。DeepSeek 单条验证里，synthesis 成本最高；真实 DeepSeek + Wikipedia benchmark 总 token 是 14281，总成本估算是 0.0082474 美元。
 关联模块：`cost.py`, `benchmark.py`
 可追问：
 1. researcher 的搜索成本怎么计？
@@ -390,7 +390,7 @@
 [状态: 待消化]
 标签：Benchmark / 评测
 检索关键词：benchmark, latency, token, citation
-回答：`benchmark.py` 记录 seed、配置快照、case_id、query、latency_ms、total_tokens、estimated_cost_usd、deduped_source_count、raw_search_result_count、citation_retention_rate、success、fallback_count 和 output_summary。当前 benchmark 是 mock plumbing smoke test：latency 只看本机管线有没有异常变慢，不能当真实 DeepResearch 性能；token 是字符估算；cost 为 0 是 mock 单价；citation 1.0 只说明当前引用链路没断。
+回答：`benchmark.py` 记录 seed、配置快照、case_id、query、latency_ms、total_tokens、estimated_cost_usd、deduped_source_count、raw_search_result_count、citation_retention_rate、success、fallback_count 和 output_summary。现在有两类数据：mock plumbing run 只证明离线路径和记录链路；DeepSeek + Wikipedia run 是真实 provider 小样本，5 条 case 成功 3 条、fallback 0、total_tokens 14281、总成本 0.0082474 美元、平均 citation_retention_rate 0.7494。
 关联模块：`benchmark.py`, `results/benchmark_summary.json`
 可追问：
 1. 为什么只 5 条 case？
@@ -447,7 +447,7 @@
 [状态: 待消化]
 标签：局限 / 诚实表达
 检索关键词：limitations, real LLM, semantic evaluation
-回答：最大短板是还没有接真实 LLM provider，synthesis 和 planner 都是 mock，所以自然语言质量和真实 token/cost 未实测。另外 citation checker 只是 lexical overlap，不能代表完整事实校验。我会在面试里主动说清楚：当前完成的是可运行后端骨架和评测闭环，不把未实测能力说成已完成。
+回答：最大短板已经不是“完全没有真实 LLM”，而是只接了 DeepSeek 一个 provider，真实 benchmark 也只有 5 条小样本；Wikipedia 不是生产级搜索，citation checker 只是 lexical overlap，不能代表完整事实校验。我会在面试里主动说清楚：真实 provider 路径和 cost usage 已经跑通，但质量评测和生产化还没有完成。
 关联模块：`llm.py`, `citation.py`, `KNOWLEDGE_BASE.md`
 可追问：
 1. 下一步先补哪个？

@@ -1,12 +1,12 @@
 # 0 项目一句话介绍
 
-本项目是我从空仓库开始手写的一个收窄版 DeepResearch Agent，目标不是复刻大而全的 open_deep_research，而是把「问题澄清、research brief、并发 researcher、来源去重、带引用合成、citation check、trace 和 benchmark」这条主链路做干净。它解决的是普通 RAG 一次性检索后直接回答时，难以解释检索路径、引用是否支撑论断、工具失败如何降级的问题。当前版本默认使用 mock model 和 mock search，保证无 API key 也能一条命令跑通；同时实现了 Wikipedia 真实检索 adapter，用来证明工具层不是纯 mock。这个项目体现的 Agent 后端能力主要是多阶段编排、并发工具调用、失败兜底、可观测性、成本归因和可复现评测。
+本项目是我从空仓库开始手写的一个收窄版 DeepResearch Agent，目标不是复刻大而全的 open_deep_research，而是把「问题澄清、research brief、并发 researcher、来源去重、带引用合成、citation check、trace 和 benchmark」这条主链路做干净。它解决的是普通 RAG 一次性检索后直接回答时，难以解释检索路径、引用是否支撑论断、工具失败如何降级的问题。当前版本默认使用 mock LLM 和 mock search，保证无 API key 也能一条命令跑通；同时已经接入 DeepSeek 真实 LLM provider 和 Wikipedia 真实检索 adapter，用显式参数切换并记录真实 usage/cost。这个项目体现的 Agent 后端能力主要是多阶段编排、并发工具调用、失败兜底、可观测性、成本归因和可复现评测。
 
 # 1 岗位匹配
 
 我做这个项目时刻意对齐 Agent 后端 / LLM 应用岗，而不是做一个只会调用 LLM 的 demo。JD 里常见的 LangGraph、RAG、MCP、并发、可观测性、评测这些关键词，在本项目里对应到清晰的工程模块：`orchestrator.py` 做轻量编排，`rag.py` 做本地 keyword RAG，`search.py` 做工具 adapter、重试、超时、熔断和降级，`tracing.py` 和 `cost.py` 做观测和成本归因，`benchmark.py` 做可复现评测。
 
-我没有在 MVP 阶段强行接真实 LLM provider，因为本地没有 API key 时这会阻塞项目主线。最终选择是先把 provider 抽象和结构化输出能力边界写出来，用 `MockLLMProvider` 保证测试和 benchmark 可复现；真实 OpenAI/Anthropic provider 作为 v2 扩展。
+我在第一阶段没有强行让默认路径依赖真实 LLM provider，因为没有 API key 时会阻塞陌生人 clone 运行。最终选择是默认保留 `MockLLMProvider` 做可复现测试和 mock plumbing benchmark；当环境变量 `DEEPSEEK_API_KEY` 存在时，可以显式启用 `DeepSeekLLMProvider` 跑真实 structured output、synthesis、token usage 和 cost。OpenAI/Anthropic 等其他 provider 仍作为 v2 扩展。
 
 # 2 总体架构
 
@@ -20,11 +20,11 @@ Agent 编排层：`src/deepresearch_agent/orchestrator.py`。输入是用户 que
 
 评测层：`src/deepresearch_agent/benchmark.py`、`data/benchmark_cases.jsonl`、`tests/`。benchmark 固定 seed 和配置快照，记录 latency、tokens、cost、source count、citation retention、success。
 
-可观测层：`src/deepresearch_agent/tracing.py`、`src/deepresearch_agent/cost.py`。Trace 每阶段写 JSONL，Cost 按 brief_generation、planning、synthesis 估算 token 和 mock 成本。
+可观测层：`src/deepresearch_agent/tracing.py`、`src/deepresearch_agent/cost.py`。Trace 每阶段写 JSONL，Cost 按 brief_generation、planning、synthesis 归因 token 和成本；mock 路径仍是字符数近似，DeepSeek 路径使用 provider 返回的真实 usage。
 
 # 3 核心流程
 
-完整链路是：用户问题进入 `ResearchRequest` 后，`MockLLMProvider.create_brief` 先做 normalize 和 research brief；`plan` 生成 3 个子问题；`orchestrator` 用 `asyncio.gather` 并发启动 2 到 3 个 researcher；每个 researcher 同时拿 search 和 local RAG 的来源，做 dedup 和 verifier；全局再做一次 source dedup 并分配 `S1`、`S2` 这样的引用 ID；`synthesize` 生成带引用的报告；`CitationChecker` 对每条 claim 的 citation ID 和 source text 做词重叠校验；最后返回结构化报告，同时写 trace log 和 cost summary。
+完整链路是：用户问题进入 `ResearchRequest` 后，配置化 LLM provider 先做 normalize 和 research brief；`plan` 生成子问题；`orchestrator` 用 `asyncio.gather` 并发启动 2 到 3 个 researcher；每个 researcher 同时拿 search 和 local RAG 的来源，做 dedup 和 verifier；全局再做一次 source dedup 并分配 `S1`、`S2` 这样的引用 ID；`synthesize` 生成带引用的报告；`CitationChecker` 对每条 claim 的 citation ID 和 source text 做词重叠校验；最后返回结构化报告，同时写 trace log 和 cost summary。默认 provider 是 mock；显式传 `--llm-provider deepseek` 时 brief、plan 和 synthesis 都由 DeepSeek JSON mode 生成。
 
 # 4 关键设计决策
 
@@ -84,9 +84,9 @@ Agent 编排层：`src/deepresearch_agent/orchestrator.py`。输入是用户 que
 
 # 5 实现细节
 
-Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。当前 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题。局限是没有真实 LLM 推理，也不会根据领域动态改变 plan。
+Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。局限是 planner 还不会根据 researcher 中间结果动态追加子问题。
 
-DeepSeek Planner 验证：`src/deepresearch_agent/llm.py` 里新增了 `DeepSeekLLMProvider.plan`，只用于步骤 1 的结构化输出验证；`create_brief` 和 `synthesize` 仍保持 `NotImplementedError`，避免在没验证 synthesis 前误接端到端。验证脚本是 `src/deepresearch_agent/validate_deepseek_structured_output.py`，它从环境变量读取 `DEEPSEEK_API_KEY`，用 JSON mode 请求 `deepseek-chat`，并用现有 `SubQuestion` Pydantic schema 解析输出。
+DeepSeek Planner 验证：`src/deepresearch_agent/llm.py` 里新增了 `DeepSeekLLMProvider.plan`，第一步先独立验证结构化输出；验证脚本是 `src/deepresearch_agent/validate_deepseek_structured_output.py`，它从环境变量读取 `DEEPSEEK_API_KEY`，用 JSON mode 请求 `deepseek-chat`，并用现有 `SubQuestion` Pydantic schema 解析输出。后续步骤再把同一个 provider 扩展到 `create_brief` 和 `synthesize`，避免一次性接太多导致错误边界不清。
 
 DeepSeek Synthesizer 接入：步骤 2 以后，`DeepSeekLLMProvider.create_brief`、`plan`、`synthesize` 都走 DeepSeek JSON mode。CLI 和 API 可以通过 `llm_provider="deepseek"` 或 CLI 参数 `--llm-provider deepseek` 显式启用；默认仍是 mock，保证离线测试不受 API key 影响。当前 synthesis 要求模型输出 `{"answer": "...", "claims": [...]}`，并要求每条 factual claim 使用输入 sources 中已有的 `[Sx]` citation ID。
 
@@ -94,7 +94,7 @@ Researcher：`src/deepresearch_agent/orchestrator.py` 的 `_research_one`。输�
 
 Verifier：`src/deepresearch_agent/verifier.py`。输入是 source 列表，输出是过滤后的 source。关键设计是可解释 quality reasons。局限是规则打分，不能真正判断来源权威性。
 
-Synthesizer：`src/deepresearch_agent/llm.py` 的 `synthesize`。输入是 brief、plan、findings、sources，输出 answer 和 claims。当前用 mock 生成可测报告。局限是真实写作质量不是目标，未接真实 LLM。
+Synthesizer：`src/deepresearch_agent/llm.py` 的 `synthesize`。输入是 brief、plan、findings、sources，输出 answer 和 claims。默认 mock 会生成可测报告，DeepSeek provider 会用 JSON mode 生成 markdown answer 和结构化 claims。局限是 DeepSeek 输出目前只靠 prompt 约束和后置 citation checker，没有做二次 LLM judge 或强制 source quote。
 
 Citation Checker：`src/deepresearch_agent/citation.py`。输入是 claims 和 sources，输出 `CitationCheckReport`。关键设计是每条 claim 都落到 citation ID 和 overlap score。局限是只能做 lexical support。
 
@@ -169,9 +169,9 @@ Trace Logger：`src/deepresearch_agent/tracing.py`。每个 run 写 `logs/resear
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
-DeepSeek 结构化输出验证：`py -3.11 -m deepresearch_agent.validate_deepseek_structured_output --query "How should citation checking reduce hallucination in deep research agents?" --max-researchers 3` 成功。`deepseek-chat` 返回了 3 条合法 `SubQuestion`，Pydantic schema 解析通过。真实输出主题分别覆盖 citation checking 的机制、实证证据、最佳实践与限制。本步骤只验证 planner 结构化输出，未接 synthesizer，未产生端到端报告，也未记录真实 token/cost。
+DeepSeek 结构化输出验证：`py -3.11 -m deepresearch_agent.validate_deepseek_structured_output --query "How should citation checking reduce hallucination in deep research agents?" --max-researchers 3` 成功。`deepseek-chat` 返回了 3 条合法 `SubQuestion`，Pydantic schema 解析通过。真实输出主题分别覆盖 citation checking 的机制、实证证据、最佳实践与限制。这是步骤 1 的历史记录，当时只验证 planner 结构化输出；后续步骤已经把 DeepSeek 扩展到端到端 synthesis 和真实 usage/cost。
 
-DeepSeek 端到端单条验证（LLM 真，search 仍是 mock）：`py -3.11 -m deepresearch_agent.cli "How should citation checking reduce hallucination in deep research agents?" --llm-provider deepseek --search-provider mock --max-researchers 2 --max-results 3 --json` 成功。模型生成的 brief 不再是模板回填，scope 是“Methods and effectiveness of citation verification in mitigating factual inaccuracies in AI-driven research agents”；planner 拆出 automated citation verification 和 human-in-the-loop 对比两个子问题；synthesis 生成了 markdown 报告和 6 条 claims。步骤 2 首次成功运行记录：latency `18987.535ms`，raw_search_result_count `6`，deduped_source_count `7`，citation_retention_rate `0.8333`，supported_claims `5/6`。其中 1 条 human-in-the-loop claim 被当前 lexical citation checker 标为 unsupported。注意：这一步还没有接真实 usage/cost，cost 仍显示旧字符估算与 `0.0`，不能当真实成本。
+DeepSeek 端到端单条验证（LLM 真，search 仍是 mock）：`py -3.11 -m deepresearch_agent.cli "How should citation checking reduce hallucination in deep research agents?" --llm-provider deepseek --search-provider mock --max-researchers 2 --max-results 3 --json` 成功。模型生成的 brief 不再是模板回填，scope 是“Methods and effectiveness of citation verification in mitigating factual inaccuracies in AI-driven research agents”；planner 拆出 automated citation verification 和 human-in-the-loop 对比两个子问题；synthesis 生成了 markdown 报告和 6 条 claims。步骤 2 首次成功运行记录：latency `18987.535ms`，raw_search_result_count `6`，deduped_source_count `7`，citation_retention_rate `0.8333`，supported_claims `5/6`。其中 1 条 human-in-the-loop claim 被当前 lexical citation checker 标为 unsupported。这是接真实 usage 前的历史记录，所以当时的 cost 不能当真实成本；步骤 3 已补上 provider usage 解析。
 
 DeepSeek usage/cost 单条验证（LLM 真，search 仍是 mock）：接入真实 usage 后重跑同一条命令成功。运行记录：latency `18524.693ms`，raw_search_result_count `6`，deduped_source_count `7`，citation_retention_rate `1.0`，supported_claims `6/6`。真实 usage：input_tokens `1842`，output_tokens `1310`，total_tokens `3152`，estimated_cost_usd `0.00193834`。分阶段成本：brief_generation `118 + 140 tokens / $0.00018586`，planning `277 + 226 tokens / $0.00032339`，synthesis `1447 + 944 tokens / $0.00142909`。注意：search 仍是 mock，所以这还不是“LLM + search 全真实”的 benchmark；步骤 4 再切 Wikipedia。
 
@@ -205,22 +205,22 @@ benchmark 汇总：管线 plumbing 指标，mock，非真实性能。具体 late
 | citation_retention_rate_avg | 0.7494 | lexical citation checker 结果，不是语义级事实评估 |
 | fallback_count_total | 0 | 本次没有降级到 mock search |
 
-逐 case 结果：case-001 成功，retention `1.0`，cost `$0.00169658`；case-002 失败，retention `0.4615`，cost `$0.00185575`；case-003 成功，retention `1.0`，cost `$0.00167514`；case-004 成功，retention `1.0`，cost `$0.00134979`；case-005 失败，retention `0.4286`，cost `$0.00167014`。这组数据比 mock plumbing 更有意义，因为 LLM token/cost 是 provider usage，search 也没有 fallback；但它仍受 Wikipedia 搜索质量和 lexical citation checker 限制。
+逐 case 结果：case-001 成功，retention `0.8571`，cost `$0.00169658`；case-002 失败，retention `0.4615`，cost `$0.00185575`；case-003 成功，retention `1.0`，cost `$0.00167514`；case-004 成功，retention `1.0`，cost `$0.00134979`；case-005 失败，retention `0.4286`，cost `$0.00167014`。这组数据比 mock plumbing 更有意义，因为 LLM token/cost 是 provider usage，search 也没有 fallback；但它仍受 Wikipedia 搜索质量和 lexical citation checker 限制。
 
 未实测：真实搜索 API 高并发限流、语义级 citation faithfulness、Redis/PostgreSQL 缓存、OpenTelemetry/LangSmith tracing、真实用户流量。
 
 # 8 评测设计
 
 answer completeness：当前未做 LLM judge，只用 case success 间接衡量，未实测完整性。
-citation faithfulness：当前实测指标是 claim/source lexical overlap，benchmark 平均 citation retention `1.0`。
+citation faithfulness：当前实测指标是 claim/source lexical overlap。mock plumbing run 平均 retention 是 `1.0`，只能说明 mock 引用链路没断；DeepSeek + Wikipedia benchmark 平均 retention 是 `0.7494`，暴露出真实 synthesis 下当前 checker 会拦下一部分 unsupported claim。
 source diversity：当前记录 deduped_source_count，但没有按 domain/provider 多样性打分。
 hallucination rate：当前用 unsupported citation count 作为 proxy，不能覆盖无引用幻觉。
-latency：benchmark 记录每 case latency_ms，并计算 P50/P90/max；当前只能作为 mock plumbing 的回归信号，不能作为 Agent 性能指标。
+latency：benchmark 记录每 case latency_ms，并计算 P50/P90/max；mock latency 只能作为 plumbing 回归信号，DeepSeek + Wikipedia latency 包含真实网络/API 时间，也不能当线上 SLA。
 cost：mock provider 成本为 0，token 用字符估算；DeepSeek provider 已接真实 usage 并按官方价格估算成本。其他真实 LLM provider 未实测。
-工具失败恢复：有 unit test 覆盖 primary failure fallback 和 circuit breaker open；benchmark mock provider 没触发 fallback。
+工具失败恢复：有 unit test 覆盖 primary failure fallback 和 circuit breaker open；第一次 DeepSeek + Wikipedia benchmark 出现过 fallback，修复 Wikipedia 长查询压缩后最终 benchmark 的 `fallback_count_total=0`。
 multi-hop 成功率：当前没有真实 multi-hop 标注集，未实测。
 
-评测集构造方式：我先放了 5 条围绕本项目核心能力的问题，覆盖 supervisor-researcher、citation faithfulness、tool failure、cost tracking、benchmark reproducibility。它不是公开标准 benchmark，目标是本地可复现 smoke benchmark。
+评测集构造方式：我先放了 5 条围绕本项目核心能力的问题，覆盖 supervisor-researcher、citation faithfulness、tool failure、cost tracking、benchmark reproducibility。它不是公开标准 benchmark，目标是本地可复现 smoke benchmark；现在同时保留 mock plumbing 记录和 DeepSeek + Wikipedia 真实 provider 小样本记录。
 
 # 9 与参考项目的差异
 
@@ -261,7 +261,7 @@ multi-hop 成功率：当前没有真实 multi-hop 标注集，未实测。
 
 # 10 局限与优化空间
 
-真实 LLM provider 未接入：当前问题是 mock synthesis 不能代表真实写作质量。可行方案是实现 OpenAI-compatible provider，并要求模型支持 structured output 和 tool calling。工程代价是 API key、价格、重试、usage 解析和测试替身。面试怎么讲：我会说 MVP 先把后端骨架和评测闭环做实，真实模型接入是独立 adapter 工作。
+真实 LLM provider 覆盖还窄：当前只接了 DeepSeek，一个 provider 不能代表所有模型/价格/限流行为。可行方案是继续实现 OpenAI/Anthropic 等 OpenAI-compatible 或原生 provider，并统一 structured output、usage 解析、重试和测试替身。工程代价是 API key、价格、限流、错误码差异和 CI mock。面试怎么讲：我会说我已经把真实 provider 接入路径跑通，但不会把单 provider 小样本夸成通用生产能力。
 
 Citation checker 语义能力弱：当前问题是 lexical overlap 只能拦明显错引。可行方案是加 LLM judge、NLI 模型或 sentence embedding entailment。工程代价是成本、延迟和 judge 可靠性评估。面试怎么讲：我会说现在是 CI 友好的第一道闸，不是最终事实评审。
 

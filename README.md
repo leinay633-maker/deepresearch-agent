@@ -2,7 +2,7 @@
 
 一个故意收窄的 DeepResearch Agent：从用户问题出发，生成 research brief，拆分子问题，并发检索，去重和来源质量过滤后，合成带引用的结构化报告，并对引用做 faithfulness 检查。
 
-默认运行不需要 API key。`mock` provider 用于稳定演示和 benchmark；`wikipedia` provider 是真实无 key 网络检索 adapter，网络失败时会降级到 mock。
+默认运行不需要 API key。默认 LLM 和 search 都走 `mock`，用于稳定演示、测试和 mock plumbing benchmark；也可以显式切到 DeepSeek 真实 LLM provider 和 Wikipedia 真实无 key search adapter。DeepSeek API key 只从环境变量 `DEEPSEEK_API_KEY` 读取。
 
 ## Quickstart
 
@@ -37,12 +37,27 @@ curl.exe -N -X POST http://127.0.0.1:8000/research/stream -H "Content-Type: appl
 py -3.11 -m deepresearch_agent.benchmark --search-provider mock --seed 20260606
 ```
 
+运行 DeepSeek + Wikipedia 真实 provider benchmark：
+
+```powershell
+$env:DEEPSEEK_API_KEY="<your-key>"
+$env:REQUEST_TIMEOUT_SECONDS="8"
+py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --search-provider wikipedia --seed 20260606 --max-researchers 2 --max-results 3
+```
+
 输出会写入 `logs/benchmark-*.jsonl` 和 `results/benchmark_summary.json`。
 
 ## Providers
 
-- `mock`：默认 provider，离线可复现，用于测试和 benchmark。
-- `wikipedia`：真实网络检索 adapter，调用 Wikipedia Search API；失败、超时或熔断时自动使用 mock fallback。
+LLM providers：
+
+- `mock`：默认 LLM provider，离线可复现，用于测试和 mock plumbing benchmark。
+- `deepseek`：真实 OpenAI-compatible LLM provider，使用 DeepSeek JSON mode 生成 brief、plan 和 cited synthesis；需要 `DEEPSEEK_API_KEY`。
+
+Search providers：
+
+- `mock`：默认 search provider，离线可复现。
+- `wikipedia`：真实网络检索 adapter，调用 Wikipedia Search API；失败、超时或熔断时自动使用 mock fallback，并在 trace/metrics 里暴露 fallback。
 
 ## Project Layout
 
@@ -50,7 +65,7 @@ py -3.11 -m deepresearch_agent.benchmark --search-provider mock --seed 20260606
 src/deepresearch_agent/
   api.py              FastAPI + SSE endpoints
   orchestrator.py     End-to-end research spine
-  llm.py              Mock structured-output/tool-capable model provider
+  llm.py              Mock and DeepSeek structured-output model providers
   search.py           Search adapters, retry, timeout, circuit breaker, fallback
   rag.py              Local keyword RAG retriever
   verifier.py         Source quality filtering

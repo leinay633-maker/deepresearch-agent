@@ -7,9 +7,9 @@
 - 已从空仓库实现一个可运行的 DeepResearch Agent MVP。
 - 已实现主链路：用户问题 -> clarify/normalize -> research brief -> planner 拆子问题 -> 3 个 researcher 并发检索 -> source dedup -> verifier -> synthesizer 带引用合成 -> citation check -> structured report。
 - 已实现 FastAPI JSON 接口 `/research` 和 SSE 接口 `/research/stream`。
-- 已实现 mock search provider 和 Wikipedia 真实无 key search adapter。
+- 已实现 mock LLM/search provider、DeepSeek 真实 LLM provider、Wikipedia 真实无 key search adapter。
 - 已实现工具失败处理：retry、timeout、circuit breaker、fallback。
-- 已实现结构化 trace、阶段级 token/cost 估算、benchmark harness。
+- 已实现结构化 trace、阶段级 token/cost 归因、benchmark harness；DeepSeek 路径记录 provider 返回的真实 usage 并按官方价格估算成本。
 - 已生成 `KNOWLEDGE_BASE.md` 和 `INTERVIEW_QA.md`。
 
 ## 优先审阅文件
@@ -31,25 +31,29 @@
 py -3.11 -m pytest -q
 ```
 
-最近一次结果：`9 passed, 1 warning`。warning 是 FastAPI TestClient / Starlette 关于 httpx 的 deprecation 提示，未影响功能。
+最近一次结果：`11 passed, 1 warning`。warning 是 FastAPI TestClient / Starlette 关于 httpx 的 deprecation 提示，未影响功能。
 
 benchmark 命令：
 
 ```powershell
-py -3.11 -m deepresearch_agent.benchmark --search-provider mock --seed 20260606
+$env:REQUEST_TIMEOUT_SECONDS='8'
+py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --search-provider wikipedia --seed 20260606 --max-researchers 2 --max-results 3
 ```
 
-最近一次 summary 在 `results/benchmark_summary.json`，原始记录在 `logs/benchmark-20260606T152954Z.jsonl`。
+最近一次 summary 在 `results/benchmark_summary.json`，原始记录在 `logs/benchmark-20260606T160617Z.jsonl`。本次是 DeepSeek LLM + Wikipedia search，`fallback_count_total=0`，没有降级到 mock search。
 
-核心实测指标解释：下面这些是 mock plumbing run 的记录，只证明管线能跑通，不能当成真实性能、真实成本或真实答案质量成果。延迟测的是本机 Python 跑 deterministic mock 的速度；token 是字符数估算；成本恒为 0 是因为 mock provider 单价为 0；citation_retention_rate 为 1.0 是因为 mock synthesis 自己生成引用并由当前轻量 checker 检查。
+核心实测指标解释：下面这些是真实 provider local benchmark 记录，适合证明本机这次配置下 LLM provider、search adapter、usage/cost 记录和 citation checker 已经端到端跑通；它仍不是线上 SLA 或广义质量分数。延迟包含 DeepSeek 和 Wikipedia 网络/API 时间；citation_retention_rate 是 lexical checker 结果，不是语义级事实评估。
 
 - case_count: 5
-- success_count: 5
-- success_rate: 1.0
-- latency p50 / p90: recorded in `results/benchmark_summary.json`, but intentionally not quoted as a performance result
-- total_tokens: 22281
-- citation_retention_rate_avg: 1.0, not real LLM faithfulness quality
-- estimated_cost_usd_total: 0.0, mock-only
+- success_count: 3
+- success_rate: 0.6
+- latency p50 / p90 / max: 17594.742ms / 19464.713ms / 20480.629ms
+- total_tokens: 14281
+- citation_retention_rate_avg: 0.7494
+- estimated_cost_usd_total: 0.0082474
+- fallback_count_total: 0
+
+对比用 mock plumbing 原始记录仍保留在 `logs/benchmark-20260606T152954Z.jsonl`。mock 数字只证明离线路径和记录链路能跑，不能当真实性能、真实成本或真实答案质量成果。
 
 ## 运行方式
 
@@ -79,10 +83,10 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 
 ## 明确没做或未实测
 
-- 未接真实 LLM provider；当前 planner/synthesizer 是 deterministic mock。
-- 未实测真实 LLM token usage 和真实 LLM cost。
+- 只接了 DeepSeek 一个真实 LLM provider；OpenAI/Anthropic 等其他 provider 未接。
+- DeepSeek 已实测真实 token usage 和 cost，但没有做长时间多轮稳定性/限流压测。
 - Citation checker 当前是 lexical overlap，不是语义级事实校验。
-- Wikipedia adapter 已实测能跑，但不是生产级搜索 provider。
+- Wikipedia adapter 已实测能跑且本次 benchmark 无 fallback，但不是生产级搜索 provider。
 - mock benchmark 的 latency/success/citation/cost 不应作为面试成果开场，只能说它证明 pipeline plumbing 和记录链路能跑。
 - 未接 Redis/PostgreSQL、OpenTelemetry/LangSmith、LangGraph checkpoint。
 - 未做 PDF/Docx 多格式导出。
@@ -93,5 +97,10 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 
 - `de058f2 chore: initialize deep research project`
 - `d52a83e feat: implement observable deep research spine`
+- `236608a docs: clarify mock benchmark limitations`
+- `2eee6fe feat: add DeepSeek structured-output validation`
+- `c6eb9a6 feat: wire DeepSeek provider into end-to-end synthesis`
+- `7d371a9 feat: record real DeepSeek usage and cost`
+- `cdf48fa feat: run DeepSeek Wikipedia benchmark without mock fallback`
 
 本交接文件用于帮助审阅者快速定位项目状态，不替代 `KNOWLEDGE_BASE.md`。
