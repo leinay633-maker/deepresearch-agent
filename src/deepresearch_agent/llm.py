@@ -12,6 +12,10 @@ from urllib.request import Request, urlopen
 from deepresearch_agent.cost import CostTracker
 from deepresearch_agent.schemas import Finding, ResearchBrief, ResearchRequest, Source, SubQuestion
 
+DEEPSEEK_CHAT_INPUT_CACHE_HIT_PER_1M = 0.07
+DEEPSEEK_CHAT_INPUT_CACHE_MISS_PER_1M = 0.27
+DEEPSEEK_CHAT_OUTPUT_PER_1M = 1.10
+
 
 @dataclass(frozen=True)
 class LLMJsonResult:
@@ -197,7 +201,7 @@ class DeepSeekLLMProvider:
             constraints=[str(item).strip() for item in payload.get("constraints", [])],
             assumptions=[str(item).strip() for item in payload.get("assumptions", [])],
         )
-        cost.add("brief_generation", request.query, result.content)
+        self._add_usage_cost(cost, "brief_generation", result)
         return brief
 
     async def plan(
@@ -238,7 +242,7 @@ class DeepSeekLLMProvider:
             raise ValueError(
                 f"DeepSeek returned {len(subquestions)} subquestions; expected {max_researchers}"
             )
-        cost.add("planning", brief.model_dump_json(), result.content)
+        self._add_usage_cost(cost, "planning", result)
         return subquestions
 
     async def synthesize(
@@ -308,7 +312,7 @@ class DeepSeekLLMProvider:
         if not isinstance(claims_raw, list) or not claims_raw:
             raise ValueError("DeepSeek synthesis response missing non-empty claims list")
         claims = [str(item).strip() for item in claims_raw if str(item).strip()]
-        cost.add("synthesis", json.dumps(synthesis_input, ensure_ascii=False), result.content)
+        self._add_usage_cost(cost, "synthesis", result)
         return answer, claims
 
     async def _chat_json(
@@ -391,6 +395,17 @@ class DeepSeekLLMProvider:
         _extract_content(payload)
         return payload
 
+    def _add_usage_cost(
+        self, cost: CostTracker, stage: str, result: LLMJsonResult
+    ):
+        input_tokens, output_tokens, estimated_cost = _deepseek_usage_cost_usd(result.usage)
+        return cost.add_usage(
+            stage=stage,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            estimated_cost_usd=estimated_cost,
+        )
+
 
 def _normalize_query(query: str) -> str:
     normalized = re.sub(r"\s+", " ", query.strip())
@@ -444,3 +459,23 @@ def _extract_content(payload: dict) -> str:
     if not isinstance(content, str):
         raise ValueError("DeepSeek response missing message.content")
     return content
+
+
+def _deepseek_usage_cost_usd(usage: dict) -> tuple[int, int, float]:
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or 0)
+    if prompt_tokens <= 0 or completion_tokens <= 0:
+        raise ValueError(f"DeepSeek usage missing token counts: {usage}")
+
+    cache_hit_tokens = int(usage.get("prompt_cache_hit_tokens") or 0)
+    cache_miss_tokens = usage.get("prompt_cache_miss_tokens")
+    if cache_miss_tokens is None:
+        cache_miss_tokens = max(prompt_tokens - cache_hit_tokens, 0)
+    cache_miss_tokens = int(cache_miss_tokens)
+
+    input_cost = (
+        cache_hit_tokens * DEEPSEEK_CHAT_INPUT_CACHE_HIT_PER_1M
+        + cache_miss_tokens * DEEPSEEK_CHAT_INPUT_CACHE_MISS_PER_1M
+    ) / 1_000_000
+    output_cost = completion_tokens * DEEPSEEK_CHAT_OUTPUT_PER_1M / 1_000_000
+    return prompt_tokens, completion_tokens, input_cost + output_cost

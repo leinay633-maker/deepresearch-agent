@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from deepresearch_agent.citation import CitationChecker
+from deepresearch_agent.cost import CostTracker
 from deepresearch_agent.dedup import SourceDeduplicator
 from deepresearch_agent.schemas import Source
 from deepresearch_agent.verifier import SourceVerifier
@@ -58,3 +59,20 @@ def test_citation_checker_flags_unsupported_claim() -> None:
 
     assert report.supported_claims == 1
     assert report.unsupported_claims == 1
+
+
+def test_cost_tracker_can_record_provider_usage() -> None:
+    tracker = CostTracker(provider="deepseek", model="deepseek-chat")
+
+    record = tracker.add_usage(
+        stage="planning",
+        input_tokens=1000,
+        output_tokens=200,
+        estimated_cost_usd=0.00049,
+    )
+    summary = tracker.summary()
+
+    assert record.input_tokens == 1000
+    assert record.output_tokens == 200
+    assert summary.total_tokens == 1200
+    assert summary.total_estimated_cost_usd == 0.00049

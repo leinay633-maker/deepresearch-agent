@@ -43,6 +43,24 @@ class CostTracker:
         self.records.append(record)
         return record
 
+    def add_usage(
+        self,
+        stage: str,
+        input_tokens: int,
+        output_tokens: int,
+        estimated_cost_usd: float,
+    ) -> CostRecord:
+        record = CostRecord(
+            stage=stage,
+            provider=self.provider,
+            model=self.model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            estimated_cost_usd=round(estimated_cost_usd, 8),
+        )
+        self.records.append(record)
+        return record
+
     def summary(self) -> CostSummary:
         input_tokens = sum(record.input_tokens for record in self.records)
         output_tokens = sum(record.output_tokens for record in self.records)
