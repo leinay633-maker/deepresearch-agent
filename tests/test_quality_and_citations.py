@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from deepresearch_agent.citation import CitationChecker
-from deepresearch_agent.cost import CostTracker
+from deepresearch_agent.cost import CostTracker, deepseek_usage_cost_usd
 from deepresearch_agent.dedup import SourceDeduplicator
-from deepresearch_agent.llm import _deepseek_usage_cost_usd
 from deepresearch_agent.schemas import Source
 from deepresearch_agent.verifier import SourceVerifier
 
@@ -80,7 +79,7 @@ def test_cost_tracker_can_record_provider_usage() -> None:
 
 
 def test_deepseek_v4_flash_usage_cost_uses_cache_buckets() -> None:
-    input_tokens, output_tokens, cost = _deepseek_usage_cost_usd(
+    input_tokens, output_tokens, cost = deepseek_usage_cost_usd(
         "deepseek-v4-flash",
         {
             "prompt_tokens": 1000,

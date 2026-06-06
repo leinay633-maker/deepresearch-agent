@@ -9,21 +9,10 @@ from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from deepresearch_agent.cost import CostTracker
+from deepresearch_agent.cost import CostTracker, deepseek_usage_cost_usd
 from deepresearch_agent.schemas import Finding, ResearchBrief, ResearchRequest, Source, SubQuestion
 
 DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-flash"
-DEEPSEEK_V4_FLASH_PRICING_USD_PER_1M = {
-    "input_cache_hit": 0.0028,
-    "input_cache_miss": 0.14,
-    "output": 0.28,
-}
-DEEPSEEK_PRICING_USD_PER_1M = {
-    DEEPSEEK_DEFAULT_MODEL: DEEPSEEK_V4_FLASH_PRICING_USD_PER_1M,
-    # Compatibility aliases documented by DeepSeek for V4 Flash non-thinking/thinking modes.
-    "deepseek-chat": DEEPSEEK_V4_FLASH_PRICING_USD_PER_1M,
-    "deepseek-reasoner": DEEPSEEK_V4_FLASH_PRICING_USD_PER_1M,
-}
 
 
 @dataclass(frozen=True)
@@ -407,7 +396,7 @@ class DeepSeekLLMProvider:
     def _add_usage_cost(
         self, cost: CostTracker, stage: str, result: LLMJsonResult
     ):
-        input_tokens, output_tokens, estimated_cost = _deepseek_usage_cost_usd(
+        input_tokens, output_tokens, estimated_cost = deepseek_usage_cost_usd(
             self.model, result.usage
         )
         return cost.add_usage(
@@ -470,26 +459,3 @@ def _extract_content(payload: dict) -> str:
     if not isinstance(content, str):
         raise ValueError("DeepSeek response missing message.content")
     return content
-
-
-def _deepseek_usage_cost_usd(model: str, usage: dict) -> tuple[int, int, float]:
-    prompt_tokens = int(usage.get("prompt_tokens") or 0)
-    completion_tokens = int(usage.get("completion_tokens") or 0)
-    if prompt_tokens <= 0 or completion_tokens <= 0:
-        raise ValueError(f"DeepSeek usage missing token counts: {usage}")
-    pricing = DEEPSEEK_PRICING_USD_PER_1M.get(model.lower())
-    if pricing is None:
-        raise ValueError(f"DeepSeek pricing is not configured for model: {model}")
-
-    cache_hit_tokens = int(usage.get("prompt_cache_hit_tokens") or 0)
-    cache_miss_tokens = usage.get("prompt_cache_miss_tokens")
-    if cache_miss_tokens is None:
-        cache_miss_tokens = max(prompt_tokens - cache_hit_tokens, 0)
-    cache_miss_tokens = int(cache_miss_tokens)
-
-    input_cost = (
-        cache_hit_tokens * pricing["input_cache_hit"]
-        + cache_miss_tokens * pricing["input_cache_miss"]
-    ) / 1_000_000
-    output_cost = completion_tokens * pricing["output"] / 1_000_000
-    return prompt_tokens, completion_tokens, input_cost + output_cost

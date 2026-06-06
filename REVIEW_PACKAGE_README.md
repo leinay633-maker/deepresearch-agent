@@ -40,18 +40,18 @@ $env:REQUEST_TIMEOUT_SECONDS='8'
 py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --search-provider wikipedia --seed 20260607 --max-researchers 2 --max-results 3
 ```
 
-最近一次 summary 在 `results/benchmark_summary.json`，原始记录在 `logs/benchmark-20260606T165321Z.jsonl`。本次是 DeepSeek `deepseek-v4-flash` + Wikipedia search，`fallback_count_total=0`，没有降级到 mock search。
+最近一次 summary 在 `results/benchmark_summary.json`，原始记录在 `logs/benchmark-20260606T171739Z.jsonl`。本次是 DeepSeek `deepseek-v4-flash` + Wikipedia search，`fallback_count_total=2`，有 2 次 researcher 检索降级，已按真实结果记录。
 
 核心实测指标解释：下面这些是真实 provider local benchmark 记录，适合证明本机这次配置下 LLM provider、search adapter、usage/cost 记录和 citation checker 已经端到端跑通；它仍不是线上 SLA 或广义质量分数。延迟包含 DeepSeek 和 Wikipedia 网络/API 时间；citation_retention_rate 是 lexical checker 结果，不是语义级事实评估。
 
 - case_count: 5
 - success_count: 4
 - success_rate: 0.8
-- latency p50 / p90 / max: 37671.791ms / 41253.925ms / 42258.527ms
-- total_tokens: 18945
-- citation_retention_rate_avg: 0.8893
-- estimated_cost_usd_total: 0.00401674（按当前实现中的 `deepseek-v4-flash` 价格常量估算，后续模型/价格页变化时需要重跑并重算）
-- fallback_count_total: 0
+- latency p50 / p90 / max: 30235.414ms / 48390.038ms / 54020.348ms
+- total_tokens: 19843
+- citation_retention_rate_avg: 0.8778
+- estimated_cost_usd_total: 0.00425096（按当前实现中的 `deepseek-v4-flash` 价格常量估算，价格核对日期：2026-06-07）
+- fallback_count_total: 2
 
 对比用 mock plumbing 原始记录仍保留在 `logs/benchmark-20260606T152954Z.jsonl`。mock 数字只证明离线路径和记录链路能跑，不能当真实性能、真实成本或真实答案质量成果。
 
@@ -85,9 +85,9 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 
 - 只接了 DeepSeek 一个真实 LLM provider；OpenAI/Anthropic 等其他 provider 未接。
 - DeepSeek 已实测真实 token usage 和 cost，但没有做长时间多轮稳定性/限流压测。
-- 当前默认 DeepSeek 模型已切到 `deepseek-v4-flash`；`deepseek-chat` 只作为兼容 alias 保留在价格表里。
+- 当前默认 DeepSeek 模型已切到显式 `deepseek-v4-flash`；legacy alias 只为兼容旧配置保留在代码价格表里。
 - Citation checker 当前是 lexical overlap，不是语义级事实校验。
-- Wikipedia adapter 已实测能跑且本次 benchmark 无 fallback，但不是生产级搜索 provider。
+- Wikipedia adapter 已实测能跑，但本次 benchmark 真实出现 2 次 fallback；它不是生产级搜索 provider。
 - mock benchmark 的 latency/success/citation/cost 不应作为面试成果开场，只能说它证明 pipeline plumbing 和记录链路能跑。
 - 未接 Redis/PostgreSQL、OpenTelemetry/LangSmith、LangGraph checkpoint。
 - 未做 PDF/Docx 多格式导出。
