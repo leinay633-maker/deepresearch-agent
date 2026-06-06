@@ -5,7 +5,12 @@ import asyncio
 import pytest
 
 from deepresearch_agent.config import Settings
-from deepresearch_agent.search import MockSearchAdapter, SearchError, SearchService
+from deepresearch_agent.search import (
+    MockSearchAdapter,
+    SearchError,
+    SearchService,
+    _wikipedia_query_candidates,
+)
 
 
 class FailingSearchAdapter:
@@ -48,3 +53,14 @@ def test_circuit_breaker_skips_open_primary() -> None:
 
 def test_pytest_is_available() -> None:
     assert pytest.__version__
+
+
+def test_wikipedia_query_candidates_compact_long_questions() -> None:
+    candidates = _wikipedia_query_candidates(
+        "What empirical evidence exists from 2020 onwards that citation faithfulness checks reduce hallucination in LLM-based agent reports?"
+    )
+
+    assert candidates[0] != candidates[-1]
+    assert "citation" in candidates[0].lower()
+    assert "faithfulness" in candidates[0].lower()
+    assert len(candidates[0]) < len(candidates[-1])

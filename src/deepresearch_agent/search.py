@@ -101,11 +101,25 @@ class WikipediaSearchAdapter:
         return await asyncio.to_thread(self._search_sync, query, max_results, timeout)
 
     def _search_sync(self, query: str, max_results: int, timeout: float) -> list[Source]:
+        errors: list[str] = []
+        for search_query in _wikipedia_query_candidates(query):
+            try:
+                sources = self._search_once(search_query, query, max_results, timeout)
+            except SearchError as exc:
+                errors.append(str(exc))
+                continue
+            if sources:
+                return sources
+        raise SearchError("; ".join(error for error in errors if error) or "wikipedia returned no results")
+
+    def _search_once(
+        self, search_query: str, original_query: str, max_results: int, timeout: float
+    ) -> list[Source]:
         params = urlencode(
             {
                 "action": "query",
                 "list": "search",
-                "srsearch": query,
+                "srsearch": search_query,
                 "srlimit": max_results,
                 "format": "json",
                 "utf8": "1",
@@ -123,7 +137,7 @@ class WikipediaSearchAdapter:
 
         results = payload.get("query", {}).get("search", [])
         sources: list[Source] = []
-        query_terms = _tokens(query)
+        query_terms = _tokens(search_query)
         for index, result in enumerate(results):
             title = html.unescape(str(result.get("title", "")))
             snippet = _strip_html(str(result.get("snippet", "")))
@@ -138,13 +152,13 @@ class WikipediaSearchAdapter:
                     url=f"https://en.wikipedia.org/wiki/{url_title}",
                     content=content,
                     provider=self.name,
-                    query=query,
+                    query=original_query,
                     score=float(overlap * 10 + rank_bonus),
-                    metadata={"pageid": page_id},
+                    metadata={"pageid": page_id, "search_query": search_query},
                 )
             )
         if not sources:
-            raise SearchError("wikipedia returned no results")
+            raise SearchError(f"wikipedia returned no results for query: {search_query}")
         return sources
 
 
@@ -237,3 +251,58 @@ def _strip_html(text: str) -> str:
 
 def _tokens(text: str) -> set[str]:
     return {token.lower() for token in re.findall(r"[a-zA-Z0-9_]+", text)}
+
+
+WIKIPEDIA_STOPWORDS = {
+    "about",
+    "agent",
+    "agents",
+    "and",
+    "are",
+    "between",
+    "compare",
+    "compared",
+    "common",
+    "does",
+    "from",
+    "have",
+    "how",
+    "implement",
+    "implemented",
+    "into",
+    "needed",
+    "should",
+    "that",
+    "the",
+    "their",
+    "used",
+    "what",
+    "when",
+    "where",
+    "which",
+    "why",
+    "with",
+}
+
+
+def _wikipedia_query_candidates(query: str) -> list[str]:
+    words = re.findall(r"[A-Za-z][A-Za-z0-9_-]+", query)
+    keywords = []
+    for word in words:
+        lowered = word.lower()
+        if lowered in WIKIPEDIA_STOPWORDS or len(lowered) <= 2:
+            continue
+        if lowered not in {item.lower() for item in keywords}:
+            keywords.append(word)
+    candidates = []
+    if keywords:
+        candidates.append(" ".join(keywords[:8]))
+    if len(keywords) > 4:
+        candidates.append(" ".join(keywords[:4]))
+    candidates.append(query)
+    deduped = []
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if candidate and candidate not in deduped:
+            deduped.append(candidate)
+    return deduped

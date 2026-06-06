@@ -91,19 +91,12 @@ def _summarize(
     tokens = [record["total_tokens"] for record in records]
     retentions = [record["citation_retention_rate"] for record in records]
     success_count = sum(1 for record in records if record["success"])
+    benchmark_kind, interpretation, limitations = _benchmark_notes(config_snapshot)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "benchmark_kind": "mock_plumbing_smoke_test",
-        "interpretation": (
-            "These numbers validate that the local pipeline can run end to end. "
-            "They are not real DeepResearch performance, cost, or answer-quality metrics."
-        ),
-        "limitations": [
-            "latency_ms measures local Python execution with deterministic mock components",
-            "total_tokens is an approximate character-count estimate, not provider tokenizer usage",
-            "estimated_cost_usd is 0 because the mock provider price is configured as 0",
-            "citation_retention_rate can be 1.0 because mock synthesis cites sources created inside the same pipeline",
-        ],
+        "benchmark_kind": benchmark_kind,
+        "interpretation": interpretation,
+        "limitations": limitations,
         "raw_log": str(raw_path),
         "config": config_snapshot,
         "case_count": len(records),
@@ -138,6 +131,39 @@ def _percentile(values: list[float], percentile: int) -> float:
     upper = min(lower + 1, len(ordered) - 1)
     weight = index - lower
     return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
+def _benchmark_notes(config_snapshot: dict[str, Any]) -> tuple[str, str, list[str]]:
+    llm_provider = config_snapshot.get("llm_provider")
+    search_provider = config_snapshot.get("search_provider")
+    if llm_provider == "mock" and search_provider == "mock":
+        return (
+            "mock_plumbing_smoke_test",
+            (
+                "These numbers validate that the local pipeline can run end to end. "
+                "They are not real DeepResearch performance, cost, or answer-quality metrics."
+            ),
+            [
+                "latency_ms measures local Python execution with deterministic mock components",
+                "total_tokens is an approximate character-count estimate, not provider tokenizer usage",
+                "estimated_cost_usd is 0 because the mock provider price is configured as 0",
+                "citation_retention_rate can be 1.0 because mock synthesis cites sources created inside the same pipeline",
+            ],
+        )
+    return (
+        "real_llm_live_search_benchmark",
+        (
+            "These numbers use the configured live LLM/search providers and are suitable "
+            "as local benchmark evidence for this exact setup, not as a general product SLA."
+        ),
+        [
+            "latency_ms includes live network/API time and can vary across runs",
+            "DeepSeek token usage and cost come from provider usage fields when llm_provider is deepseek",
+            "Wikipedia is a real no-key adapter but not a production-grade web search provider",
+            "citation_retention_rate is checked by lexical overlap, not semantic entailment",
+            "the benchmark set is small and local, so success_rate is not a broad quality score",
+        ],
+    )
 
 
 def main() -> None:

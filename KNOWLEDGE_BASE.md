@@ -149,6 +149,15 @@ Trace Logger：`src/deepresearch_agent/tracing.py`。每个 run 写 `logs/resear
 复盘：分步骤推进是有价值的，步骤 2 立刻暴露了步骤 1 临时代码和后续真实接入的冲突。
 面试可能追问：为什么把这个写进知识库？回答：这是接真实 provider 过程中真实发生的 bug，不编造也不隐藏，能说明我是按验证链路推进的。
 
+## 问题 6：第一次 DeepSeek + Wikipedia benchmark 出现 mock fallback
+
+现象：步骤 4 第一次运行 DeepSeek LLM + Wikipedia search benchmark 时，summary 显示 `fallback_count_total=6`，说明部分 researcher 的 Wikipedia 检索降级到了 mock，不能算“LLM 和检索都不是 mock”的真实 benchmark。
+原因：DeepSeek planner 生成的子问题是长自然语言问题，直接传给 Wikipedia Search API 时，有些查询返回 no results，有些查询触发 live search timeout；`SearchService` 按设计降级到 mock。
+排查：查看 `logs/research-*.jsonl`，失败原因包括 `wikipedia returned no results` 和 timeout 空错误字符串。
+修复：在 `WikipediaSearchAdapter` 内增加 `_wikipedia_query_candidates()`，把长问题压缩成关键词查询，并在无结果时逐步尝试候选查询；同时真实 benchmark 运行时把 `REQUEST_TIMEOUT_SECONDS` 设置为 `8`。重跑后 `fallback_count_total=0`。
+复盘：真实检索 adapter 不只是“能联网”，还要把 agent planner 产出的长问题转换成搜索引擎能吃的 query。这个 bug 也证明 fallback 指标必须进入 benchmark，否则会误以为检索全是真实的。
+面试可能追问：为什么不用更强搜索？回答：本次按约束先用无 key 的 Wikipedia，后续换 Tavily/Brave 是新增 adapter，不需要改 orchestrator。
+
 # 7 实测数据
 
 本节所有 mock benchmark 数字只用于证明 pipeline plumbing 能端到端跑通，不能当作真实性能、真实成本或真实答案质量成果。尤其不能在面试里说“我的 DeepResearch p50 是个位数毫秒”这类话，因为这个延迟测的是本机 Python 跑 deterministic mock 的速度，换机器、换进程热身状态、换依赖版本都会变。
@@ -166,8 +175,8 @@ DeepSeek 端到端单条验证（LLM 真，search 仍是 mock）：`py -3.11 -m 
 
 DeepSeek usage/cost 单条验证（LLM 真，search 仍是 mock）：接入真实 usage 后重跑同一条命令成功。运行记录：latency `18524.693ms`，raw_search_result_count `6`，deduped_source_count `7`，citation_retention_rate `1.0`，supported_claims `6/6`。真实 usage：input_tokens `1842`，output_tokens `1310`，total_tokens `3152`，estimated_cost_usd `0.00193834`。分阶段成本：brief_generation `118 + 140 tokens / $0.00018586`，planning `277 + 226 tokens / $0.00032339`，synthesis `1447 + 944 tokens / $0.00142909`。注意：search 仍是 mock，所以这还不是“LLM + search 全真实”的 benchmark；步骤 4 再切 Wikipedia。
 
-benchmark 原始记录：`logs/benchmark-20260606T152954Z.jsonl`。
-benchmark summary：`results/benchmark_summary.json`。
+mock benchmark 原始记录：`logs/benchmark-20260606T152954Z.jsonl`。
+当前 benchmark summary：`results/benchmark_summary.json`，已被真实 DeepSeek + Wikipedia benchmark 覆盖。
 
 benchmark 汇总：管线 plumbing 指标，mock，非真实性能。具体 latency/token/cost 数字保留在 `results/benchmark_summary.json` 和 raw log 里，面试时不把这些数字当成果开场。
 
@@ -181,7 +190,24 @@ benchmark 汇总：管线 plumbing 指标，mock，非真实性能。具体 late
 | citation_retention_rate_avg | 当前 mock run 为 1.0 | mock 自生成自引用，只说明 checker 链路没断 |
 | fallback_count_total | 当前 mock run 为 0 | mock provider 本身不触发外部失败 |
 
-未实测：真实 LLM token usage、真实 LLM cost、真实搜索 API 高并发限流、Redis/Postgres 缓存、OpenTelemetry/LangSmith tracing、真实用户流量。
+真实 DeepSeek + Wikipedia benchmark：`$env:REQUEST_TIMEOUT_SECONDS='8'; py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --search-provider wikipedia --seed 20260606 --max-researchers 2 --max-results 3`。本次 LLM 是 DeepSeek，检索 primary 是 Wikipedia，最终 `fallback_count_total=0`，没有 mock fallback。原始记录：`logs/benchmark-20260606T160617Z.jsonl`，summary：`results/benchmark_summary.json`。
+
+| 指标 | 真实 benchmark 记录 | 怎么解释 |
+|---|---:|---|
+| case_count | 5 | 仍是小型本地 benchmark，不是公开权威评测 |
+| success_count / success_rate | 3 / 0.6 | 真实 citation checker 下有 2 条 case 未达当前 success 条件 |
+| latency p50 | 17594.742ms | 包含 DeepSeek + Wikipedia live 网络时间，不是 SLA |
+| latency p90 | 19464.713ms | 同上 |
+| latency max | 20480.629ms | 同上 |
+| total_tokens | 14281 | 来自 DeepSeek usage 字段 |
+| avg_tokens | 2856.2 | 来自 DeepSeek usage 字段 |
+| estimated_cost_usd_total | 0.0082474 | 按 DeepSeek `deepseek-chat` 官方 USD 价格估算 |
+| citation_retention_rate_avg | 0.7494 | lexical citation checker 结果，不是语义级事实评估 |
+| fallback_count_total | 0 | 本次没有降级到 mock search |
+
+逐 case 结果：case-001 成功，retention `1.0`，cost `$0.00169658`；case-002 失败，retention `0.4615`，cost `$0.00185575`；case-003 成功，retention `1.0`，cost `$0.00167514`；case-004 成功，retention `1.0`，cost `$0.00134979`；case-005 失败，retention `0.4286`，cost `$0.00167014`。这组数据比 mock plumbing 更有意义，因为 LLM token/cost 是 provider usage，search 也没有 fallback；但它仍受 Wikipedia 搜索质量和 lexical citation checker 限制。
+
+未实测：真实搜索 API 高并发限流、语义级 citation faithfulness、Redis/PostgreSQL 缓存、OpenTelemetry/LangSmith tracing、真实用户流量。
 
 # 8 评测设计
 
@@ -190,7 +216,7 @@ citation faithfulness：当前实测指标是 claim/source lexical overlap，ben
 source diversity：当前记录 deduped_source_count，但没有按 domain/provider 多样性打分。
 hallucination rate：当前用 unsupported citation count 作为 proxy，不能覆盖无引用幻觉。
 latency：benchmark 记录每 case latency_ms，并计算 P50/P90/max；当前只能作为 mock plumbing 的回归信号，不能作为 Agent 性能指标。
-cost：当前 mock provider 成本为 0，token 用字符估算；真实 provider 成本未实测。
+cost：mock provider 成本为 0，token 用字符估算；DeepSeek provider 已接真实 usage 并按官方价格估算成本。其他真实 LLM provider 未实测。
 工具失败恢复：有 unit test 覆盖 primary failure fallback 和 circuit breaker open；benchmark mock provider 没触发 fallback。
 multi-hop 成功率：当前没有真实 multi-hop 标注集，未实测。
 
