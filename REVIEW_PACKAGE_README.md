@@ -9,13 +9,13 @@
 - 已实现 FastAPI JSON 接口 `/research` 和 SSE 接口 `/research/stream`。
 - 已实现 mock LLM/search provider、DeepSeek 真实 LLM provider、Wikipedia 真实无 key search adapter。
 - 已实现工具失败处理：retry、timeout、circuit breaker、fallback。
-- 已实现结构化 trace、阶段级 token/cost 归因、benchmark harness；DeepSeek 路径记录 provider 返回的真实 usage 并按官方价格估算成本。
+- 已实现结构化 trace、阶段级 token/cost 归因、benchmark harness；DeepSeek 路径记录 provider 返回的真实 usage，并按当前实现里的价格常量估算成本。
 - 已生成 `KNOWLEDGE_BASE.md` 和 `INTERVIEW_QA.md`。
 
 ## 优先审阅文件
 
 1. `KNOWLEDGE_BASE.md`：项目复盘、真实问题、实测数据、和参考项目差异。
-2. `INTERVIEW_QA.md`：面试检索和 drill 用问答，共 40 题。
+2. `INTERVIEW_QA.md`：面试检索和 drill 用问答，共 41 题。
 3. `src/deepresearch_agent/orchestrator.py`：端到端编排主线。
 4. `src/deepresearch_agent/search.py`：search adapter、retry、timeout、circuit breaker、fallback。
 5. `src/deepresearch_agent/citation.py`：citation faithfulness 第一层检查。
@@ -50,7 +50,7 @@ py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --search-provid
 - latency p50 / p90 / max: 17594.742ms / 19464.713ms / 20480.629ms
 - total_tokens: 14281
 - citation_retention_rate_avg: 0.7494
-- estimated_cost_usd_total: 0.0082474
+- estimated_cost_usd_total: 0.0082474（按当前实现中的 `deepseek-chat` 价格常量估算，后续模型/价格页变化时需要重跑并重算）
 - fallback_count_total: 0
 
 对比用 mock plumbing 原始记录仍保留在 `logs/benchmark-20260606T152954Z.jsonl`。mock 数字只证明离线路径和记录链路能跑，不能当真实性能、真实成本或真实答案质量成果。
@@ -85,6 +85,7 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 
 - 只接了 DeepSeek 一个真实 LLM provider；OpenAI/Anthropic 等其他 provider 未接。
 - DeepSeek 已实测真实 token usage 和 cost，但没有做长时间多轮稳定性/限流压测。
+- 当前默认 DeepSeek 模型是 `deepseek-chat`，官方主文档已提示它将在 2026-07-24 15:59 UTC 弃用；后续应切到 `deepseek-v4-flash` 并更新价格常量后重跑 benchmark。
 - Citation checker 当前是 lexical overlap，不是语义级事实校验。
 - Wikipedia adapter 已实测能跑且本次 benchmark 无 fallback，但不是生产级搜索 provider。
 - mock benchmark 的 latency/success/citation/cost 不应作为面试成果开场，只能说它证明 pipeline plumbing 和记录链路能跑。

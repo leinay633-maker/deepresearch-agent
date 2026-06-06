@@ -55,6 +55,17 @@
 2. mock 会不会让项目太假？
 3. 怎么切到真实检索？
 
+## Q：为什么第一版真实 LLM 选 DeepSeek？
+[状态: 待消化]
+标签：LLM Provider / 选型
+检索关键词：DeepSeek, JSON mode, provider decision
+回答：我需要一个真实 provider 来验证 structured output、usage 解析和成本归因，但又不能让默认运行依赖 API key。DeepSeek 的 API 兼容 OpenAI Chat Completions，支持 JSON Output，足够验证 brief、planner、synthesis 这些结构化输出；默认仍保留 mock，只有显式传 `--llm-provider deepseek` 才走真实模型。代价是现在只代表 DeepSeek 一个 provider，而且默认 `deepseek-chat` 模型名后续要迁移到 `deepseek-v4-flash`。
+关联模块：`llm.py`, `config.py`, `KNOWLEDGE_BASE.md`
+可追问：
+1. 为什么不用 OpenAI？
+2. tool calling 用了吗？
+3. 模型价格变化怎么办？
+
 # Planner 模块
 
 ## Q：Planner 在项目里做什么？
@@ -346,7 +357,7 @@
 [状态: 待消化]
 标签：成本控制 / Token
 检索关键词：CostTracker, token accounting
-回答：`CostTracker` 按阶段记录 input_tokens、output_tokens 和 estimated_cost_usd。当前阶段包括 brief_generation、planning、synthesis。mock provider 成本是 0，token 用字符数近似估算；DeepSeek provider 会读取 API 返回的 `prompt_tokens` / `completion_tokens`，并按官方价格估算成本。
+回答：`CostTracker` 按阶段记录 input_tokens、output_tokens 和 estimated_cost_usd。当前阶段包括 brief_generation、planning、synthesis。mock provider 成本是 0，token 用字符数近似估算；DeepSeek provider 会读取 API 返回的 `prompt_tokens` / `completion_tokens`，并按当前实现里的价格常量估算成本。模型或价格页变化时，这个常量要同步更新。
 关联模块：`cost.py`, `llm.py`
 可追问：
 1. 真实 provider 的 usage 怎么接？
@@ -357,7 +368,7 @@
 [状态: 待消化]
 标签：成本控制 / 可观测性
 检索关键词：stage cost, attribution
-回答：多 Agent 系统里只知道总 token 没有太大调优价值。按阶段归因后，才能知道成本主要花在 brief、planning 还是 synthesis。DeepSeek 单条验证里，synthesis 成本最高；真实 DeepSeek + Wikipedia benchmark 总 token 是 14281，总成本估算是 0.0082474 美元。
+回答：多 Agent 系统里只知道总 token 没有太大调优价值。按阶段归因后，才能知道成本主要花在 brief、planning 还是 synthesis。DeepSeek 单条验证里，synthesis 成本最高；真实 DeepSeek + Wikipedia benchmark 总 token 是 14281，总成本按当前实现价格常量估算是 0.0082474 美元。后续切到 `deepseek-v4-flash` 或价格变动时，这个成本必须重算。
 关联模块：`cost.py`, `benchmark.py`
 可追问：
 1. researcher 的搜索成本怎么计？
@@ -390,7 +401,7 @@
 [状态: 待消化]
 标签：Benchmark / 评测
 检索关键词：benchmark, latency, token, citation
-回答：`benchmark.py` 记录 seed、配置快照、case_id、query、latency_ms、total_tokens、estimated_cost_usd、deduped_source_count、raw_search_result_count、citation_retention_rate、success、fallback_count 和 output_summary。现在有两类数据：mock plumbing run 只证明离线路径和记录链路；DeepSeek + Wikipedia run 是真实 provider 小样本，5 条 case 成功 3 条、fallback 0、total_tokens 14281、总成本 0.0082474 美元、平均 citation_retention_rate 0.7494。
+回答：`benchmark.py` 记录 seed、配置快照、case_id、query、latency_ms、total_tokens、estimated_cost_usd、deduped_source_count、raw_search_result_count、citation_retention_rate、success、fallback_count 和 output_summary。现在有两类数据：mock plumbing run 只证明离线路径和记录链路；DeepSeek + Wikipedia run 是真实 provider 小样本，5 条 case 成功 3 条、fallback 0、total_tokens 14281、总成本按当前实现价格常量估算为 0.0082474 美元、平均 citation_retention_rate 0.7494。
 关联模块：`benchmark.py`, `results/benchmark_summary.json`
 可追问：
 1. 为什么只 5 条 case？

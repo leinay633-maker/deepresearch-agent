@@ -82,6 +82,15 @@ Agent 编排层：`src/deepresearch_agent/orchestrator.py`。输入是用户 que
 代价：没有 LangGraph 原生可视化和 durable execution。
 面试怎么答：我会说我理解 LangGraph 的价值，但 MVP 的核心风险在 citation、fallback、benchmark，而不是图框架本身。
 
+## 决策 7：为什么第一版真实 LLM provider 选择 DeepSeek
+
+背景：mock 路径能证明 pipeline plumbing，但无法回答“真实 LLM structured output、真实 token usage、真实成本记录是否能跑通”。同时默认路径不能依赖 API key，否则陌生人 clone 后会被阻塞。
+可选方案：继续 mock-only；接 OpenAI/Anthropic；接 DeepSeek OpenAI-compatible API；一次性做多 provider。
+最终选择：先接一个显式启用的 DeepSeek provider，默认仍是 mock；API key 只读环境变量 `DEEPSEEK_API_KEY`，模型名允许用 `DEEPSEEK_MODEL` 覆盖。
+理由：DeepSeek API 兼容 OpenAI Chat Completions，适合用标准 `/chat/completions` 接入；官方 JSON Output 支持 `response_format={"type":"json_object"}`，满足 brief/plan/synthesis 的结构化输出验证；官方 Tool Calls 能力存在，但本项目当前工具调用由 Python orchestrator 管控，没有让模型直接发 tool call；本机有可用 key，可以在不提交密钥的前提下跑出真实 usage/cost。
+代价：当前只代表 DeepSeek 一个 provider，不能泛化到所有模型；本次 benchmark 用的是默认 `deepseek-chat`，官方主文档已提示该模型名将在 2026-07-24 15:59 UTC 弃用，后续应迁移到 `deepseek-v4-flash` 并更新价格常量后重跑 benchmark。当前 `estimated_cost_usd` 是根据 provider usage 和代码里的 `deepseek-chat` 价格常量估算，不等同于长期稳定账单或产品级成本承诺。
+面试怎么答：我会说我没有把 mock 数字包装成真实成果，而是先用 DeepSeek 把 structured output、usage 解析、成本归因和真实搜索 benchmark 打通；但我也会主动说明它只是单 provider 小样本，下一步是迁移最新模型名、做 provider 抽象扩展和更强评测。
+
 # 5 实现细节
 
 Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。局限是 planner 还不会根据 researcher 中间结果动态追加子问题。
@@ -98,7 +107,7 @@ Synthesizer：`src/deepresearch_agent/llm.py` 的 `synthesize`。输入是 brief
 
 Citation Checker：`src/deepresearch_agent/citation.py`。输入是 claims 和 sources，输出 `CitationCheckReport`。关键设计是每条 claim 都落到 citation ID 和 overlap score。局限是只能做 lexical support。
 
-Cost Tracker：`src/deepresearch_agent/cost.py`。mock provider 仍使用字符数近似估算；DeepSeek provider 已接入 API 返回的真实 `prompt_tokens` / `completion_tokens`，并通过 `CostTracker.add_usage()` 记录到同一套 `CostSummary`。当前 `deepseek-chat` 成本计算按 DeepSeek 官方 USD 价格页：input cache hit `$0.07/1M tokens`，input cache miss `$0.27/1M tokens`，output `$1.10/1M tokens`。如果响应没有 token usage，DeepSeek 路径会直接失败，不会退回字符估算伪装成真实 usage。
+Cost Tracker：`src/deepresearch_agent/cost.py`。mock provider 仍使用字符数近似估算；DeepSeek provider 已接入 API 返回的真实 `prompt_tokens` / `completion_tokens`，并通过 `CostTracker.add_usage()` 记录到同一套 `CostSummary`。当前 `deepseek-chat` 成本计算按 DeepSeek `pricing-details-usd` 页的 deepseek-chat 行：input cache hit `$0.07/1M tokens`，input cache miss `$0.27/1M tokens`，output `$1.10/1M tokens`。注意 DeepSeek 主价格页已展示 v4-flash/v4-pro 新价格和 `deepseek-chat` 弃用时间，后续切模型时必须同步更新价格常量并重跑 benchmark。如果响应没有 token usage，DeepSeek 路径会直接失败，不会退回字符估算伪装成真实 usage。
 
 Trace Logger：`src/deepresearch_agent/tracing.py`。每个 run 写 `logs/research-<run_id>.jsonl`，记录 stage、status、duration_ms、payload。runtime trace 默认不提交 Git，benchmark 原始记录提交。
 
@@ -201,7 +210,7 @@ benchmark 汇总：管线 plumbing 指标，mock，非真实性能。具体 late
 | latency max | 20480.629ms | 同上 |
 | total_tokens | 14281 | 来自 DeepSeek usage 字段 |
 | avg_tokens | 2856.2 | 来自 DeepSeek usage 字段 |
-| estimated_cost_usd_total | 0.0082474 | 按 DeepSeek `deepseek-chat` 官方 USD 价格估算 |
+| estimated_cost_usd_total | 0.0082474 | 按当前实现中的 `deepseek-chat` 价格常量估算，后续切模型或价格页变化必须重算 |
 | citation_retention_rate_avg | 0.7494 | lexical citation checker 结果，不是语义级事实评估 |
 | fallback_count_total | 0 | 本次没有降级到 mock search |
 
@@ -216,7 +225,7 @@ citation faithfulness：当前实测指标是 claim/source lexical overlap。moc
 source diversity：当前记录 deduped_source_count，但没有按 domain/provider 多样性打分。
 hallucination rate：当前用 unsupported citation count 作为 proxy，不能覆盖无引用幻觉。
 latency：benchmark 记录每 case latency_ms，并计算 P50/P90/max；mock latency 只能作为 plumbing 回归信号，DeepSeek + Wikipedia latency 包含真实网络/API 时间，也不能当线上 SLA。
-cost：mock provider 成本为 0，token 用字符估算；DeepSeek provider 已接真实 usage 并按官方价格估算成本。其他真实 LLM provider 未实测。
+cost：mock provider 成本为 0，token 用字符估算；DeepSeek provider 已接真实 usage，并按当前实现里的价格常量估算成本。其他真实 LLM provider 未实测。
 工具失败恢复：有 unit test 覆盖 primary failure fallback 和 circuit breaker open；第一次 DeepSeek + Wikipedia benchmark 出现过 fallback，修复 Wikipedia 长查询压缩后最终 benchmark 的 `fallback_count_total=0`。
 multi-hop 成功率：当前没有真实 multi-hop 标注集，未实测。
 
@@ -261,7 +270,7 @@ multi-hop 成功率：当前没有真实 multi-hop 标注集，未实测。
 
 # 10 局限与优化空间
 
-真实 LLM provider 覆盖还窄：当前只接了 DeepSeek，一个 provider 不能代表所有模型/价格/限流行为。可行方案是继续实现 OpenAI/Anthropic 等 OpenAI-compatible 或原生 provider，并统一 structured output、usage 解析、重试和测试替身。工程代价是 API key、价格、限流、错误码差异和 CI mock。面试怎么讲：我会说我已经把真实 provider 接入路径跑通，但不会把单 provider 小样本夸成通用生产能力。
+真实 LLM provider 覆盖还窄：当前只接了 DeepSeek，一个 provider 不能代表所有模型/价格/限流行为，而且默认 `deepseek-chat` 模型名需要在官方弃用日前迁移到 `deepseek-v4-flash`。可行方案是继续实现 OpenAI/Anthropic 等 OpenAI-compatible 或原生 provider，并统一 structured output、usage 解析、重试、模型定价表和测试替身。工程代价是 API key、价格、限流、错误码差异和 CI mock。面试怎么讲：我会说我已经把真实 provider 接入路径跑通，但不会把单 provider 小样本夸成通用生产能力。
 
 Citation checker 语义能力弱：当前问题是 lexical overlap 只能拦明显错引。可行方案是加 LLM judge、NLI 模型或 sentence embedding entailment。工程代价是成本、延迟和 judge 可靠性评估。面试怎么讲：我会说现在是 CI 友好的第一道闸，不是最终事实评审。
 

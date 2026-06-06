@@ -52,7 +52,7 @@ py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --search-provid
 LLM providers：
 
 - `mock`：默认 LLM provider，离线可复现，用于测试和 mock plumbing benchmark。
-- `deepseek`：真实 OpenAI-compatible LLM provider，使用 DeepSeek JSON mode 生成 brief、plan 和 cited synthesis；需要 `DEEPSEEK_API_KEY`。
+- `deepseek`：真实 OpenAI-compatible LLM provider，使用 DeepSeek JSON mode 生成 brief、plan 和 cited synthesis；需要 `DEEPSEEK_API_KEY`，可用 `DEEPSEEK_MODEL` 覆盖默认模型。
 
 Search providers：
 
