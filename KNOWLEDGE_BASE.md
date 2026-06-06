@@ -88,6 +88,7 @@ Agent 编排层：`src/deepresearch_agent/orchestrator.py`。输入是用户 que
 可选方案：继续 mock-only；接 OpenAI/Anthropic；接 DeepSeek OpenAI-compatible API；一次性做多 provider。
 最终选择：先接一个显式启用的 DeepSeek provider，默认仍是 mock；API key 只读环境变量 `DEEPSEEK_API_KEY`，模型名允许用 `DEEPSEEK_MODEL` 覆盖。
 理由：DeepSeek API 兼容 OpenAI Chat Completions，适合用标准 `/chat/completions` 接入；官方 JSON Output 支持 `response_format={"type":"json_object"}`，满足 brief/plan/synthesis 的结构化输出验证；官方 Tool Calls 能力存在，但本项目当前工具调用由 Python orchestrator 管控，没有让模型直接发 tool call；本机有可用 key，可以在不提交密钥的前提下跑出真实 usage/cost。
+核对过的官方文档：JSON Output `https://api-docs.deepseek.com/guides/json_mode/`，Tool Calls `https://api-docs.deepseek.com/guides/function_calling/`，当前模型与价格 `https://api-docs.deepseek.com/quick_start/pricing`，本次实现使用的 legacy `deepseek-chat` USD 明细 `https://api-docs.deepseek.com/quick_start/pricing-details-usd`。
 代价：当前只代表 DeepSeek 一个 provider，不能泛化到所有模型；本次 benchmark 用的是默认 `deepseek-chat`，官方主文档已提示该模型名将在 2026-07-24 15:59 UTC 弃用，后续应迁移到 `deepseek-v4-flash` 并更新价格常量后重跑 benchmark。当前 `estimated_cost_usd` 是根据 provider usage 和代码里的 `deepseek-chat` 价格常量估算，不等同于长期稳定账单或产品级成本承诺。
 面试怎么答：我会说我没有把 mock 数字包装成真实成果，而是先用 DeepSeek 把 structured output、usage 解析、成本归因和真实搜索 benchmark 打通；但我也会主动说明它只是单 provider 小样本，下一步是迁移最新模型名、做 provider 抽象扩展和更强评测。
 
