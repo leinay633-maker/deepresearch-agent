@@ -31,26 +31,26 @@
 py -3.11 -m pytest -q
 ```
 
-最近一次结果：`11 passed, 1 warning`。warning 是 FastAPI TestClient / Starlette 关于 httpx 的 deprecation 提示，未影响功能。
+最近一次结果：`12 passed, 1 warning`。warning 是 FastAPI TestClient / Starlette 关于 httpx 的 deprecation 提示，未影响功能。
 
 benchmark 命令：
 
 ```powershell
 $env:REQUEST_TIMEOUT_SECONDS='8'
-py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --search-provider wikipedia --seed 20260606 --max-researchers 2 --max-results 3
+py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --search-provider wikipedia --seed 20260607 --max-researchers 2 --max-results 3
 ```
 
-最近一次 summary 在 `results/benchmark_summary.json`，原始记录在 `logs/benchmark-20260606T160617Z.jsonl`。本次是 DeepSeek LLM + Wikipedia search，`fallback_count_total=0`，没有降级到 mock search。
+最近一次 summary 在 `results/benchmark_summary.json`，原始记录在 `logs/benchmark-20260606T165321Z.jsonl`。本次是 DeepSeek `deepseek-v4-flash` + Wikipedia search，`fallback_count_total=0`，没有降级到 mock search。
 
 核心实测指标解释：下面这些是真实 provider local benchmark 记录，适合证明本机这次配置下 LLM provider、search adapter、usage/cost 记录和 citation checker 已经端到端跑通；它仍不是线上 SLA 或广义质量分数。延迟包含 DeepSeek 和 Wikipedia 网络/API 时间；citation_retention_rate 是 lexical checker 结果，不是语义级事实评估。
 
 - case_count: 5
-- success_count: 3
-- success_rate: 0.6
-- latency p50 / p90 / max: 17594.742ms / 19464.713ms / 20480.629ms
-- total_tokens: 14281
-- citation_retention_rate_avg: 0.7494
-- estimated_cost_usd_total: 0.0082474（按当前实现中的 `deepseek-chat` 价格常量估算，后续模型/价格页变化时需要重跑并重算）
+- success_count: 4
+- success_rate: 0.8
+- latency p50 / p90 / max: 37671.791ms / 41253.925ms / 42258.527ms
+- total_tokens: 18945
+- citation_retention_rate_avg: 0.8893
+- estimated_cost_usd_total: 0.00401674（按当前实现中的 `deepseek-v4-flash` 价格常量估算，后续模型/价格页变化时需要重跑并重算）
 - fallback_count_total: 0
 
 对比用 mock plumbing 原始记录仍保留在 `logs/benchmark-20260606T152954Z.jsonl`。mock 数字只证明离线路径和记录链路能跑，不能当真实性能、真实成本或真实答案质量成果。
@@ -85,7 +85,7 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 
 - 只接了 DeepSeek 一个真实 LLM provider；OpenAI/Anthropic 等其他 provider 未接。
 - DeepSeek 已实测真实 token usage 和 cost，但没有做长时间多轮稳定性/限流压测。
-- 当前默认 DeepSeek 模型是 `deepseek-chat`，官方主文档已提示它将在 2026-07-24 15:59 UTC 弃用；后续应切到 `deepseek-v4-flash` 并更新价格常量后重跑 benchmark。
+- 当前默认 DeepSeek 模型已切到 `deepseek-v4-flash`；`deepseek-chat` 只作为兼容 alias 保留在价格表里。
 - Citation checker 当前是 lexical overlap，不是语义级事实校验。
 - Wikipedia adapter 已实测能跑且本次 benchmark 无 fallback，但不是生产级搜索 provider。
 - mock benchmark 的 latency/success/citation/cost 不应作为面试成果开场，只能说它证明 pipeline plumbing 和记录链路能跑。

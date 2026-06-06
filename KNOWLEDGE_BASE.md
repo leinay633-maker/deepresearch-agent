@@ -88,15 +88,15 @@ Agent 编排层：`src/deepresearch_agent/orchestrator.py`。输入是用户 que
 可选方案：继续 mock-only；接 OpenAI/Anthropic；接 DeepSeek OpenAI-compatible API；一次性做多 provider。
 最终选择：先接一个显式启用的 DeepSeek provider，默认仍是 mock；API key 只读环境变量 `DEEPSEEK_API_KEY`，模型名允许用 `DEEPSEEK_MODEL` 覆盖。
 理由：DeepSeek API 兼容 OpenAI Chat Completions，适合用标准 `/chat/completions` 接入；官方 JSON Output 支持 `response_format={"type":"json_object"}`，满足 brief/plan/synthesis 的结构化输出验证；官方 Tool Calls 能力存在，但本项目当前工具调用由 Python orchestrator 管控，没有让模型直接发 tool call；本机有可用 key，可以在不提交密钥的前提下跑出真实 usage/cost。
-核对过的官方文档：JSON Output `https://api-docs.deepseek.com/guides/json_mode/`，Tool Calls `https://api-docs.deepseek.com/guides/function_calling/`，当前模型与价格 `https://api-docs.deepseek.com/quick_start/pricing`，本次实现使用的 legacy `deepseek-chat` USD 明细 `https://api-docs.deepseek.com/quick_start/pricing-details-usd`。
-代价：当前只代表 DeepSeek 一个 provider，不能泛化到所有模型；本次 benchmark 用的是默认 `deepseek-chat`，官方主文档已提示该模型名将在 2026-07-24 15:59 UTC 弃用，后续应迁移到 `deepseek-v4-flash` 并更新价格常量后重跑 benchmark。当前 `estimated_cost_usd` 是根据 provider usage 和代码里的 `deepseek-chat` 价格常量估算，不等同于长期稳定账单或产品级成本承诺。
-面试怎么答：我会说我没有把 mock 数字包装成真实成果，而是先用 DeepSeek 把 structured output、usage 解析、成本归因和真实搜索 benchmark 打通；但我也会主动说明它只是单 provider 小样本，下一步是迁移最新模型名、做 provider 抽象扩展和更强评测。
+核对过的官方文档：JSON Output `https://api-docs.deepseek.com/guides/json_mode/`，Tool Calls `https://api-docs.deepseek.com/guides/function_calling/`，当前模型与价格 `https://api-docs.deepseek.com/quick_start/pricing`。
+代价：当前只代表 DeepSeek 一个 provider，不能泛化到所有模型；默认模型已从历史 `deepseek-chat` 迁移到 `deepseek-v4-flash`，但 `deepseek-chat` / `deepseek-reasoner` 仍只作为兼容 alias 保留在价格表中。当前 `estimated_cost_usd` 是根据 provider usage 和代码里的 `deepseek-v4-flash` 价格常量估算，不等同于长期稳定账单或产品级成本承诺。
+面试怎么答：我会说我没有把 mock 数字包装成真实成果，而是先用 DeepSeek 把 structured output、usage 解析、成本归因和真实搜索 benchmark 打通；迁移 v4-flash 后又重跑了 schema validation 和 5 case benchmark。但我也会主动说明它只是单 provider 小样本，下一步是 provider 抽象扩展和更强评测。
 
 # 5 实现细节
 
 Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。局限是 planner 还不会根据 researcher 中间结果动态追加子问题。
 
-DeepSeek Planner 验证：`src/deepresearch_agent/llm.py` 里新增了 `DeepSeekLLMProvider.plan`，第一步先独立验证结构化输出；验证脚本是 `src/deepresearch_agent/validate_deepseek_structured_output.py`，它从环境变量读取 `DEEPSEEK_API_KEY`，用 JSON mode 请求 `deepseek-chat`，并用现有 `SubQuestion` Pydantic schema 解析输出。后续步骤再把同一个 provider 扩展到 `create_brief` 和 `synthesize`，避免一次性接太多导致错误边界不清。
+DeepSeek Planner 验证：`src/deepresearch_agent/llm.py` 里新增了 `DeepSeekLLMProvider.plan`，第一步先独立验证结构化输出；验证脚本是 `src/deepresearch_agent/validate_deepseek_structured_output.py`，它从环境变量读取 `DEEPSEEK_API_KEY`，用 JSON mode 请求默认 `deepseek-v4-flash`，并用现有 `SubQuestion` Pydantic schema 解析输出。后续步骤再把同一个 provider 扩展到 `create_brief` 和 `synthesize`，避免一次性接太多导致错误边界不清。
 
 DeepSeek Synthesizer 接入：步骤 2 以后，`DeepSeekLLMProvider.create_brief`、`plan`、`synthesize` 都走 DeepSeek JSON mode。CLI 和 API 可以通过 `llm_provider="deepseek"` 或 CLI 参数 `--llm-provider deepseek` 显式启用；默认仍是 mock，保证离线测试不受 API key 影响。当前 synthesis 要求模型输出 `{"answer": "...", "claims": [...]}`，并要求每条 factual claim 使用输入 sources 中已有的 `[Sx]` citation ID。
 
@@ -108,7 +108,7 @@ Synthesizer：`src/deepresearch_agent/llm.py` 的 `synthesize`。输入是 brief
 
 Citation Checker：`src/deepresearch_agent/citation.py`。输入是 claims 和 sources，输出 `CitationCheckReport`。关键设计是每条 claim 都落到 citation ID 和 overlap score。局限是只能做 lexical support。
 
-Cost Tracker：`src/deepresearch_agent/cost.py`。mock provider 仍使用字符数近似估算；DeepSeek provider 已接入 API 返回的真实 `prompt_tokens` / `completion_tokens`，并通过 `CostTracker.add_usage()` 记录到同一套 `CostSummary`。当前 `deepseek-chat` 成本计算按 DeepSeek `pricing-details-usd` 页的 deepseek-chat 行：input cache hit `$0.07/1M tokens`，input cache miss `$0.27/1M tokens`，output `$1.10/1M tokens`。注意 DeepSeek 主价格页已展示 v4-flash/v4-pro 新价格和 `deepseek-chat` 弃用时间，后续切模型时必须同步更新价格常量并重跑 benchmark。如果响应没有 token usage，DeepSeek 路径会直接失败，不会退回字符估算伪装成真实 usage。
+Cost Tracker：`src/deepresearch_agent/cost.py`。mock provider 仍使用字符数近似估算；DeepSeek provider 已接入 API 返回的真实 `prompt_tokens` / `completion_tokens`，并通过 `CostTracker.add_usage()` 记录到同一套 `CostSummary`。当前 `deepseek-v4-flash` 成本计算按 DeepSeek 当前模型价格页：input cache hit `$0.0028/1M tokens`，input cache miss `$0.14/1M tokens`，output `$0.28/1M tokens`。`deepseek-chat` 和 `deepseek-reasoner` 只作为 v4-flash 兼容 alias 使用同一价格表；未配置价格的模型会直接报错，避免 silently 用错单价。如果响应没有 token usage，DeepSeek 路径会直接失败，不会退回字符估算伪装成真实 usage。
 
 Trace Logger：`src/deepresearch_agent/tracing.py`。每个 run 写 `logs/research-<run_id>.jsonl`，记录 stage、status、duration_ms、payload。runtime trace 默认不提交 Git，benchmark 原始记录提交。
 
@@ -168,6 +168,15 @@ Trace Logger：`src/deepresearch_agent/tracing.py`。每个 run 写 `logs/resear
 复盘：真实检索 adapter 不只是“能联网”，还要把 agent planner 产出的长问题转换成搜索引擎能吃的 query。这个 bug 也证明 fallback 指标必须进入 benchmark，否则会误以为检索全是真实的。
 面试可能追问：为什么不用更强搜索？回答：本次按约束先用无 key 的 Wikipedia，后续换 Tavily/Brave 是新增 adapter，不需要改 orchestrator。
 
+## 问题 7：DeepSeek 默认模型和价格表需要迁移到 v4-flash
+
+现象：官方模型与价格页已经把主模型列成 `deepseek-v4-flash` / `deepseek-v4-pro`，并说明 `deepseek-chat`、`deepseek-reasoner` 是兼容别名；继续默认 `deepseek-chat` 会让代码和最新文档脱节。
+原因：步骤 1 到步骤 4 接入 DeepSeek 时使用的是历史兼容模型名和旧价格常量，后来核对官方文档发现需要迁移。
+排查：重新查 DeepSeek 官方 Models & Pricing、Create Chat Completion、JSON Output 和 Tool Calls 文档，确认 `deepseek-v4-flash` 支持 JSON Output 和 Tool Calls，且当前价格是 cache hit `$0.0028/1M`、cache miss `$0.14/1M`、output `$0.28/1M`。
+修复：把默认模型改成 `deepseek-v4-flash`，验证脚本默认值同步迁移；成本计算改成按模型查价格表，`deepseek-chat` / `deepseek-reasoner` 仅作为 alias 保留；新增单测覆盖 cache hit/cache miss/output 成本计算。随后用 `deepseek-v4-flash` 重跑 planner schema validation 和真实 benchmark。
+复盘：模型 provider 不是一次接完就结束，模型名、价格和功能支持都会变；代码里必须有显式定价表和失败策略，不能把过期单价悄悄沿用。
+面试可能追问：为什么不直接删掉 `deepseek-chat`？回答：删掉会让旧运行记录和用户自定义 `DEEPSEEK_MODEL=deepseek-chat` 立即失效；我保留 alias，但当前默认和新 benchmark 都走 `deepseek-v4-flash`。
+
 # 7 实测数据
 
 本节所有 mock benchmark 数字只用于证明 pipeline plumbing 能端到端跑通，不能当作真实性能、真实成本或真实答案质量成果。尤其不能在面试里说“我的 DeepResearch p50 是个位数毫秒”这类话，因为这个延迟测的是本机 Python 跑 deterministic mock 的速度，换机器、换进程热身状态、换依赖版本都会变。
@@ -175,11 +184,11 @@ Trace Logger：`src/deepresearch_agent/tracing.py`。每个 run 写 `logs/resear
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 120 -e ".[dev]"` 成功。
-测试验证：`py -3.11 -m pytest -q`，结果 `9 passed, 1 warning in 1.04s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `12 passed, 1 warning in 0.88s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
-DeepSeek 结构化输出验证：`py -3.11 -m deepresearch_agent.validate_deepseek_structured_output --query "How should citation checking reduce hallucination in deep research agents?" --max-researchers 3` 成功。`deepseek-chat` 返回了 3 条合法 `SubQuestion`，Pydantic schema 解析通过。真实输出主题分别覆盖 citation checking 的机制、实证证据、最佳实践与限制。这是步骤 1 的历史记录，当时只验证 planner 结构化输出；后续步骤已经把 DeepSeek 扩展到端到端 synthesis 和真实 usage/cost。
+DeepSeek 结构化输出验证：`py -3.11 -m deepresearch_agent.validate_deepseek_structured_output --query "How should citation checking reduce hallucination in deep research agents?" --max-researchers 3` 成功。迁移后默认 `deepseek-v4-flash` 返回了 3 条合法 `SubQuestion`，Pydantic schema 解析通过。真实输出主题分别覆盖 citation checking 机制、citation accuracy 与 hallucination rate 的关系、以及 citation checking 的失败模式。
 
 DeepSeek 端到端单条验证（LLM 真，search 仍是 mock）：`py -3.11 -m deepresearch_agent.cli "How should citation checking reduce hallucination in deep research agents?" --llm-provider deepseek --search-provider mock --max-researchers 2 --max-results 3 --json` 成功。模型生成的 brief 不再是模板回填，scope 是“Methods and effectiveness of citation verification in mitigating factual inaccuracies in AI-driven research agents”；planner 拆出 automated citation verification 和 human-in-the-loop 对比两个子问题；synthesis 生成了 markdown 报告和 6 条 claims。步骤 2 首次成功运行记录：latency `18987.535ms`，raw_search_result_count `6`，deduped_source_count `7`，citation_retention_rate `0.8333`，supported_claims `5/6`。其中 1 条 human-in-the-loop claim 被当前 lexical citation checker 标为 unsupported。这是接真实 usage 前的历史记录，所以当时的 cost 不能当真实成本；步骤 3 已补上 provider usage 解析。
 
@@ -200,33 +209,35 @@ benchmark 汇总：管线 plumbing 指标，mock，非真实性能。具体 late
 | citation_retention_rate_avg | 当前 mock run 为 1.0 | mock 自生成自引用，只说明 checker 链路没断 |
 | fallback_count_total | 当前 mock run 为 0 | mock provider 本身不触发外部失败 |
 
-真实 DeepSeek + Wikipedia benchmark：`$env:REQUEST_TIMEOUT_SECONDS='8'; py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --search-provider wikipedia --seed 20260606 --max-researchers 2 --max-results 3`。本次 LLM 是 DeepSeek，检索 primary 是 Wikipedia，最终 `fallback_count_total=0`，没有 mock fallback。原始记录：`logs/benchmark-20260606T160617Z.jsonl`，summary：`results/benchmark_summary.json`。
+旧 `deepseek-chat` 兼容 benchmark 原始记录：`logs/benchmark-20260606T160617Z.jsonl`，当时 success_rate `0.6`、citation_retention_rate_avg `0.7494`、estimated_cost_usd_total `0.0082474`。这是历史记录，不再作为当前主口径。
+
+真实 DeepSeek v4-flash + Wikipedia benchmark：`$env:REQUEST_TIMEOUT_SECONDS='8'; py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --search-provider wikipedia --seed 20260607 --max-researchers 2 --max-results 3`。本次 LLM 是 `deepseek-v4-flash`，检索 primary 是 Wikipedia，最终 `fallback_count_total=0`，没有 mock fallback。原始记录：`logs/benchmark-20260606T165321Z.jsonl`，summary：`results/benchmark_summary.json`。
 
 | 指标 | 真实 benchmark 记录 | 怎么解释 |
 |---|---:|---|
 | case_count | 5 | 仍是小型本地 benchmark，不是公开权威评测 |
-| success_count / success_rate | 3 / 0.6 | 真实 citation checker 下有 2 条 case 未达当前 success 条件 |
-| latency p50 | 17594.742ms | 包含 DeepSeek + Wikipedia live 网络时间，不是 SLA |
-| latency p90 | 19464.713ms | 同上 |
-| latency max | 20480.629ms | 同上 |
-| total_tokens | 14281 | 来自 DeepSeek usage 字段 |
-| avg_tokens | 2856.2 | 来自 DeepSeek usage 字段 |
-| estimated_cost_usd_total | 0.0082474 | 按当前实现中的 `deepseek-chat` 价格常量估算，后续切模型或价格页变化必须重算 |
-| citation_retention_rate_avg | 0.7494 | lexical citation checker 结果，不是语义级事实评估 |
+| success_count / success_rate | 4 / 0.8 | 真实 citation checker 下有 1 条 case 未达当前 success 条件 |
+| latency p50 | 37671.791ms | 包含 DeepSeek + Wikipedia live 网络时间，不是 SLA |
+| latency p90 | 41253.925ms | 同上 |
+| latency max | 42258.527ms | 同上 |
+| total_tokens | 18945 | 来自 DeepSeek usage 字段 |
+| avg_tokens | 3789.0 | 来自 DeepSeek usage 字段 |
+| estimated_cost_usd_total | 0.00401674 | 按当前实现中的 `deepseek-v4-flash` 价格常量估算，后续切模型或价格页变化必须重算 |
+| citation_retention_rate_avg | 0.8893 | lexical citation checker 结果，不是语义级事实评估 |
 | fallback_count_total | 0 | 本次没有降级到 mock search |
 
-逐 case 结果：case-001 成功，retention `0.8571`，cost `$0.00169658`；case-002 失败，retention `0.4615`，cost `$0.00185575`；case-003 成功，retention `1.0`，cost `$0.00167514`；case-004 成功，retention `1.0`，cost `$0.00134979`；case-005 失败，retention `0.4286`，cost `$0.00167014`。这组数据比 mock plumbing 更有意义，因为 LLM token/cost 是 provider usage，search 也没有 fallback；但它仍受 Wikipedia 搜索质量和 lexical citation checker 限制。
+逐 case 结果：case-001 成功，retention `1.0`，cost `$0.0009961`；case-002 成功，retention `1.0`，cost `$0.00077798`；case-003 成功，retention `0.8571`，cost `$0.00071078`；case-004 失败，retention `0.7143`，cost `$0.00077616`；case-005 成功，retention `0.875`，cost `$0.00075572`。这组数据比 mock plumbing 更有意义，因为 LLM token/cost 是 provider usage，search 也没有 fallback；但它仍受 Wikipedia 搜索质量、LLM 输出波动和 lexical citation checker 限制。
 
 未实测：真实搜索 API 高并发限流、语义级 citation faithfulness、Redis/PostgreSQL 缓存、OpenTelemetry/LangSmith tracing、真实用户流量。
 
 # 8 评测设计
 
 answer completeness：当前未做 LLM judge，只用 case success 间接衡量，未实测完整性。
-citation faithfulness：当前实测指标是 claim/source lexical overlap。mock plumbing run 平均 retention 是 `1.0`，只能说明 mock 引用链路没断；DeepSeek + Wikipedia benchmark 平均 retention 是 `0.7494`，暴露出真实 synthesis 下当前 checker 会拦下一部分 unsupported claim。
+citation faithfulness：当前实测指标是 claim/source lexical overlap。mock plumbing run 平均 retention 是 `1.0`，只能说明 mock 引用链路没断；DeepSeek v4-flash + Wikipedia benchmark 平均 retention 是 `0.8893`，但仍有 1 条 case 未达当前 success 条件。
 source diversity：当前记录 deduped_source_count，但没有按 domain/provider 多样性打分。
 hallucination rate：当前用 unsupported citation count 作为 proxy，不能覆盖无引用幻觉。
 latency：benchmark 记录每 case latency_ms，并计算 P50/P90/max；mock latency 只能作为 plumbing 回归信号，DeepSeek + Wikipedia latency 包含真实网络/API 时间，也不能当线上 SLA。
-cost：mock provider 成本为 0，token 用字符估算；DeepSeek provider 已接真实 usage，并按当前实现里的价格常量估算成本。其他真实 LLM provider 未实测。
+cost：mock provider 成本为 0，token 用字符估算；DeepSeek provider 已接真实 usage，并按当前实现里的 v4-flash 价格常量估算成本。其他真实 LLM provider 未实测。
 工具失败恢复：有 unit test 覆盖 primary failure fallback 和 circuit breaker open；第一次 DeepSeek + Wikipedia benchmark 出现过 fallback，修复 Wikipedia 长查询压缩后最终 benchmark 的 `fallback_count_total=0`。
 multi-hop 成功率：当前没有真实 multi-hop 标注集，未实测。
 
@@ -271,7 +282,7 @@ multi-hop 成功率：当前没有真实 multi-hop 标注集，未实测。
 
 # 10 局限与优化空间
 
-真实 LLM provider 覆盖还窄：当前只接了 DeepSeek，一个 provider 不能代表所有模型/价格/限流行为，而且默认 `deepseek-chat` 模型名需要在官方弃用日前迁移到 `deepseek-v4-flash`。可行方案是继续实现 OpenAI/Anthropic 等 OpenAI-compatible 或原生 provider，并统一 structured output、usage 解析、重试、模型定价表和测试替身。工程代价是 API key、价格、限流、错误码差异和 CI mock。面试怎么讲：我会说我已经把真实 provider 接入路径跑通，但不会把单 provider 小样本夸成通用生产能力。
+真实 LLM provider 覆盖还窄：当前只接了 DeepSeek v4-flash，一个 provider 不能代表所有模型/价格/限流行为。可行方案是继续实现 OpenAI/Anthropic 等 OpenAI-compatible 或原生 provider，并统一 structured output、usage 解析、重试、模型定价表和测试替身。工程代价是 API key、价格、限流、错误码差异和 CI mock。面试怎么讲：我会说我已经把真实 provider 接入路径跑通，但不会把单 provider 小样本夸成通用生产能力。
 
 Citation checker 语义能力弱：当前问题是 lexical overlap 只能拦明显错引。可行方案是加 LLM judge、NLI 模型或 sentence embedding entailment。工程代价是成本、延迟和 judge 可靠性评估。面试怎么讲：我会说现在是 CI 友好的第一道闸，不是最终事实评审。
 

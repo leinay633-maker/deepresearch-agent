@@ -42,7 +42,7 @@ py -3.11 -m deepresearch_agent.benchmark --search-provider mock --seed 20260606
 ```powershell
 $env:DEEPSEEK_API_KEY="<your-key>"
 $env:REQUEST_TIMEOUT_SECONDS="8"
-py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --search-provider wikipedia --seed 20260606 --max-researchers 2 --max-results 3
+py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --search-provider wikipedia --seed 20260607 --max-researchers 2 --max-results 3
 ```
 
 输出会写入 `logs/benchmark-*.jsonl` 和 `results/benchmark_summary.json`。
@@ -52,7 +52,7 @@ py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --search-provid
 LLM providers：
 
 - `mock`：默认 LLM provider，离线可复现，用于测试和 mock plumbing benchmark。
-- `deepseek`：真实 OpenAI-compatible LLM provider，使用 DeepSeek JSON mode 生成 brief、plan 和 cited synthesis；需要 `DEEPSEEK_API_KEY`，可用 `DEEPSEEK_MODEL` 覆盖默认模型。
+- `deepseek`：真实 OpenAI-compatible LLM provider，默认模型 `deepseek-v4-flash`，使用 DeepSeek JSON mode 生成 brief、plan 和 cited synthesis；需要 `DEEPSEEK_API_KEY`，可用 `DEEPSEEK_MODEL` 覆盖默认模型。
 
 Search providers：
 

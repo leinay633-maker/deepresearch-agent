@@ -6,7 +6,7 @@ import json
 import os
 
 from deepresearch_agent.cost import CostTracker
-from deepresearch_agent.llm import DeepSeekLLMProvider
+from deepresearch_agent.llm import DEEPSEEK_DEFAULT_MODEL, DeepSeekLLMProvider
 from deepresearch_agent.schemas import ResearchBrief
 
 
@@ -49,7 +49,7 @@ def main() -> None:
         "--query",
         default="How should citation checking reduce hallucination in deep research agents?",
     )
-    parser.add_argument("--model", default="deepseek-chat")
+    parser.add_argument("--model", default=DEEPSEEK_DEFAULT_MODEL)
     parser.add_argument("--max-researchers", type=int, default=3)
     parser.add_argument("--max-retries", type=int, default=2)
     args = parser.parse_args()

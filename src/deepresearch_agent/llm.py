@@ -12,9 +12,18 @@ from urllib.request import Request, urlopen
 from deepresearch_agent.cost import CostTracker
 from deepresearch_agent.schemas import Finding, ResearchBrief, ResearchRequest, Source, SubQuestion
 
-DEEPSEEK_CHAT_INPUT_CACHE_HIT_PER_1M = 0.07
-DEEPSEEK_CHAT_INPUT_CACHE_MISS_PER_1M = 0.27
-DEEPSEEK_CHAT_OUTPUT_PER_1M = 1.10
+DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-flash"
+DEEPSEEK_V4_FLASH_PRICING_USD_PER_1M = {
+    "input_cache_hit": 0.0028,
+    "input_cache_miss": 0.14,
+    "output": 0.28,
+}
+DEEPSEEK_PRICING_USD_PER_1M = {
+    DEEPSEEK_DEFAULT_MODEL: DEEPSEEK_V4_FLASH_PRICING_USD_PER_1M,
+    # Compatibility aliases documented by DeepSeek for V4 Flash non-thinking/thinking modes.
+    "deepseek-chat": DEEPSEEK_V4_FLASH_PRICING_USD_PER_1M,
+    "deepseek-reasoner": DEEPSEEK_V4_FLASH_PRICING_USD_PER_1M,
+}
 
 
 @dataclass(frozen=True)
@@ -158,7 +167,7 @@ class DeepSeekLLMProvider:
 
     def __init__(
         self,
-        model: str = "deepseek-chat",
+        model: str = DEEPSEEK_DEFAULT_MODEL,
         base_url: str = "https://api.deepseek.com",
         timeout_seconds: float = 60.0,
         max_retries: int = 2,
@@ -398,7 +407,9 @@ class DeepSeekLLMProvider:
     def _add_usage_cost(
         self, cost: CostTracker, stage: str, result: LLMJsonResult
     ):
-        input_tokens, output_tokens, estimated_cost = _deepseek_usage_cost_usd(result.usage)
+        input_tokens, output_tokens, estimated_cost = _deepseek_usage_cost_usd(
+            self.model, result.usage
+        )
         return cost.add_usage(
             stage=stage,
             input_tokens=input_tokens,
@@ -461,11 +472,14 @@ def _extract_content(payload: dict) -> str:
     return content
 
 
-def _deepseek_usage_cost_usd(usage: dict) -> tuple[int, int, float]:
+def _deepseek_usage_cost_usd(model: str, usage: dict) -> tuple[int, int, float]:
     prompt_tokens = int(usage.get("prompt_tokens") or 0)
     completion_tokens = int(usage.get("completion_tokens") or 0)
     if prompt_tokens <= 0 or completion_tokens <= 0:
         raise ValueError(f"DeepSeek usage missing token counts: {usage}")
+    pricing = DEEPSEEK_PRICING_USD_PER_1M.get(model.lower())
+    if pricing is None:
+        raise ValueError(f"DeepSeek pricing is not configured for model: {model}")
 
     cache_hit_tokens = int(usage.get("prompt_cache_hit_tokens") or 0)
     cache_miss_tokens = usage.get("prompt_cache_miss_tokens")
@@ -474,8 +488,8 @@ def _deepseek_usage_cost_usd(usage: dict) -> tuple[int, int, float]:
     cache_miss_tokens = int(cache_miss_tokens)
 
     input_cost = (
-        cache_hit_tokens * DEEPSEEK_CHAT_INPUT_CACHE_HIT_PER_1M
-        + cache_miss_tokens * DEEPSEEK_CHAT_INPUT_CACHE_MISS_PER_1M
+        cache_hit_tokens * pricing["input_cache_hit"]
+        + cache_miss_tokens * pricing["input_cache_miss"]
     ) / 1_000_000
-    output_cost = completion_tokens * DEEPSEEK_CHAT_OUTPUT_PER_1M / 1_000_000
+    output_cost = completion_tokens * pricing["output"] / 1_000_000
     return prompt_tokens, completion_tokens, input_cost + output_cost

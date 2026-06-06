@@ -3,6 +3,7 @@ from __future__ import annotations
 from deepresearch_agent.citation import CitationChecker
 from deepresearch_agent.cost import CostTracker
 from deepresearch_agent.dedup import SourceDeduplicator
+from deepresearch_agent.llm import _deepseek_usage_cost_usd
 from deepresearch_agent.schemas import Source
 from deepresearch_agent.verifier import SourceVerifier
 
@@ -62,7 +63,7 @@ def test_citation_checker_flags_unsupported_claim() -> None:
 
 
 def test_cost_tracker_can_record_provider_usage() -> None:
-    tracker = CostTracker(provider="deepseek", model="deepseek-chat")
+    tracker = CostTracker(provider="deepseek", model="deepseek-v4-flash")
 
     record = tracker.add_usage(
         stage="planning",
@@ -76,3 +77,19 @@ def test_cost_tracker_can_record_provider_usage() -> None:
     assert record.output_tokens == 200
     assert summary.total_tokens == 1200
     assert summary.total_estimated_cost_usd == 0.00049
+
+
+def test_deepseek_v4_flash_usage_cost_uses_cache_buckets() -> None:
+    input_tokens, output_tokens, cost = _deepseek_usage_cost_usd(
+        "deepseek-v4-flash",
+        {
+            "prompt_tokens": 1000,
+            "completion_tokens": 200,
+            "prompt_cache_hit_tokens": 250,
+            "prompt_cache_miss_tokens": 750,
+        },
+    )
+
+    assert input_tokens == 1000
+    assert output_tokens == 200
+    assert cost == (250 * 0.0028 + 750 * 0.14 + 200 * 0.28) / 1_000_000

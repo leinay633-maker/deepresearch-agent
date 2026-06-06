@@ -59,7 +59,7 @@
 [状态: 待消化]
 标签：LLM Provider / 选型
 检索关键词：DeepSeek, JSON mode, provider decision
-回答：我需要一个真实 provider 来验证 structured output、usage 解析和成本归因，但又不能让默认运行依赖 API key。DeepSeek 的 API 兼容 OpenAI Chat Completions，支持 JSON Output，足够验证 brief、planner、synthesis 这些结构化输出；默认仍保留 mock，只有显式传 `--llm-provider deepseek` 才走真实模型。代价是现在只代表 DeepSeek 一个 provider，而且默认 `deepseek-chat` 模型名后续要迁移到 `deepseek-v4-flash`。
+回答：我需要一个真实 provider 来验证 structured output、usage 解析和成本归因，但又不能让默认运行依赖 API key。DeepSeek 的 API 兼容 OpenAI Chat Completions，支持 JSON Output，足够验证 brief、planner、synthesis 这些结构化输出；默认仍保留 mock，只有显式传 `--llm-provider deepseek` 才走真实模型。现在默认真实模型已切到 `deepseek-v4-flash`，`deepseek-chat` 只作为兼容 alias 保留。
 关联模块：`llm.py`, `config.py`, `KNOWLEDGE_BASE.md`
 可追问：
 1. 为什么不用 OpenAI？
@@ -311,7 +311,7 @@
 [状态: 待消化]
 标签：评测 / Citation
 检索关键词：citation_retention_rate
-回答：它是 supported_claims / total_claims。mock benchmark 的平均 retention 是 1.0，只说明 mock 引用链路没断；DeepSeek + Wikipedia 真实 provider benchmark 的平均 retention 是 0.7494，5 条里有 2 条没有达到当前 success 条件。这个指标仍是 lexical overlap，不等于完整语义事实校验。
+回答：它是 supported_claims / total_claims。mock benchmark 的平均 retention 是 1.0，只说明 mock 引用链路没断；DeepSeek v4-flash + Wikipedia 真实 provider benchmark 的平均 retention 是 0.8893，5 条里有 1 条没有达到当前 success 条件。这个指标仍是 lexical overlap，不等于完整语义事实校验。
 关联模块：`citation.py`, `benchmark.py`, `results/benchmark_summary.json`
 可追问：
 1. 1.0 是否说明没有幻觉？
@@ -368,7 +368,7 @@
 [状态: 待消化]
 标签：成本控制 / 可观测性
 检索关键词：stage cost, attribution
-回答：多 Agent 系统里只知道总 token 没有太大调优价值。按阶段归因后，才能知道成本主要花在 brief、planning 还是 synthesis。DeepSeek 单条验证里，synthesis 成本最高；真实 DeepSeek + Wikipedia benchmark 总 token 是 14281，总成本按当前实现价格常量估算是 0.0082474 美元。后续切到 `deepseek-v4-flash` 或价格变动时，这个成本必须重算。
+回答：多 Agent 系统里只知道总 token 没有太大调优价值。按阶段归因后，才能知道成本主要花在 brief、planning 还是 synthesis。DeepSeek v4-flash + Wikipedia benchmark 总 token 是 18945，总成本按当前实现价格常量估算是 0.00401674 美元。后续模型或价格变动时，这个成本必须重算。
 关联模块：`cost.py`, `benchmark.py`
 可追问：
 1. researcher 的搜索成本怎么计？
@@ -401,7 +401,7 @@
 [状态: 待消化]
 标签：Benchmark / 评测
 检索关键词：benchmark, latency, token, citation
-回答：`benchmark.py` 记录 seed、配置快照、case_id、query、latency_ms、total_tokens、estimated_cost_usd、deduped_source_count、raw_search_result_count、citation_retention_rate、success、fallback_count 和 output_summary。现在有两类数据：mock plumbing run 只证明离线路径和记录链路；DeepSeek + Wikipedia run 是真实 provider 小样本，5 条 case 成功 3 条、fallback 0、total_tokens 14281、总成本按当前实现价格常量估算为 0.0082474 美元、平均 citation_retention_rate 0.7494。
+回答：`benchmark.py` 记录 seed、配置快照、case_id、query、latency_ms、total_tokens、estimated_cost_usd、deduped_source_count、raw_search_result_count、citation_retention_rate、success、fallback_count 和 output_summary。现在有两类数据：mock plumbing run 只证明离线路径和记录链路；DeepSeek v4-flash + Wikipedia run 是真实 provider 小样本，5 条 case 成功 4 条、fallback 0、total_tokens 18945、总成本按当前实现价格常量估算为 0.00401674 美元、平均 citation_retention_rate 0.8893。
 关联模块：`benchmark.py`, `results/benchmark_summary.json`
 可追问：
 1. 为什么只 5 条 case？
@@ -458,7 +458,7 @@
 [状态: 待消化]
 标签：局限 / 诚实表达
 检索关键词：limitations, real LLM, semantic evaluation
-回答：最大短板已经不是“完全没有真实 LLM”，而是只接了 DeepSeek 一个 provider，真实 benchmark 也只有 5 条小样本；Wikipedia 不是生产级搜索，citation checker 只是 lexical overlap，不能代表完整事实校验。我会在面试里主动说清楚：真实 provider 路径和 cost usage 已经跑通，但质量评测和生产化还没有完成。
+回答：最大短板已经不是“完全没有真实 LLM”，而是只接了 DeepSeek v4-flash 一个 provider，真实 benchmark 也只有 5 条小样本；Wikipedia 不是生产级搜索，citation checker 只是 lexical overlap，不能代表完整事实校验。我会在面试里主动说清楚：真实 provider 路径和 cost usage 已经跑通，但质量评测和生产化还没有完成。
 关联模块：`llm.py`, `citation.py`, `KNOWLEDGE_BASE.md`
 可追问：
 1. 下一步先补哪个？
