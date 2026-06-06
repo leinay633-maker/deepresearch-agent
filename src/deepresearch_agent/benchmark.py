@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
@@ -28,15 +29,29 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     records = []
 
     settings = load_settings()
+    effective_llm_model = _effective_llm_model(args, settings)
+    effective_settings = replace(
+        settings,
+        llm_provider=args.llm_provider,
+        search_provider=args.search_provider,
+        max_researchers=args.max_researchers,
+        deepseek_model=effective_llm_model
+        if args.llm_provider == "deepseek"
+        else settings.deepseek_model,
+    )
+    settings_snapshot = asdict(effective_settings)
+    settings_snapshot["llm_model"] = effective_llm_model
+    settings_snapshot["max_results"] = args.max_results
     config_snapshot = {
         "seed": args.seed,
-        "llm_provider": args.llm_provider,
-        "llm_model": args.llm_model,
-        "search_provider": args.search_provider,
+        "llm_provider": effective_settings.llm_provider,
+        "llm_model": effective_llm_model,
+        "search_provider": effective_settings.search_provider,
         "case_count": len(cases),
-        "max_researchers": args.max_researchers,
+        "max_researchers": effective_settings.max_researchers,
         "max_results": args.max_results,
-        "settings": settings.__dict__,
+        "request_timeout_seconds": effective_settings.request_timeout_seconds,
+        "settings": settings_snapshot,
     }
 
     with raw_path.open("w", encoding="utf-8") as file:
@@ -44,14 +59,14 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         for case in cases:
             request = ResearchRequest(
                 query=case["query"],
-                max_researchers=args.max_researchers,
+                max_researchers=effective_settings.max_researchers,
                 max_results_per_researcher=args.max_results,
-                llm_provider=args.llm_provider,
-                llm_model=args.llm_model,
-                search_provider=args.search_provider,
+                llm_provider=effective_settings.llm_provider,
+                llm_model=effective_llm_model,
+                search_provider=effective_settings.search_provider,
                 seed=args.seed,
             )
-            report = await DeepResearchOrchestrator(settings=settings).run(request)
+            report = await DeepResearchOrchestrator(settings=effective_settings).run(request)
             record = {
                 "type": "case_result",
                 "case_id": case["id"],
@@ -73,6 +88,14 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     summary = _summarize(records, config_snapshot, raw_path)
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary
+
+
+def _effective_llm_model(args: argparse.Namespace, settings: Any) -> str:
+    if args.llm_model:
+        return args.llm_model
+    if args.llm_provider == "deepseek":
+        return settings.deepseek_model
+    return settings.mock_model_name
 
 
 def _load_cases(path: Path) -> list[dict[str, str]]:
