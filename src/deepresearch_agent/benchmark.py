@@ -30,6 +30,8 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     settings = load_settings()
     config_snapshot = {
         "seed": args.seed,
+        "llm_provider": args.llm_provider,
+        "llm_model": args.llm_model,
         "search_provider": args.search_provider,
         "case_count": len(cases),
         "max_researchers": args.max_researchers,
@@ -44,6 +46,8 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 query=case["query"],
                 max_researchers=args.max_researchers,
                 max_results_per_researcher=args.max_results,
+                llm_provider=args.llm_provider,
+                llm_model=args.llm_model,
                 search_provider=args.search_provider,
                 seed=args.seed,
             )
@@ -140,6 +144,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the DeepResearch Agent benchmark.")
     parser.add_argument("--cases", default=None)
     parser.add_argument("--search-provider", choices=["mock", "wikipedia"], default="mock")
+    parser.add_argument("--llm-provider", choices=["mock", "deepseek"], default="mock")
+    parser.add_argument("--llm-model", default=None)
     parser.add_argument("--seed", type=int, default=20260606)
     parser.add_argument("--max-researchers", type=int, default=3)
     parser.add_argument("--max-results", type=int, default=4)

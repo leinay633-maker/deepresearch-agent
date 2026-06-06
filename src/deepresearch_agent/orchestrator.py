@@ -10,7 +10,7 @@ from deepresearch_agent.citation import CitationChecker
 from deepresearch_agent.config import Settings, load_settings
 from deepresearch_agent.cost import CostTracker
 from deepresearch_agent.dedup import SourceDeduplicator
-from deepresearch_agent.llm import MockLLMProvider, summarize_sources
+from deepresearch_agent.llm import DeepSeekLLMProvider, MockLLMProvider, summarize_sources
 from deepresearch_agent.rag import LocalRagRetriever
 from deepresearch_agent.schemas import Finding, ResearchRequest, Source, StructuredReport, TraceEvent
 from deepresearch_agent.search import SearchOutcome, SearchService, build_search_service
@@ -27,7 +27,6 @@ class DeepResearchOrchestrator:
         search_service: SearchService | None = None,
     ) -> None:
         self.settings = settings or load_settings()
-        self.llm = MockLLMProvider(self.settings.mock_model_name)
         self.search_service = search_service
         self.rag = LocalRagRetriever()
         self.deduper = SourceDeduplicator()
@@ -37,9 +36,10 @@ class DeepResearchOrchestrator:
     async def run(self, request: ResearchRequest, emit: Emit | None = None) -> StructuredReport:
         run_id = uuid.uuid4().hex[:12]
         trace = TraceLogger(run_id=run_id, trace_dir=self.settings.trace_dir)
+        llm = self._build_llm_provider(request)
         cost = CostTracker(
-            provider=self.llm.name,
-            model=self.llm.model,
+            provider=llm.name,
+            model=llm.model,
             input_cost_per_1m=self.settings.mock_input_cost_per_1m_tokens,
             output_cost_per_1m=self.settings.mock_output_cost_per_1m_tokens,
         )
@@ -48,7 +48,7 @@ class DeepResearchOrchestrator:
         await self._record(trace, "run", "start", {"query": request.query}, emit=emit)
 
         stage_start = trace.now()
-        brief = await self.llm.create_brief(request, cost)
+        brief = await llm.create_brief(request, cost)
         await self._record(
             trace,
             "clarify_normalize",
@@ -60,7 +60,7 @@ class DeepResearchOrchestrator:
 
         stage_start = trace.now()
         max_researchers = min(request.max_researchers, self.settings.max_researchers)
-        plan = await self.llm.plan(brief, max_researchers=max_researchers, cost=cost)
+        plan = await llm.plan(brief, max_researchers=max_researchers, cost=cost)
         await self._record(
             trace,
             "planner",
@@ -100,7 +100,7 @@ class DeepResearchOrchestrator:
         )
 
         stage_start = trace.now()
-        answer, claims = await self.llm.synthesize(brief, plan, findings, sources, cost)
+        answer, claims = await llm.synthesize(brief, plan, findings, sources, cost)
         await self._record(
             trace,
             "synthesizer",
@@ -147,6 +147,12 @@ class DeepResearchOrchestrator:
             metrics=metrics,
             trace_events=trace.events,
         )
+
+    def _build_llm_provider(self, request: ResearchRequest):
+        provider = (request.llm_provider or self.settings.llm_provider).strip().lower()
+        if provider == "deepseek":
+            return DeepSeekLLMProvider(model=request.llm_model or self.settings.deepseek_model)
+        return MockLLMProvider(self.settings.mock_model_name)
 
     async def _research_one(
         self,

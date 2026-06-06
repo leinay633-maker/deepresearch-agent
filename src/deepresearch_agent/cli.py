@@ -13,6 +13,8 @@ async def _run(args: argparse.Namespace) -> int:
         query=args.query,
         max_researchers=args.max_researchers,
         max_results_per_researcher=args.max_results,
+        llm_provider=args.llm_provider,
+        llm_model=args.llm_model,
         search_provider=args.search_provider,
         seed=args.seed,
     )
@@ -34,6 +36,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run a local DeepResearch Agent query.")
     parser.add_argument("query")
     parser.add_argument("--search-provider", choices=["mock", "wikipedia"], default=None)
+    parser.add_argument("--llm-provider", choices=["mock", "deepseek"], default=None)
+    parser.add_argument("--llm-model", default=None)
     parser.add_argument("--max-researchers", type=int, default=3)
     parser.add_argument("--max-results", type=int, default=4)
     parser.add_argument("--seed", type=int, default=20260606)

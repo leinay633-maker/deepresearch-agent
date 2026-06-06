@@ -4,12 +4,20 @@ import json
 import os
 import re
 import time
+from dataclasses import dataclass
 from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from deepresearch_agent.cost import CostTracker
 from deepresearch_agent.schemas import Finding, ResearchBrief, ResearchRequest, Source, SubQuestion
+
+
+@dataclass(frozen=True)
+class LLMJsonResult:
+    parsed: dict
+    content: str
+    usage: dict
 
 
 class LLMProvider(Protocol):
@@ -157,13 +165,45 @@ class DeepSeekLLMProvider:
         self.max_retries = max_retries
 
     async def create_brief(self, request: ResearchRequest, cost: CostTracker) -> ResearchBrief:
-        raise NotImplementedError("DeepSeek brief generation is introduced after step 1.")
+        result = await self._chat_json_result(
+            stage="brief_generation",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You normalize research requests. Return strict json only. "
+                        "The json object must match this schema: "
+                        '{"normalized_query":"...","scope":"...","constraints":["..."],"assumptions":["..."]}. '
+                        "Do not include markdown."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Create json for a DeepResearch brief. "
+                        f"User query: {request.query!r}. "
+                        "Keep the normalized query close to the user intent, make constraints actionable, "
+                        "and include assumptions only when needed."
+                    ),
+                },
+            ],
+            max_tokens=1200,
+        )
+        payload = result.parsed
+        brief = ResearchBrief(
+            original_query=request.query,
+            normalized_query=str(payload["normalized_query"]).strip(),
+            scope=str(payload["scope"]).strip(),
+            constraints=[str(item).strip() for item in payload.get("constraints", [])],
+            assumptions=[str(item).strip() for item in payload.get("assumptions", [])],
+        )
+        cost.add("brief_generation", request.query, result.content)
+        return brief
 
     async def plan(
         self, brief: ResearchBrief, max_researchers: int, cost: CostTracker
     ) -> list[SubQuestion]:
-        del cost
-        payload = await self._chat_json(
+        result = await self._chat_json_result(
             stage="planning",
             messages=[
                 {
@@ -189,6 +229,7 @@ class DeepSeekLLMProvider:
             ],
             max_tokens=1200,
         )
+        payload = result.parsed
         items = payload.get("subquestions")
         if not isinstance(items, list):
             raise ValueError("DeepSeek JSON response missing list field: subquestions")
@@ -197,6 +238,7 @@ class DeepSeekLLMProvider:
             raise ValueError(
                 f"DeepSeek returned {len(subquestions)} subquestions; expected {max_researchers}"
             )
+        cost.add("planning", brief.model_dump_json(), result.content)
         return subquestions
 
     async def synthesize(
@@ -207,7 +249,67 @@ class DeepSeekLLMProvider:
         sources: list[Source],
         cost: CostTracker,
     ) -> tuple[str, list[str]]:
-        raise NotImplementedError("DeepSeek synthesis is introduced after step 1 passes.")
+        compact_findings = [
+            {
+                "subquestion_id": finding.subquestion_id,
+                "subquestion": finding.subquestion,
+                "summary": finding.summary,
+                "source_ids": finding.source_ids,
+            }
+            for finding in findings
+        ]
+        compact_sources = [
+            {
+                "id": source.id,
+                "title": source.title,
+                "url": source.url,
+                "content": source.content[:900],
+                "provider": source.provider,
+                "quality_score": source.quality_score,
+            }
+            for source in sources
+        ]
+        synthesis_input = {
+            "brief": brief.model_dump(mode="json"),
+            "plan": [item.model_dump() for item in plan],
+            "findings": compact_findings,
+            "sources": compact_sources,
+        }
+        result = await self._chat_json_result(
+            stage="synthesis",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You write concise DeepResearch reports. Return strict json only. "
+                        "The json object must match this schema: "
+                        '{"answer":"markdown report with citations like [S1]","claims":["claim text [S1]"]}. '
+                        "Every factual claim must cite one or more supplied source IDs. "
+                        "Use only source IDs present in the input json. Do not invent citations."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Write json for the final report from this research context. "
+                        "Answer in English unless the query is Chinese. "
+                        "Make the answer specific to the evidence and call out limitations. "
+                        f"Research context json: {json.dumps(synthesis_input, ensure_ascii=False)}"
+                    ),
+                },
+            ],
+            max_tokens=2600,
+        )
+        payload = result.parsed
+        answer = str(payload.get("answer", "")).strip()
+        claims_raw = payload.get("claims")
+        if not answer:
+            raise ValueError("DeepSeek synthesis response missing answer")
+        if not isinstance(claims_raw, list) or not claims_raw:
+            raise ValueError("DeepSeek synthesis response missing non-empty claims list")
+        claims = [str(item).strip() for item in claims_raw if str(item).strip()]
+        cost.add("synthesis", json.dumps(synthesis_input, ensure_ascii=False), result.content)
+        return answer, claims
 
     async def _chat_json(
         self,
@@ -217,6 +319,17 @@ class DeepSeekLLMProvider:
     ) -> dict:
         import asyncio
 
+        result = await self._chat_json_result(stage, messages, max_tokens)
+        return result.parsed
+
+    async def _chat_json_result(
+        self,
+        stage: str,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+    ) -> LLMJsonResult:
+        import asyncio
+
         return await asyncio.to_thread(self._chat_json_sync, stage, messages, max_tokens)
 
     def _chat_json_sync(
@@ -224,14 +337,19 @@ class DeepSeekLLMProvider:
         stage: str,
         messages: list[dict[str, str]],
         max_tokens: int,
-    ) -> dict:
+    ) -> LLMJsonResult:
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                content = self._post_chat_completions(messages, max_tokens=max_tokens)
+                payload = self._post_chat_completions(messages, max_tokens=max_tokens)
+                content = _extract_content(payload)
                 if not content.strip():
                     raise ValueError("DeepSeek returned empty content")
-                return _parse_json_object(content)
+                return LLMJsonResult(
+                    parsed=_parse_json_object(content),
+                    content=content,
+                    usage=payload.get("usage") or {},
+                )
             except Exception as exc:
                 last_error = exc
                 if attempt >= self.max_retries:
@@ -239,7 +357,7 @@ class DeepSeekLLMProvider:
                 time.sleep(0.8 * (attempt + 1))
         raise RuntimeError(f"DeepSeek {stage} JSON validation failed: {last_error}") from last_error
 
-    def _post_chat_completions(self, messages: list[dict[str, str]], max_tokens: int) -> str:
+    def _post_chat_completions(self, messages: list[dict[str, str]], max_tokens: int) -> dict:
         api_key = os.environ.get("DEEPSEEK_API_KEY")
         if not api_key:
             raise RuntimeError("DEEPSEEK_API_KEY environment variable is required")
@@ -270,13 +388,8 @@ class DeepSeekLLMProvider:
         except URLError as exc:
             raise RuntimeError(f"DeepSeek request failed: {exc.reason}") from exc
 
-        choices = payload.get("choices") or []
-        if not choices:
-            raise ValueError("DeepSeek response missing choices")
-        content = choices[0].get("message", {}).get("content")
-        if not isinstance(content, str):
-            raise ValueError("DeepSeek response missing message.content")
-        return content
+        _extract_content(payload)
+        return payload
 
 
 def _normalize_query(query: str) -> str:
@@ -321,3 +434,13 @@ def _parse_json_object(content: str) -> dict:
 
 def _redact(text: str) -> str:
     return re.sub(r"sk-[A-Za-z0-9_-]+", "sk-***", text)
+
+
+def _extract_content(payload: dict) -> str:
+    choices = payload.get("choices") or []
+    if not choices:
+        raise ValueError("DeepSeek response missing choices")
+    content = choices[0].get("message", {}).get("content")
+    if not isinstance(content, str):
+        raise ValueError("DeepSeek response missing message.content")
+    return content

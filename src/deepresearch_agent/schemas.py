@@ -14,6 +14,8 @@ class ResearchRequest(BaseModel):
     query: str = Field(..., min_length=3)
     max_researchers: int = Field(default=3, ge=1, le=5)
     max_results_per_researcher: int = Field(default=4, ge=1, le=10)
+    llm_provider: str | None = None
+    llm_model: str | None = None
     search_provider: str | None = None
     seed: int = 20260606
 
