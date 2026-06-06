@@ -1,6 +1,14 @@
 {
-  "generated_at": "2026-06-06T14:59:35.803416+00:00",
-  "raw_log": "D:\\Deepreserch Agent\\logs\\benchmark-20260606T145935Z.jsonl",
+  "generated_at": "2026-06-06T15:29:54.313971+00:00",
+  "benchmark_kind": "mock_plumbing_smoke_test",
+  "interpretation": "These numbers validate that the local pipeline can run end to end. They are not real DeepResearch performance, cost, or answer-quality metrics.",
+  "limitations": [
+    "latency_ms measures local Python execution with deterministic mock components",
+    "total_tokens is an approximate character-count estimate, not provider tokenizer usage",
+    "estimated_cost_usd is 0 because the mock provider price is configured as 0",
+    "citation_retention_rate can be 1.0 because mock synthesis cites sources created inside the same pipeline"
+  ],
+  "raw_log": "D:\\Deepreserch Agent\\logs\\benchmark-20260606T152954Z.jsonl",
   "config": {
     "seed": 20260606,
     "search_provider": "mock",
@@ -25,9 +33,9 @@
   "success_count": 5,
   "success_rate": 1.0,
   "latency_ms": {
-    "p50": 8.681,
-    "p90": 9.249,
-    "max": 9.427
+    "p50": 8.288,
+    "p90": 8.637,
+    "max": 8.697
   },
   "tokens": {
     "avg": 4456.2,
@@ -41,7 +49,7 @@
       "type": "case_result",
       "case_id": "case-001",
       "query": "How does a supervisor-researcher deep research agent differ from normal RAG?",
-      "latency_ms": 9.427,
+      "latency_ms": 8.697,
       "total_tokens": 4537,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 6,
@@ -50,13 +58,13 @@
       "success": true,
       "fallback_count": 0,
       "output_summary": "# Research Report: How does a supervisor-researcher deep research agent differ from normal RAG?\n\n## Executive Summary\n- What background and definitions are needed to answer: How does a supervisor-researcher deep research agent differ from n",
-      "run_id": "c4330b94b4f6"
+      "run_id": "fb6b6bc62bcd"
     },
     {
       "type": "case_result",
       "case_id": "case-002",
       "query": "How should citation faithfulness checks reduce hallucination in agent reports?",
-      "latency_ms": 8.681,
+      "latency_ms": 8.288,
       "total_tokens": 4565,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 7,
@@ -65,13 +73,13 @@
       "success": true,
       "fallback_count": 0,
       "output_summary": "# Research Report: How should citation faithfulness checks reduce hallucination in agent reports?\n\n## Executive Summary\n- What background and definitions are needed to answer: How should citation faithfulness checks reduce hallucination in ",
-      "run_id": "6576608fdf10"
+      "run_id": "ccce877efc0a"
     },
     {
       "type": "case_result",
       "case_id": "case-003",
       "query": "What failure handling is needed when an agent search tool times out?",
-      "latency_ms": 7.354,
+      "latency_ms": 8.546,
       "total_tokens": 4413,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 7,
@@ -80,13 +88,13 @@
       "success": true,
       "fallback_count": 0,
       "output_summary": "# Research Report: What failure handling is needed when an agent search tool times out?\n\n## Executive Summary\n- What background and definitions are needed to answer: What failure handling is needed when an agent search tool times out? The s",
-      "run_id": "37ebc8ebf590"
+      "run_id": "a0aa34d4c977"
     },
     {
       "type": "case_result",
       "case_id": "case-004",
       "query": "Why track token and cost by stage in a multi-agent research pipeline?",
-      "latency_ms": 8.466,
+      "latency_ms": 7.316,
       "total_tokens": 4348,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 6,
@@ -95,13 +103,13 @@
       "success": true,
       "fallback_count": 0,
       "output_summary": "# Research Report: Why track token and cost by stage in a multi-agent research pipeline?\n\n## Executive Summary\n- What background and definitions are needed to answer: Why track token and cost by stage in a multi-agent research pipeline? The",
-      "run_id": "fb93409040b7"
+      "run_id": "e1f6fd0a9c6c"
     },
     {
       "type": "case_result",
       "case_id": "case-005",
       "query": "How can a benchmark harness make deep research results reproducible?",
-      "latency_ms": 8.983,
+      "latency_ms": 8.251,
       "total_tokens": 4418,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 8,
@@ -110,7 +118,7 @@
       "success": true,
       "fallback_count": 0,
       "output_summary": "# Research Report: How can a benchmark harness make deep research results reproducible?\n\n## Executive Summary\n- What background and definitions are needed to answer: How can a benchmark harness make deep research results reproducible? The s",
-      "run_id": "885f48764673"
+      "run_id": "771561136640"
     }
   ]
 }

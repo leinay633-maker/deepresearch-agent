@@ -39,18 +39,17 @@ benchmark 命令：
 py -3.11 -m deepresearch_agent.benchmark --search-provider mock --seed 20260606
 ```
 
-最近一次 summary 在 `results/benchmark_summary.json`，原始记录在 `logs/benchmark-20260606T145935Z.jsonl`。
+最近一次 summary 在 `results/benchmark_summary.json`，原始记录在 `logs/benchmark-20260606T152954Z.jsonl`。
 
-核心实测指标：
+核心实测指标解释：下面这些是 mock plumbing run 的记录，只证明管线能跑通，不能当成真实性能、真实成本或真实答案质量成果。延迟测的是本机 Python 跑 deterministic mock 的速度；token 是字符数估算；成本恒为 0 是因为 mock provider 单价为 0；citation_retention_rate 为 1.0 是因为 mock synthesis 自己生成引用并由当前轻量 checker 检查。
 
 - case_count: 5
 - success_count: 5
 - success_rate: 1.0
-- latency p50: 8.681ms
-- latency p90: 9.249ms
+- latency p50 / p90: recorded in `results/benchmark_summary.json`, but intentionally not quoted as a performance result
 - total_tokens: 22281
-- citation_retention_rate_avg: 1.0
-- estimated_cost_usd_total: 0.0
+- citation_retention_rate_avg: 1.0, not real LLM faithfulness quality
+- estimated_cost_usd_total: 0.0, mock-only
 
 ## 运行方式
 
@@ -84,6 +83,7 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 - 未实测真实 LLM token usage 和真实 LLM cost。
 - Citation checker 当前是 lexical overlap，不是语义级事实校验。
 - Wikipedia adapter 已实测能跑，但不是生产级搜索 provider。
+- mock benchmark 的 latency/success/citation/cost 不应作为面试成果开场，只能说它证明 pipeline plumbing 和记录链路能跑。
 - 未接 Redis/PostgreSQL、OpenTelemetry/LangSmith、LangGraph checkpoint。
 - 未做 PDF/Docx 多格式导出。
 

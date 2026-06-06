@@ -138,31 +138,29 @@ Trace Logger：`src/deepresearch_agent/tracing.py`。每个 run 写 `logs/resear
 
 # 7 实测数据
 
+本节所有 mock benchmark 数字只用于证明 pipeline plumbing 能端到端跑通，不能当作真实性能、真实成本或真实答案质量成果。尤其不能在面试里说“我的 DeepResearch p50 是个位数毫秒”这类话，因为这个延迟测的是本机 Python 跑 deterministic mock 的速度，换机器、换进程热身状态、换依赖版本都会变。
+
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 120 -e ".[dev]"` 成功。
 测试验证：`py -3.11 -m pytest -q`，结果 `9 passed, 1 warning in 1.04s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，未影响功能。
-CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，latency `10.63ms`，raw_search_result_count `12`，deduped_source_count `8`，citation_retention_rate `1.0`，total_tokens `4417`，estimated_cost_usd `0.0`。
+CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
-benchmark 原始记录：`logs/benchmark-20260606T145935Z.jsonl`。
+benchmark 原始记录：`logs/benchmark-20260606T152954Z.jsonl`。
 benchmark summary：`results/benchmark_summary.json`。
 
-benchmark 汇总：
+benchmark 汇总：管线 plumbing 指标，mock，非真实性能。具体 latency/token/cost 数字保留在 `results/benchmark_summary.json` 和 raw log 里，面试时不把这些数字当成果开场。
 
-| 指标 | 实测值 |
-|---|---:|
-| case_count | 5 |
-| success_count | 5 |
-| success_rate | 1.0 |
-| latency p50 | 8.681ms |
-| latency p90 | 9.249ms |
-| latency max | 9.427ms |
-| total_tokens | 22281 |
-| avg_tokens | 4456.2 |
-| estimated_cost_usd_total | 0.0 |
-| citation_retention_rate_avg | 1.0 |
-| fallback_count_total | 0 |
+| 指标 | mock plumbing run 记录 | 面试口径 |
+|---|---|---|
+| case_count | 5 条本地 smoke case | 只说明 benchmark harness 能批量跑 case |
+| success_count / success_rate | 当前 mock run 全部通过 | 不代表真实任务成功率 |
+| latency p50 / p90 / max | JSON 里有记录 | 只说明系统会记录延迟，不报具体 ms 作为性能成果 |
+| total_tokens / avg_tokens | JSON 里有记录 | 字符数近似估算，不是真实 tokenizer usage |
+| estimated_cost_usd_total | mock 配置下为 0 | 不代表真实成本 |
+| citation_retention_rate_avg | 当前 mock run 为 1.0 | mock 自生成自引用，只说明 checker 链路没断 |
+| fallback_count_total | 当前 mock run 为 0 | mock provider 本身不触发外部失败 |
 
 未实测：真实 LLM token usage、真实 LLM cost、真实搜索 API 高并发限流、Redis/Postgres 缓存、OpenTelemetry/LangSmith tracing、真实用户流量。
 
@@ -172,7 +170,7 @@ answer completeness：当前未做 LLM judge，只用 case success 间接衡量�
 citation faithfulness：当前实测指标是 claim/source lexical overlap，benchmark 平均 citation retention `1.0`。
 source diversity：当前记录 deduped_source_count，但没有按 domain/provider 多样性打分。
 hallucination rate：当前用 unsupported citation count 作为 proxy，不能覆盖无引用幻觉。
-latency：benchmark 记录每 case latency_ms，并计算 P50/P90/max。
+latency：benchmark 记录每 case latency_ms，并计算 P50/P90/max；当前只能作为 mock plumbing 的回归信号，不能作为 Agent 性能指标。
 cost：当前 mock provider 成本为 0，token 用字符估算；真实 provider 成本未实测。
 工具失败恢复：有 unit test 覆盖 primary failure fallback 和 circuit breaker open；benchmark mock provider 没触发 fallback。
 multi-hop 成功率：当前没有真实 multi-hop 标注集，未实测。

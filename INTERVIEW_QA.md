@@ -390,7 +390,7 @@
 [状态: 待消化]
 标签：Benchmark / 评测
 检索关键词：benchmark, latency, token, citation
-回答：`benchmark.py` 记录 seed、配置快照、case_id、query、latency_ms、total_tokens、estimated_cost_usd、deduped_source_count、raw_search_result_count、citation_retention_rate、success、fallback_count 和 output_summary。summary 会计算 success_rate、P50/P90 latency、token total。
+回答：`benchmark.py` 记录 seed、配置快照、case_id、query、latency_ms、total_tokens、estimated_cost_usd、deduped_source_count、raw_search_result_count、citation_retention_rate、success、fallback_count 和 output_summary。当前 benchmark 是 mock plumbing smoke test：latency 只看本机管线有没有异常变慢，不能当真实 DeepResearch 性能；token 是字符估算；cost 为 0 是 mock 单价；citation 1.0 只说明当前引用链路没断。
 关联模块：`benchmark.py`, `results/benchmark_summary.json`
 可追问：
 1. 为什么只 5 条 case？

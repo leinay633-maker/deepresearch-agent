@@ -89,6 +89,17 @@ def _summarize(
     success_count = sum(1 for record in records if record["success"])
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "benchmark_kind": "mock_plumbing_smoke_test",
+        "interpretation": (
+            "These numbers validate that the local pipeline can run end to end. "
+            "They are not real DeepResearch performance, cost, or answer-quality metrics."
+        ),
+        "limitations": [
+            "latency_ms measures local Python execution with deterministic mock components",
+            "total_tokens is an approximate character-count estimate, not provider tokenizer usage",
+            "estimated_cost_usd is 0 because the mock provider price is configured as 0",
+            "citation_retention_rate can be 1.0 because mock synthesis cites sources created inside the same pipeline",
+        ],
         "raw_log": str(raw_path),
         "config": config_snapshot,
         "case_count": len(records),
