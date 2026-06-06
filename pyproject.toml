@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deepresearch-agent"
+version = "0.1.0"
+description = "A scoped, observable DeepResearch Agent for agent backend interviews."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "fastapi>=0.115.0",
+    "pydantic>=2.8.0",
+    "uvicorn[standard]>=0.32.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "httpx>=0.27.0",
+]
+
+[project.scripts]
+deepresearch = "deepresearch_agent.cli:main"
+deepresearch-api = "deepresearch_agent.api:main"
+deepresearch-benchmark = "deepresearch_agent.benchmark:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

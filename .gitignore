@@ -15,6 +15,6 @@ build/
 
 logs/*.tmp
 logs/*.log
+logs/research-*.jsonl
 !logs/.gitkeep
 !logs/benchmark-*.jsonl
-!logs/research-*.jsonl

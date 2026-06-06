@@ -1,0 +1,5 @@
+{"id":"case-001","query":"How does a supervisor-researcher deep research agent differ from normal RAG?"}
+{"id":"case-002","query":"How should citation faithfulness checks reduce hallucination in agent reports?"}
+{"id":"case-003","query":"What failure handling is needed when an agent search tool times out?"}
+{"id":"case-004","query":"Why track token and cost by stage in a multi-agent research pipeline?"}
+{"id":"case-005","query":"How can a benchmark harness make deep research results reproducible?"}
