@@ -86,6 +86,8 @@ Agent 编排层：`src/deepresearch_agent/orchestrator.py`。输入是用户 que
 
 Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。当前 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题。局限是没有真实 LLM 推理，也不会根据领域动态改变 plan。
 
+DeepSeek Planner 验证：`src/deepresearch_agent/llm.py` 里新增了 `DeepSeekLLMProvider.plan`，只用于步骤 1 的结构化输出验证；`create_brief` 和 `synthesize` 仍保持 `NotImplementedError`，避免在没验证 synthesis 前误接端到端。验证脚本是 `src/deepresearch_agent/validate_deepseek_structured_output.py`，它从环境变量读取 `DEEPSEEK_API_KEY`，用 JSON mode 请求 `deepseek-chat`，并用现有 `SubQuestion` Pydantic schema 解析输出。
+
 Researcher：`src/deepresearch_agent/orchestrator.py` 的 `_research_one`。输入是子问题，输出是 `Finding`。它调用 `SearchService` 和 `LocalRagRetriever`，再 dedup、verify、summary。局限是 summary 仍是模板化，不是自然语言 LLM 压缩。
 
 Verifier：`src/deepresearch_agent/verifier.py`。输入是 source 列表，输出是过滤后的 source。关键设计是可解释 quality reasons。局限是规则打分，不能真正判断来源权威性。
@@ -146,6 +148,8 @@ Trace Logger：`src/deepresearch_agent/tracing.py`。每个 run 写 `logs/resear
 测试验证：`py -3.11 -m pytest -q`，结果 `9 passed, 1 warning in 1.04s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
+
+DeepSeek 结构化输出验证：`py -3.11 -m deepresearch_agent.validate_deepseek_structured_output --query "How should citation checking reduce hallucination in deep research agents?" --max-researchers 3` 成功。`deepseek-chat` 返回了 3 条合法 `SubQuestion`，Pydantic schema 解析通过。真实输出主题分别覆盖 citation checking 的机制、实证证据、最佳实践与限制。本步骤只验证 planner 结构化输出，未接 synthesizer，未产生端到端报告，也未记录真实 token/cost。
 
 benchmark 原始记录：`logs/benchmark-20260606T152954Z.jsonl`。
 benchmark summary：`results/benchmark_summary.json`。
