@@ -1,0 +1,70 @@
+{
+  "dataset": {
+    "name": "BEIR/scifact",
+    "source_url": "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/scifact.zip",
+    "qrels_split": "test",
+    "corpus_doc_count": 5183,
+    "query_count": 1109,
+    "evaluated_query_count": 300,
+    "qrels_query_count": 300,
+    "qrels_relevant_pair_count": 339
+  },
+  "config": {
+    "modes": [
+      "keyword",
+      "hybrid",
+      "hybrid_rerank"
+    ],
+    "top_k": 10,
+    "max_queries": null,
+    "embedding_provider": "local",
+    "embedding_model": "BAAI/bge-small-en-v1.5",
+    "rerank_provider": "local",
+    "rerank_model": "BAAI/bge-reranker-base",
+    "rerank_candidate_k": 10,
+    "llm_provider": null,
+    "search_provider": null,
+    "include_rankings": false
+  },
+  "runs": {
+    "keyword": {
+      "mode": "keyword",
+      "top_k": 10,
+      "query_count": 300,
+      "elapsed_seconds": 99.549255,
+      "average_query_latency_seconds": 0.331831,
+      "metrics": {
+        "query_count": 300,
+        "recall@10": 0.6000000000000001,
+        "ndcg@10": 0.4823420566794712,
+        "mrr": 0.45484788359788364
+      }
+    },
+    "hybrid": {
+      "mode": "hybrid",
+      "top_k": 10,
+      "query_count": 300,
+      "elapsed_seconds": 171.574793,
+      "average_query_latency_seconds": 0.571916,
+      "metrics": {
+        "query_count": 300,
+        "recall@10": 0.8205555555555555,
+        "ndcg@10": 0.657609579872509,
+        "mrr": 0.6097632275132274
+      }
+    },
+    "hybrid_rerank": {
+      "mode": "hybrid_rerank",
+      "top_k": 10,
+      "query_count": 300,
+      "elapsed_seconds": 1020.665909,
+      "average_query_latency_seconds": 3.40222,
+      "metrics": {
+        "query_count": 300,
+        "recall@10": 0.8238888888888889,
+        "ndcg@10": 0.7306665593859187,
+        "mrr": 0.7083373015873015
+      }
+    }
+  }
+}
