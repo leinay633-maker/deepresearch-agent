@@ -14,7 +14,7 @@ API 层：`src/deepresearch_agent/api.py`。输入是 `ResearchRequest` 或 `Cre
 
 Agent 编排层：`src/deepresearch_agent/orchestrator.py`。输入是用户 query 和配置，输出是完整报告。它按 clarify/normalize、planner、并发 researcher、source dedup、synthesizer、citation check 的顺序执行。这里我没有直接用 LangGraph，是因为当前目标是可讲清楚的收窄项目，轻量 orchestrator 更便于展示每个阶段的输入输出和失败边界。
 
-工具 Adapter 层：`src/deepresearch_agent/search.py`、`src/deepresearch_agent/rag.py`、`src/deepresearch_agent/embeddings.py`、`src/deepresearch_agent/rerankers.py`。搜索层有 `MockSearchAdapter` 和 `WikipediaSearchAdapter`，外加 `SearchService` 负责 retry、timeout、circuit breaker 和 fallback。本地 RAG 用 `data/local_corpus.jsonl`，默认走关键词 + BGE 向量 + Chroma + RRF 融合；也可以显式切回 keyword baseline，或者开启本地 / DashScope rerank。
+工具 Adapter 层：`src/deepresearch_agent/search.py`、`src/deepresearch_agent/rag.py`、`src/deepresearch_agent/embeddings.py`、`src/deepresearch_agent/rerankers.py`。搜索层有 `MockSearchAdapter`、`WikipediaSearchAdapter`、`SearxngSearchAdapter`、`JinaSearchAdapter` 和 `JinaReaderCrawler`，外加 `SearchService` 负责 retry、timeout、circuit breaker 和 fallback。本地 RAG 用 `data/local_corpus.jsonl`，默认走关键词 + BGE 向量 + Chroma + RRF 融合；也可以显式切回 keyword baseline，或者开启本地 / DashScope rerank。
 
 检索质量层：`src/deepresearch_agent/dedup.py`、`src/deepresearch_agent/verifier.py`。Dedup 按规范化 URL 合并重复来源，Verifier 按标题、正文长度、稳定 URL、已知 adapter、低质量模式打分过滤。
 
@@ -130,6 +130,15 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 代价：当前 `success_rate` 仍沿用本项目 citation retention 阈值，不等于官方 Deep Research Bench 分数；LiveDRBench 任务常要求精确 JSON/论文标题，当前 synthesizer 还不是专门为该格式训练或约束的，所以真实组可以跑但质量很差。
 面试怎么答：我会说我先补的是“公开任务可跑、artifact 可审计”的评测底座，而不是假装已经有官方 leaderboard 分数。最新 1 条 LiveDRBench preview 真实口径就是失败样本：DeepSeek v4-flash + Wikipedia 跑通但 `success_rate=0.0`、citation retention `0.5`，这反而暴露了搜索覆盖和 citation 语义评测短板。
 
+## 决策 12：为什么把 web search 和 crawler 分开接
+
+背景：Wikipedia adapter 太窄，公开 Deep Research 任务需要真正的 web search 和网页正文抽取；如果 search adapter 只返回 title/snippet，synthesizer 很容易在证据不足时失败。
+可选方案：继续强化 Wikipedia；直接接 Tavily/Brave 这种一体化 API；先接 SearxNG 搜索和 Jina Reader crawler；把 crawler 混在每个 search provider 里。
+最终选择：在 `search.py` 里新增 provider registry，保留 `mock/wikipedia`，再加 `SearxngSearchAdapter`、`JinaSearchAdapter` 和独立 `JinaReaderCrawler`。SearxNG 负责搜索候选 URL，crawler 负责把 URL 转成正文；`SearchService` 的 retry、timeout、circuit breaker、fallback 仍复用。
+理由：search 和 crawler 的失败模式不同，分开后可以替换任一层：SearxNG 可以换 Brave/Tavily，Jina Reader 可以换 trafilatura/readability/Firecrawl，而 orchestrator 仍只看统一 `Source`。默认仍是 mock，不破坏无 key 路径；SearxNG 用 `SEARXNG_BASE_URL`，Jina 可选 `JINA_API_KEY`，所有 key 都只从环境变量读。
+代价：当前没有自建 SearxNG 实例，所以 SearxNG 只做了 stub 单测；Jina Reader live crawl `https://example.com` 成功，但 Jina Search live smoke 在当前网络下返回 `401/403`，实际 query 走了 mock fallback。它是 provider 结构升级，还不是“真实搜索质量已经解决”。
+面试怎么答：我会说这一步补的是工具层边界，不是刷 benchmark。真实网页搜索要分成 query→URL 和 URL→content 两层，否则后面 citation grounding 没法定位证据片段。
+
 # 5 实现细节
 
 Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。局限是 planner 还不会根据 researcher 中间结果动态追加子问题。
@@ -139,6 +148,8 @@ DeepSeek Planner 验证：`src/deepresearch_agent/llm.py` 里新增了 `DeepSeek
 DeepSeek Synthesizer 接入：步骤 2 以后，`DeepSeekLLMProvider.create_brief`、`plan`、`synthesize` 都走 DeepSeek JSON mode。CLI 和 API 可以通过 `llm_provider="deepseek"` 或 CLI 参数 `--llm-provider deepseek` 显式启用；默认仍是 mock，保证离线测试不受 API key 影响。当前 synthesis 要求模型输出 `{"answer": "...", "claims": [...]}`，并要求每条 factual claim 使用输入 sources 中已有的 `[Sx]` citation ID。
 
 Researcher：`src/deepresearch_agent/orchestrator.py` 的 `_research_one`。输入是子问题，输出是 `Finding`。它调用 `SearchService` 和 `LocalRagRetriever`，再 dedup、verify、summary。`LocalRagRetriever` 内部已经从 keyword overlap 升级为可配置的 keyword / hybrid retrieval，但 orchestrator 仍只接收 `Source` 列表。局限是 summary 仍是模板化，不是自然语言 LLM 压缩。
+
+Web Search / Crawler Provider：`src/deepresearch_agent/search.py`。`build_search_adapter()` 现在按 provider name 构造 `mock`、`wikipedia`、`searxng` 或 `jina`，`build_crawler()` 按配置构造 `JinaReaderCrawler`。`SearxngSearchAdapter` 调 `SEARXNG_BASE_URL/search?format=json`，解析 title/url/snippet，再可选调用 crawler 抽正文；`JinaReaderCrawler` 用 `https://r.jina.ai/<url>` 抽 LLM-friendly text；`JinaSearchAdapter` 用 `https://s.jina.ai/<query>`。`JINA_API_KEY` 是可选环境变量，不进入 Settings 快照。
 
 Embedding Provider：`src/deepresearch_agent/embeddings.py`。输入文本列表，输出向量列表。默认 `LocalEmbeddingProvider` 使用 `sentence-transformers` 加载 `BAAI/bge-small-zh-v1.5`，无 API key；`DashScopeEmbeddingProvider` 调百炼 OpenAI-compatible embeddings endpoint，key 只从 `DASHSCOPE_API_KEY` 读。验证脚本是 `src/deepresearch_agent/validate_embeddings.py`，本机 local BGE 实测维度 `512`；DashScope 因未配置 key，只做了 stub endpoint 解析测试。
 
@@ -254,6 +265,24 @@ Agent Run Control Plane：`src/deepresearch_agent/run_control.py` 外包现有 D
 复盘：评测 artifact 是可信度的一部分，不能只保证脚本能跑，还要保证并行/重复运行时不会覆盖证据文件。
 面试可能追问：为什么不直接用 UUID？回答：UUID 也可以；我这次选微秒时间戳是为了保留人类可读的运行时间，同时把秒级撞名风险降掉。下一步如果做 worker queue，可以再加 run_id 或 provider suffix。
 
+## 问题 11：Jina Search live smoke 触发 fallback
+
+现象：实现 `JinaSearchAdapter` 后，我用 `py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider jina --llm-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --json` 做 live smoke。run 成功，但 `researcher.Q1` status 是 `fallback`，error 是 `HTTP Error 401: Unauthorized`；单独用 `urllib` 请求 `https://s.jina.ai/Model+Context+Protocol` 又出现过 `403/401`。同一时间，`https://r.jina.ai/https://example.com` Reader crawl 返回 `200` 和 clean text。
+原因：当前环境下 Jina Search 公开 endpoint 没有匿名搜索成功，可能需要 key、受到访问策略限制，或和 header/user-agent 有关；Reader crawl endpoint 对普通 URL 仍可匿名访问。
+排查：分别测试 `s.jina.ai` search 和 `r.jina.ai` reader；再看 orchestrator trace，确认失败被 `SearchService` 捕获并降级到 mock，而不是打断整条研究链路。
+修复：代码里保留公开 endpoint 尝试，同时支持可选 `JINA_API_KEY` 环境变量，存在时发送 Bearer header；未配置或请求失败时仍走既有 fallback。
+复盘：真实 web search provider 不是只写 adapter 就算完成，外部服务的认证、限流和访问策略都要进入 trace。当前我只能说 Jina Reader crawl live 成功，Jina Search live 未通过。
+面试可能追问：为什么还保留 Jina Search？回答：因为它的接口边界和数据格式已经接入，且官方 README 明确有 `s.jina.ai` search 能力；但我不会说它在本机已稳定可用，下一步更稳的是接自建 SearxNG 或带 key 的 Brave/Tavily。
+
+## 问题 12：新增 crawler CLI 参数后评测单测 AttributeError
+
+现象：把 SearxNG/Jina crawler 配置接进 `benchmark.py` 和 `deep_research_eval.py` 后，`tests/test_deep_research_eval.py` 失败：`Namespace` 对象没有 `searxng_base_url` 属性。
+原因：CLI parser 会补全新参数，但单测直接手工构造 `argparse.Namespace`，不会自动带上新增字段；runner 里直接访问 `args.searxng_base_url` 就破坏了旧调用方式。
+排查：失败栈定位到 `replace(settings, searxng_base_url=args.searxng_base_url ...)`，不是 orchestrator 或 provider 问题。
+修复：评测 runner 读取新增可选参数时统一用 `getattr(args, "...", None)`，没有属性时回落到 settings/env 默认值。相关测试重跑 `14 passed`。
+复盘：CLI 扩展不能假设所有调用者都从 parser 进来；测试、库函数、外部脚本都可能直接传 Namespace。
+面试可能追问：为什么不改测试补字段？回答：测试补字段也可以，但生产代码更应该对可选参数缺省鲁棒，尤其是 benchmark runner 这种会被脚本复用的入口。
+
 # 7 实测数据
 
 本节所有 mock benchmark 数字只用于证明 pipeline plumbing 能端到端跑通，不能当作真实性能、真实成本或真实答案质量成果。尤其不能在面试里说“我的 DeepResearch p50 是个位数毫秒”这类话，因为这个延迟测的是本机 Python 跑 deterministic mock 的速度，换机器、换进程热身状态、换依赖版本都会变。
@@ -261,7 +290,7 @@ Agent Run Control Plane：`src/deepresearch_agent/run_control.py` 外包现有 D
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
-测试验证：`py -3.11 -m pytest -q`，最新结果 `34 passed, 2 warnings in 124.04s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 Chroma/OpenTelemetry 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `40 passed, 2 warnings in 63.30s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 Chroma/OpenTelemetry 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -274,6 +303,8 @@ DeepSeek usage/cost 单条验证（LLM 真，search 仍是 mock）：接入真�
 Embedding provider 验证：`py -3.11 -m deepresearch_agent.validate_embeddings --provider local --text "混合检索需要关键词召回和向量召回一起融合。"` 成功。本地模型 `BAAI/bge-small-zh-v1.5` 返回维度 `512`。`DASHSCOPE_API_KEY` 当前未配置，所以百炼 embedding 没有做真实 API 调用；代码层用本地 HTTP stub 测过 DashScope-compatible response parsing。
 
 Reranker smoke：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?" --search-provider mock --llm-provider mock --max-researchers 1 --max-results 2 --local-retrieval-mode hybrid --rerank-enabled --rerank-provider local` 成功。因为首次下载/加载 `BAAI/bge-reranker-base`，latency 达到 `279692.721ms`。这只证明可选 rerank provider 能接入，不作为常规性能指标。
+
+Web search / crawler provider smoke：`py -3.11 -m pytest tests/test_web_search_providers.py tests/test_failure_handling.py -q` 成功，`10 passed in 0.36s`，覆盖 SearxNG JSON parsing、crawler 内容替换、Jina Reader URL prefix、Jina Search JSON parsing、provider registry 和 unknown provider fail-fast。真实外网 smoke：`https://r.jina.ai/https://example.com` 返回 `200` 和 clean text，说明 Jina Reader crawler 这层能 live 访问；`--search-provider jina` 的 CLI run 成功但触发 fallback，trace error 是 `HTTP Error 401: Unauthorized`，所以 Jina Search 真实检索在当前环境未通过。SearxNG 需要 `SEARXNG_BASE_URL`，当前没有自建实例，未做 live search。
 
 mock benchmark 原始记录：`logs/benchmark-20260606T152954Z.jsonl`。
 当前 benchmark summary：`results/benchmark_summary.json`，已被真实 DeepSeek + Wikipedia benchmark 覆盖。
@@ -365,7 +396,7 @@ multi-hop 成功率：当前没有真实 multi-hop 标注集，未实测。
 
 参考了什么：按要求只看了 `main-1.x` 分支 README，参考它 Coordinator/Planner/Researcher/Reporter 的角色划分，以及 web UI/API/工具集分层思路。
 没照搬什么：没有复制它的 web UI、crawler、TTS、presentation、checkpoint、配置系统。
-我做了哪些改造：砍掉内容生产和平台能力，只保留 deep research 主干和后端可观测部分。
+我做了哪些改造：砍掉内容生产和平台能力，只保留 deep research 主干和后端可观测部分；这次补了 SearxNG/Jina 这种搜索与正文抽取边界，但仍保持统一 `Source` 输出，不把 DeerFlow 的完整前端和工具生态搬进来。
 为什么更适合求职展示：范围更窄，重点在 Agent 后端可解释性和评测，而不是完整产品形态。
 
 ## gpt-researcher

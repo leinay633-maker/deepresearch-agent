@@ -45,6 +45,14 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         rerank_enabled=args.rerank_enabled,
         rerank_provider=args.rerank_provider,
         local_rerank_candidate_k=args.local_rerank_candidate_k,
+        searxng_base_url=getattr(args, "searxng_base_url", None) or settings.searxng_base_url,
+        web_crawler_provider=getattr(args, "web_crawler_provider", None)
+        or settings.web_crawler_provider,
+        jina_reader_base_url=getattr(args, "jina_reader_base_url", None)
+        or settings.jina_reader_base_url,
+        jina_search_base_url=getattr(args, "jina_search_base_url", None)
+        or settings.jina_search_base_url,
+        crawler_max_chars=getattr(args, "crawler_max_chars", None) or settings.crawler_max_chars,
         deepseek_model=effective_llm_model
         if args.llm_provider == "deepseek"
         else settings.deepseek_model,
@@ -67,6 +75,8 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "rerank_enabled": effective_settings.rerank_enabled,
         "rerank_provider": effective_settings.rerank_provider,
         "local_rerank_candidate_k": effective_settings.local_rerank_candidate_k,
+        "web_crawler_provider": effective_settings.web_crawler_provider,
+        "crawler_max_chars": effective_settings.crawler_max_chars,
         "case_count": len(cases),
         "max_researchers": effective_settings.max_researchers,
         "max_results": args.max_results,
@@ -212,7 +222,7 @@ def _benchmark_notes(config_snapshot: dict[str, Any]) -> tuple[str, str, list[st
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the DeepResearch Agent benchmark.")
     parser.add_argument("--cases", default=None)
-    parser.add_argument("--search-provider", choices=["mock", "wikipedia"], default="mock")
+    parser.add_argument("--search-provider", choices=["mock", "wikipedia", "searxng", "jina"], default="mock")
     parser.add_argument("--llm-provider", choices=["mock", "deepseek"], default="mock")
     parser.add_argument("--llm-model", default=None)
     parser.add_argument("--embedding-provider", choices=["local", "dashscope"], default="local")
@@ -225,6 +235,11 @@ def main() -> None:
     parser.add_argument("--rerank-enabled", action="store_true")
     parser.add_argument("--rerank-provider", choices=["local", "dashscope"], default="local")
     parser.add_argument("--local-rerank-candidate-k", type=int, default=6)
+    parser.add_argument("--searxng-base-url", default=None)
+    parser.add_argument("--web-crawler-provider", choices=["none", "jina", "jina_reader"], default=None)
+    parser.add_argument("--jina-reader-base-url", default=None)
+    parser.add_argument("--jina-search-base-url", default=None)
+    parser.add_argument("--crawler-max-chars", type=int, default=None)
     parser.add_argument("--seed", type=int, default=20260606)
     parser.add_argument("--max-researchers", type=int, default=3)
     parser.add_argument("--max-results", type=int, default=4)

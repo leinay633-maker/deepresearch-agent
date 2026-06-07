@@ -139,13 +139,24 @@
 ## Q：真实 search adapter 是什么？
 [状态: 待消化]
 标签：Search / Adapter
-检索关键词：WikipediaSearchAdapter, real search
-回答：当前真实 adapter 是 `WikipediaSearchAdapter`，调用 Wikipedia Search API，不需要 API key。我实测过 DeepSeek v4-flash + Wikipedia benchmark，最新结果 `fallback_count_total=2`，没有把它包装成全真实无降级。中间踩过一个坑：LLM planner 生成的长自然语言子问题会让 Wikipedia 返回空结果或超时，所以我加了 query candidate 压缩；它能降低 fallback 风险，但不能保证 Wikipedia 永远不失败。
-关联模块：`search.py`
+检索关键词：WikipediaSearchAdapter, SearxNG, Jina Reader, real search
+回答：现在搜索层已经不是只靠 Wikipedia。`search.py` 里有 `mock`、`wikipedia`、`searxng`、`jina` 四类 search adapter，还有 `JinaReaderCrawler` 做 URL 正文抽取。真正端到端实测最多的是 DeepSeek v4-flash + Wikipedia，最新 retrieval 对比里仍有 fallback；SearxNG 需要 `SEARXNG_BASE_URL`，当前没有自建实例，只做了 stub 单测；Jina Reader crawl `https://example.com` live 成功，但 Jina Search 在当前环境返回 401/403，CLI run 走了 fallback。所以我会说搜索/爬取边界已经拆开了，但生产级搜索质量还没完成。
+关联模块：`search.py`, `tests/test_web_search_providers.py`
 可追问：
 1. 为什么不用 Tavily？
 2. Wikipedia 相关性有什么问题？
-3. 怎么接第二个 provider？
+3. 怎么接 Brave/Tavily？
+
+## Q：为什么要把 search 和 crawler 分开？
+[状态: 待消化]
+标签：Search / Crawler / 工具调用
+检索关键词：SearxNG, Jina Reader, crawler, web search
+回答：因为搜索 API 往往只给 title、URL 和 snippet，而 DeepResearch 真正需要的是可引用、可检查的正文证据。现在 `SearxngSearchAdapter` 负责 query 到候选 URL，`JinaReaderCrawler` 负责 URL 到 clean text，最后仍统一成 `Source`。这样以后把 SearxNG 换成 Brave/Tavily，或者把 Jina Reader 换成 trafilatura/readability，都不会改 orchestrator。
+关联模块：`search.py`, `SearchService`, `Source`
+可追问：
+1. crawler 失败怎么办？
+2. 为什么默认不 crawl？
+3. 如何做 robots 和限流？
 
 ## Q：mock search 的意义是什么？
 [状态: 待消化]

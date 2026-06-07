@@ -38,6 +38,11 @@ class Settings:
     local_rerank_model: str = "BAAI/bge-reranker-base"
     dashscope_rerank_model: str = "gte-rerank-v2"
     local_rerank_candidate_k: int = 6
+    searxng_base_url: str = ""
+    web_crawler_provider: str = "none"
+    jina_reader_base_url: str = "https://r.jina.ai/"
+    jina_search_base_url: str = "https://s.jina.ai/"
+    crawler_max_chars: int = 4000
 
 
 def _float_env(name: str, default: float) -> float:
@@ -114,4 +119,12 @@ def load_settings() -> Settings:
             or "gte-rerank-v2"
         ),
         local_rerank_candidate_k=_int_env("LOCAL_RERANK_CANDIDATE_K", 6),
+        searxng_base_url=os.getenv("SEARXNG_BASE_URL", "").strip(),
+        web_crawler_provider=os.getenv("WEB_CRAWLER_PROVIDER", "none").strip().lower()
+        or "none",
+        jina_reader_base_url=os.getenv("JINA_READER_BASE_URL", "https://r.jina.ai/").strip()
+        or "https://r.jina.ai/",
+        jina_search_base_url=os.getenv("JINA_SEARCH_BASE_URL", "https://s.jina.ai/").strip()
+        or "https://s.jina.ai/",
+        crawler_max_chars=_int_env("CRAWLER_MAX_CHARS", 4000),
     )

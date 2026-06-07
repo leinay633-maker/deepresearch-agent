@@ -59,6 +59,14 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
         request_timeout_seconds=args.request_timeout_seconds,
         embedding_provider=args.embedding_provider,
         local_retrieval_mode=args.local_retrieval_mode,
+        searxng_base_url=getattr(args, "searxng_base_url", None) or settings.searxng_base_url,
+        web_crawler_provider=getattr(args, "web_crawler_provider", None)
+        or settings.web_crawler_provider,
+        jina_reader_base_url=getattr(args, "jina_reader_base_url", None)
+        or settings.jina_reader_base_url,
+        jina_search_base_url=getattr(args, "jina_search_base_url", None)
+        or settings.jina_search_base_url,
+        crawler_max_chars=getattr(args, "crawler_max_chars", None) or settings.crawler_max_chars,
         deepseek_model=effective_llm_model
         if args.llm_provider == "deepseek"
         else settings.deepseek_model,
@@ -80,6 +88,8 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
         "max_researchers": effective_settings.max_researchers,
         "max_results": args.max_results,
         "request_timeout_seconds": effective_settings.request_timeout_seconds,
+        "web_crawler_provider": effective_settings.web_crawler_provider,
+        "crawler_max_chars": effective_settings.crawler_max_chars,
         "judge_provider": args.judge_provider,
         "official_judge_score": "not_run",
         "settings": {
@@ -414,7 +424,7 @@ def main() -> None:
     parser.add_argument("--split", default="test")
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit", type=int, default=3)
-    parser.add_argument("--search-provider", choices=["mock", "wikipedia"], default="mock")
+    parser.add_argument("--search-provider", choices=["mock", "wikipedia", "searxng", "jina"], default="mock")
     parser.add_argument("--llm-provider", choices=["mock", "deepseek"], default="mock")
     parser.add_argument("--llm-model", default=None)
     parser.add_argument("--embedding-provider", choices=["local", "dashscope"], default="local")
@@ -422,6 +432,11 @@ def main() -> None:
     parser.add_argument("--max-researchers", type=int, default=2)
     parser.add_argument("--max-results", type=int, default=3)
     parser.add_argument("--request-timeout-seconds", type=float, default=8.0)
+    parser.add_argument("--searxng-base-url", default=None)
+    parser.add_argument("--web-crawler-provider", choices=["none", "jina", "jina_reader"], default=None)
+    parser.add_argument("--jina-reader-base-url", default=None)
+    parser.add_argument("--jina-search-base-url", default=None)
+    parser.add_argument("--crawler-max-chars", type=int, default=None)
     parser.add_argument("--seed", type=int, default=20260607)
     parser.add_argument(
         "--judge-provider",

@@ -102,6 +102,13 @@ Search providers：
 
 - `mock`：默认 search provider，离线可复现。
 - `wikipedia`：真实网络检索 adapter，调用 Wikipedia Search API；失败、超时或熔断时自动使用 mock fallback，并在 trace/metrics 里暴露 fallback。
+- `searxng`：真实 web search adapter，读取 `SEARXNG_BASE_URL` 或 CLI `--searxng-base-url` 指向自建/可访问 SearxNG 实例；可配 `WEB_CRAWLER_PROVIDER=jina` 把搜索结果 URL 交给 Jina Reader 抽正文。
+- `jina`：Jina Search adapter，调用 `https://s.jina.ai/`；如配置 `JINA_API_KEY` 会带 Bearer token，未配置时仍会尝试公开 endpoint，失败会走 mock fallback。
+
+Crawler：
+
+- `none`：默认，不抽网页正文，只使用 search snippet。
+- `jina` / `jina_reader`：调用 `https://r.jina.ai/<url>` 抽取 URL 的 LLM-friendly 文本；可用 `JINA_READER_BASE_URL`、`JINA_API_KEY`、`CRAWLER_MAX_CHARS` 配置。
 
 Local retrieval：
 

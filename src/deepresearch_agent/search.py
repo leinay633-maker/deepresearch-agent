@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 from urllib.parse import quote_plus, urlencode
 from urllib.request import Request, urlopen
 
@@ -22,6 +23,13 @@ class SearchAdapter(Protocol):
     name: str
 
     async def search(self, query: str, max_results: int, timeout: float) -> list[Source]:
+        ...
+
+
+class WebCrawler(Protocol):
+    name: str
+
+    async def crawl(self, url: str, timeout: float) -> str:
         ...
 
 
@@ -162,6 +170,160 @@ class WikipediaSearchAdapter:
         return sources
 
 
+class JinaReaderCrawler:
+    name = "jina_reader"
+
+    def __init__(self, base_url: str = "https://r.jina.ai/", max_chars: int = 4000) -> None:
+        self.base_url = base_url.rstrip("/") + "/"
+        self.max_chars = max_chars
+
+    async def crawl(self, url: str, timeout: float) -> str:
+        return await asyncio.to_thread(self._crawl_sync, url, timeout)
+
+    def _crawl_sync(self, url: str, timeout: float) -> str:
+        headers = {"User-Agent": "deepresearch-agent/0.1 local interview project"}
+        api_key = os.environ.get("JINA_API_KEY")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        request = Request(
+            f"{self.base_url}{url}",
+            headers=headers,
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                text = response.read().decode("utf-8", errors="replace")
+        except Exception as exc:  # pragma: no cover - depends on live network
+            raise SearchError(str(exc)) from exc
+        return _normalize_content(text, self.max_chars)
+
+
+class JinaSearchAdapter:
+    name = "jina"
+
+    def __init__(self, base_url: str = "https://s.jina.ai/", max_chars: int = 4000) -> None:
+        self.base_url = base_url.rstrip("/") + "/"
+        self.max_chars = max_chars
+
+    async def search(self, query: str, max_results: int, timeout: float) -> list[Source]:
+        return await asyncio.to_thread(self._search_sync, query, max_results, timeout)
+
+    def _search_sync(self, query: str, max_results: int, timeout: float) -> list[Source]:
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "deepresearch-agent/0.1 local interview project",
+        }
+        api_key = os.environ.get("JINA_API_KEY")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        request = Request(
+            f"{self.base_url}{quote_plus(query)}",
+            headers=headers,
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+        except Exception as exc:  # pragma: no cover - depends on live network
+            raise SearchError(str(exc)) from exc
+        rows = _jina_rows(raw)
+        if not rows:
+            rows = [
+                {
+                    "title": f"Jina search: {query}",
+                    "url": self.base_url,
+                    "content": raw,
+                }
+            ]
+        sources = _rows_to_sources(
+            rows[:max_results],
+            provider=self.name,
+            query=query,
+            max_results=max_results,
+            max_chars=self.max_chars,
+            metadata={"search_api": "jina_search"},
+        )
+        if not sources:
+            raise SearchError("jina search returned no results")
+        return sources
+
+
+class SearxngSearchAdapter:
+    name = "searxng"
+
+    def __init__(
+        self,
+        base_url: str,
+        crawler: WebCrawler | None = None,
+        max_chars: int = 4000,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.crawler = crawler
+        self.max_chars = max_chars
+
+    async def search(self, query: str, max_results: int, timeout: float) -> list[Source]:
+        rows = await asyncio.to_thread(self._fetch_rows_sync, query, timeout)
+        sources: list[Source] = []
+        for index, row in enumerate(rows[:max_results]):
+            if not isinstance(row, dict):
+                continue
+            url = str(row.get("url", ""))
+            title = str(row.get("title") or url or "Untitled search result")
+            snippet = str(row.get("content") or row.get("snippet") or "")
+            crawler_error = None
+            content = snippet
+            if self.crawler is not None and url:
+                try:
+                    content = await self.crawler.crawl(url, timeout)
+                except Exception as exc:
+                    crawler_error = str(exc)
+                    content = snippet
+            content = _normalize_content(content or title, self.max_chars)
+            query_terms = _tokens(query)
+            overlap = len(query_terms & _tokens(f"{title} {content}"))
+            rank_bonus = max_results - index
+            metadata = {
+                "search_api": "searxng",
+                "engine": row.get("engine"),
+                "engines": row.get("engines"),
+                "snippet": snippet,
+                "crawler": self.crawler.name if self.crawler is not None else "none",
+            }
+            if crawler_error:
+                metadata["crawler_error"] = crawler_error
+            sources.append(
+                Source(
+                    title=html.unescape(title),
+                    url=url,
+                    content=content,
+                    provider=self.name,
+                    query=query,
+                    score=float(overlap * 5 + rank_bonus),
+                    metadata=metadata,
+                )
+            )
+        if not sources:
+            raise SearchError("searxng returned no parseable results")
+        return sources
+
+    def _fetch_rows_sync(self, query: str, timeout: float) -> list[dict[str, Any]]:
+        if not self.base_url:
+            raise SearchError("SEARXNG_BASE_URL is required for searxng search")
+        params = urlencode({"q": query, "format": "json", "language": "en", "safesearch": "0"})
+        request = Request(
+            f"{self.base_url}/search?{params}",
+            headers={"User-Agent": "deepresearch-agent/0.1 local interview project"},
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:  # pragma: no cover - depends on live network
+            raise SearchError(str(exc)) from exc
+
+        rows = payload.get("results", [])
+        if not isinstance(rows, list) or not rows:
+            raise SearchError("searxng returned no results")
+        return rows
+
+
 class CircuitBreaker:
     def __init__(self, failure_threshold: int, cooldown_seconds: float) -> None:
         self.failure_threshold = failure_threshold
@@ -238,19 +400,128 @@ class SearchService:
 def build_search_service(settings: Settings, provider: str | None = None) -> SearchService:
     selected = (provider or settings.search_provider).strip().lower()
     fallback = MockSearchAdapter()
-    if selected == "wikipedia":
-        primary: SearchAdapter = WikipediaSearchAdapter()
-    else:
-        primary = fallback
+    primary = build_search_adapter(settings, selected, fallback)
     return SearchService(primary=primary, fallback=fallback, settings=settings)
+
+
+def build_search_adapter(
+    settings: Settings,
+    selected: str,
+    fallback: SearchAdapter | None = None,
+) -> SearchAdapter:
+    if selected == "mock":
+        return fallback or MockSearchAdapter()
+    if selected == "wikipedia":
+        return WikipediaSearchAdapter()
+    if selected == "searxng":
+        return SearxngSearchAdapter(
+            base_url=settings.searxng_base_url,
+            crawler=build_crawler(settings),
+            max_chars=settings.crawler_max_chars,
+        )
+    if selected == "jina":
+        return JinaSearchAdapter(
+            base_url=settings.jina_search_base_url,
+            max_chars=settings.crawler_max_chars,
+        )
+    raise ValueError(f"unknown search provider: {selected}")
+
+
+def build_crawler(settings: Settings) -> WebCrawler | None:
+    provider = settings.web_crawler_provider.strip().lower()
+    if provider in {"", "none"}:
+        return None
+    if provider in {"jina", "jina_reader"}:
+        return JinaReaderCrawler(
+            base_url=settings.jina_reader_base_url,
+            max_chars=settings.crawler_max_chars,
+        )
+    raise ValueError(f"unknown web crawler provider: {provider}")
 
 
 def _strip_html(text: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", text)).strip()
 
 
+def _normalize_content(text: str, max_chars: int) -> str:
+    normalized = re.sub(r"\s+", " ", _strip_html(text)).strip()
+    if max_chars > 0 and len(normalized) > max_chars:
+        return normalized[:max_chars].rstrip()
+    return normalized
+
+
 def _tokens(text: str) -> set[str]:
     return {token.lower() for token in re.findall(r"[a-zA-Z0-9_]+", text)}
+
+
+def _jina_rows(raw: str) -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return _jina_markdown_rows(raw)
+    data = payload.get("data") if isinstance(payload, dict) else payload
+    if isinstance(data, dict):
+        data = data.get("results", [])
+    if not isinstance(data, list):
+        return []
+    rows = []
+    for item in data:
+        if isinstance(item, dict):
+            rows.append(item)
+    return rows
+
+
+def _jina_markdown_rows(raw: str) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    content_lines: list[str] = []
+    for line in raw.splitlines():
+        if line.startswith("Title:"):
+            if current:
+                current["content"] = "\n".join(content_lines).strip()
+                rows.append(current)
+            current = {"title": line.removeprefix("Title:").strip()}
+            content_lines = []
+        elif line.startswith("URL Source:") or line.startswith("URL:"):
+            key = "URL Source:" if line.startswith("URL Source:") else "URL:"
+            current["url"] = line.removeprefix(key).strip()
+        elif current:
+            content_lines.append(line)
+    if current:
+        current["content"] = "\n".join(content_lines).strip()
+        rows.append(current)
+    return rows
+
+
+def _rows_to_sources(
+    rows: list[dict[str, Any]],
+    *,
+    provider: str,
+    query: str,
+    max_results: int,
+    max_chars: int,
+    metadata: dict[str, Any],
+) -> list[Source]:
+    sources = []
+    query_terms = _tokens(query)
+    for index, row in enumerate(rows):
+        title = str(row.get("title") or row.get("name") or row.get("url") or "Untitled search result")
+        url = str(row.get("url") or row.get("link") or row.get("href") or "")
+        content = _normalize_content(str(row.get("content") or row.get("description") or title), max_chars)
+        overlap = len(query_terms & _tokens(f"{title} {content}"))
+        rank_bonus = max_results - index
+        sources.append(
+            Source(
+                title=html.unescape(title),
+                url=url,
+                content=content,
+                provider=provider,
+                query=query,
+                score=float(overlap * 5 + rank_bonus),
+                metadata=dict(metadata),
+            )
+        )
+    return sources
 
 
 WIKIPEDIA_STOPWORDS = {

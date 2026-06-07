@@ -48,6 +48,11 @@ def _settings_from_args(args: argparse.Namespace):
         ("local_hybrid_rrf_k", "local_hybrid_rrf_k"),
         ("rerank_provider", "rerank_provider"),
         ("local_rerank_candidate_k", "local_rerank_candidate_k"),
+        ("searxng_base_url", "searxng_base_url"),
+        ("web_crawler_provider", "web_crawler_provider"),
+        ("jina_reader_base_url", "jina_reader_base_url"),
+        ("jina_search_base_url", "jina_search_base_url"),
+        ("crawler_max_chars", "crawler_max_chars"),
     ]:
         value = getattr(args, argument)
         if value is not None:
@@ -60,7 +65,7 @@ def _settings_from_args(args: argparse.Namespace):
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a local DeepResearch Agent query.")
     parser.add_argument("query")
-    parser.add_argument("--search-provider", choices=["mock", "wikipedia"], default=None)
+    parser.add_argument("--search-provider", choices=["mock", "wikipedia", "searxng", "jina"], default=None)
     parser.add_argument("--llm-provider", choices=["mock", "deepseek"], default=None)
     parser.add_argument("--llm-model", default=None)
     parser.add_argument("--embedding-provider", choices=["local", "dashscope"], default=None)
@@ -73,6 +78,11 @@ def main() -> None:
     parser.add_argument("--rerank-enabled", action="store_true")
     parser.add_argument("--rerank-provider", choices=["local", "dashscope"], default=None)
     parser.add_argument("--local-rerank-candidate-k", type=int, default=None)
+    parser.add_argument("--searxng-base-url", default=None)
+    parser.add_argument("--web-crawler-provider", choices=["none", "jina", "jina_reader"], default=None)
+    parser.add_argument("--jina-reader-base-url", default=None)
+    parser.add_argument("--jina-search-base-url", default=None)
+    parser.add_argument("--crawler-max-chars", type=int, default=None)
     parser.add_argument("--max-researchers", type=int, default=3)
     parser.add_argument("--max-results", type=int, default=4)
     parser.add_argument("--seed", type=int, default=20260606)
