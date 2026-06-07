@@ -15,6 +15,7 @@ from statistics import median
 from typing import Any
 
 from deepresearch_agent.config import load_settings
+from deepresearch_agent.eval_judge import build_eval_judge_provider
 from deepresearch_agent.orchestrator import DeepResearchOrchestrator
 from deepresearch_agent.schemas import ResearchRequest, StructuredReport
 
@@ -48,6 +49,7 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     predictions_path.parent.mkdir(parents=True, exist_ok=True)
+    answer_judge = build_eval_judge_provider(getattr(args, "judge_provider", "none"))
 
     settings = load_settings()
     effective_llm_model = _effective_llm_model(args, settings)
@@ -111,7 +113,7 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
         "reflection_min_sources": reflection_min_sources,
         "citation_judge_provider": effective_settings.citation_judge_provider,
         "citation_judge_model": effective_settings.citation_judge_model,
-        "judge_provider": args.judge_provider,
+        "judge_provider": getattr(args, "judge_provider", "none"),
         "official_judge_score": "not_run",
         "settings": {
             **asdict(effective_settings),
@@ -133,6 +135,8 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
                 effective_llm_model,
                 stage_models,
             )
+            if answer_judge is not None:
+                record["answer_judgment"] = asdict(answer_judge.judge(case, record))
             records.append(record)
             predictions.append(
                 {
@@ -363,6 +367,11 @@ def _summarize(
         if record.get("citation_retention_rate") is not None
     ]
     source_counts = [record.get("deduped_source_count", 0) for record in records]
+    answer_judgments = [
+        record["answer_judgment"]
+        for record in records
+        if record.get("answer_judgment") and record["answer_judgment"].get("score") is not None
+    ]
     success_count = sum(1 for record in records if record["success"])
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -402,6 +411,24 @@ def _summarize(
         if source_counts
         else 0.0,
         "fallback_count_total": sum(record.get("fallback_count", 0) for record in records),
+        "answer_judge": {
+            "provider": config_snapshot.get("judge_provider", "none"),
+            "scored_count": len(answer_judgments),
+            "score_avg": round(
+                sum(item["score"] for item in answer_judgments) / len(answer_judgments),
+                4,
+            )
+            if answer_judgments
+            else None,
+            "pass_rate": round(
+                sum(1 for item in answer_judgments if item["verdict"] == "pass")
+                / len(answer_judgments),
+                4,
+            )
+            if answer_judgments
+            else None,
+            "official_judge_score": "not_run",
+        },
         "records": [
             {
                 "case_id": record["case_id"],
@@ -413,6 +440,7 @@ def _summarize(
                 "deduped_source_count": record.get("deduped_source_count", 0),
                 "citation_retention_rate": record.get("citation_retention_rate", 0.0),
                 "fallback_count": record.get("fallback_count", 0),
+                "answer_judgment": record.get("answer_judgment"),
                 "error": record.get("error"),
                 "run_id": record.get("run_id"),
             }
@@ -512,9 +540,12 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260607)
     parser.add_argument(
         "--judge-provider",
-        choices=["none"],
+        choices=["none", "heuristic"],
         default="none",
-        help="Reserved for official/LLM judge scoring; currently writes artifacts only.",
+        help=(
+            "Optional answer scoring provider. 'heuristic' checks normalized "
+            "ground-truth strings in the generated answer; official scoring is not run."
+        ),
     )
     parser.add_argument("--raw-log", default=None)
     parser.add_argument("--summary-output", default=None)

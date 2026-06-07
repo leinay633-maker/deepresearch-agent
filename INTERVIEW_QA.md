@@ -700,7 +700,7 @@
 [状态: 待消化]
 标签：Benchmark / 评测
 检索关键词：benchmark, latency, token, citation
-回答：`benchmark.py` 记录 seed、配置快照、case_id、query、latency_ms、total_tokens、estimated_cost_usd、deduped_source_count、raw_search_result_count、citation_retention_rate、success、fallback_count 和 output_summary。现在有五类口径：mock plumbing run 只证明离线路径；DeepSeek + Wikipedia + keyword baseline 是端到端检索基线；DeepSeek + Wikipedia + local hybrid 是混合检索小样本；BEIR/scifact 是独立检索模块评测，只看 Recall@10、nDCG@10、MRR；LiveDRBench preview 是公开 Deep Research 端到端 artifact 评测，当前只产 answer/source/trace/cost/predictions 和本项目 citation 指标，还没有官方 judge 分数。对比结果分别在 `results/retrieval_benchmark_comparison.json`、`results/retrieval_eval_scifact.json` 和 `results/deep_research_eval_livedrbench_deepseek_wikipedia_summary.json`，我不会只挑好看的数字说。
+回答：`benchmark.py` 记录 seed、配置快照、case_id、query、latency_ms、total_tokens、estimated_cost_usd、deduped_source_count、raw_search_result_count、citation_retention_rate、success、fallback_count 和 output_summary。现在有五类口径：mock plumbing run 只证明离线路径；DeepSeek + Wikipedia + keyword baseline 是端到端检索基线；DeepSeek + Wikipedia + local hybrid 是混合检索小样本；BEIR/scifact 是独立检索模块评测，只看 Recall@10、nDCG@10、MRR；LiveDRBench preview 是公开 Deep Research 端到端 artifact 评测，当前产 answer/source/trace/cost/predictions、本项目 citation 指标，并可选用 `--judge-provider heuristic` 对 ground truth 字符串做本地弱评分，但还没有官方 judge 分数。对比结果分别在 `results/retrieval_benchmark_comparison.json`、`results/retrieval_eval_scifact.json` 和 `results/deep_research_eval_livedrbench_deepseek_wikipedia_summary.json`，我不会只挑好看的数字说。
 关联模块：`benchmark.py`, `retrieval_eval.py`, `deep_research_eval.py`, `results/benchmark_summary.json`, `results/retrieval_benchmark_comparison.json`, `results/retrieval_eval_scifact.json`
 可追问：
 1. 为什么只 5 条 case？
@@ -711,8 +711,8 @@
 [状态: 待消化]
 标签：Benchmark / Deep Research Eval
 检索关键词：LiveDRBench, public deep research eval, artifact, judge
-回答：我新增了 `src/deepresearch_agent/deep_research_eval.py`，它能加载本地 JSONL/JSON/CSV，也能直接从 Hugging Face 拉 `microsoft/LiveDRBench` 的 preview 或 v1-full，跑完整 orchestrator，并保存 raw JSONL、summary JSON 和 LiveDRBench-style predictions。当前我没有编官方分数，`judge_provider` 还是 `none`；最新真实样本是 1 条 LiveDRBench preview，DeepSeek v4-flash + Wikipedia 跑通但 `success_rate=0.0`、citation retention `0.5`、latency `20910.052ms`、token `3434`、成本 `$0.00072332`。这说明公开评测入口打通了，但 Wikipedia 搜索覆盖、JSON 格式任务约束和 citation 语义校验都还不够。
-关联模块：`deep_research_eval.py`, `orchestrator.py`, `results/deep_research_eval_livedrbench_deepseek_wikipedia_summary.json`
+回答：我新增了 `src/deepresearch_agent/deep_research_eval.py`，它能加载本地 JSONL/JSON/CSV，也能直接从 Hugging Face 拉 `microsoft/LiveDRBench` 的 preview 或 v1-full，跑完整 orchestrator，并保存 raw JSONL、summary JSON 和 LiveDRBench-style predictions。现在有两种非官方口径：`judge_provider=none` 只产 artifact 和本项目 citation/cost 指标；`judge_provider=heuristic` 会读取 case 里的 `ground_truths/answer/expected_answer`，按 normalized substring 命中率写 `answer_judgment`。我没有编官方分数；最新真实样本是 1 条 LiveDRBench preview，DeepSeek v4-flash + Wikipedia 跑通但 `success_rate=0.0`、citation retention `0.5`、latency `20910.052ms`、token `3434`、成本 `$0.00072332`。这说明公开评测入口打通了，但 Wikipedia 搜索覆盖、JSON 格式任务约束和 citation 语义校验都还不够。
+关联模块：`deep_research_eval.py`, `eval_judge.py`, `orchestrator.py`, `results/deep_research_eval_livedrbench_deepseek_wikipedia_summary.json`
 可追问：
 1. 为什么不直接报官方分？
 2. LiveDRBench 和 BEIR/scifact 有什么区别？

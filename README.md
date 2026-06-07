@@ -170,7 +170,7 @@ $env:DEEPSEEK_API_KEY="<your-key>"
 py -3.11 -m deepresearch_agent.deep_research_eval --dataset livedrbench-preview --limit 1 --llm-provider deepseek --search-provider wikipedia --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --request-timeout-seconds 8
 ```
 
-输出会写入 `logs/deep-research-eval-*.jsonl`、`results/deep_research_eval_summary.json` 和 `results/livedrbench_predictions.json`。当前脚本先产可复查 artifact 和 LiveDRBench-style predictions；官方 judge/answer-quality scoring 尚未接入。
+输出会写入 `logs/deep-research-eval-*.jsonl`、`results/deep_research_eval_summary.json` 和 `results/livedrbench_predictions.json`。当前脚本先产可复查 artifact 和 LiveDRBench-style predictions；可选 `--judge-provider heuristic` 会按 case 里的 `ground_truths` / `answer` / `expected_answer` 做本地字符串命中评分。官方 judge/answer-quality scoring 尚未接入。
 
 运行 retrieval 对比 benchmark：
 
@@ -243,6 +243,7 @@ src/deepresearch_agent/
   tracing.py          Structured JSONL trace events and optional OTLP HTTP export
   benchmark.py        Reproducible benchmark harness
   deep_research_eval.py Public end-to-end Deep Research eval artifact runner
+  eval_judge.py       Optional heuristic answer judge for public eval cases
 ```
 
 See `KNOWLEDGE_BASE.md` and `INTERVIEW_QA.md` for implementation notes and interview drill material.
