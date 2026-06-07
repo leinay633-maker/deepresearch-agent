@@ -148,6 +148,15 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 代价：它仍然是 lexical grounding，不等于语义蕴含；中文和长表格/列表的句子切分仍粗糙；`partial` 只是提示证据不足，不是严格事实分类。
 面试怎么答：我会说我没有一步跳到昂贵 judge，而是先把 citation 从“一个分数”升级成“claim -> cited source -> evidence quote”的可审计结构。后续接 LLM judge 时，judge 看的是具体 quote，不是整篇网页。
 
+## 决策 14：为什么 reflection loop 默认关闭且有轮次上限
+
+背景：原主链路是一次 plan、一次并发 research、一次 synthesis；这比真实 deep research agent 少了“发现证据不足后再研究”的循环。直接做无限循环会带来成本、延迟、状态恢复和测试不稳定问题。
+可选方案：保持一次性 plan；让 LLM 每轮自由决定是否继续；做固定 N 轮；做启发式 bounded reflection；迁移 LangGraph 循环节点。
+最终选择：在 `ResearchRequest` 上新增 `reflection_enabled`、`max_reflection_rounds`、`reflection_min_sources`。默认关闭；显式开启后，每轮先写 `compression.roundN`，压缩已有 findings，再按 source coverage/fallback 启发式判断是否追加一个 `R<N>` follow-up question，最多跑配置的轮数。
+理由：这一步先补 control flow 边界，不引入新的 LLM judge 或 planner prompt。默认关闭能保护现有 benchmark 口径；轮次上限和阈值能避免成本失控；trace 里保留 compression/reflection payload，后续可以替换成 LLM reflection policy。
+代价：当前 reflection 是启发式，不是真正语义判断“信息是否足够”；追加问题模板也比较通用，可能召回重复信息。run control 已复用同一 helper，但还没有阶段级 checkpoint 到单个 reflection round。
+面试怎么答：我会说这是从 pipeline 到 agent loop 的第一步：先把循环、压缩、追加问题和 trace 边界做出来，再把启发式 policy 换成 LLM reflection 或 evaluator。
+
 # 5 实现细节
 
 Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。局限是 planner 还不会根据 researcher 中间结果动态追加子问题。
@@ -157,6 +166,8 @@ DeepSeek Planner 验证：`src/deepresearch_agent/llm.py` 里新增了 `DeepSeek
 DeepSeek Synthesizer 接入：步骤 2 以后，`DeepSeekLLMProvider.create_brief`、`plan`、`synthesize` 都走 DeepSeek JSON mode。CLI 和 API 可以通过 `llm_provider="deepseek"` 或 CLI 参数 `--llm-provider deepseek` 显式启用；默认仍是 mock，保证离线测试不受 API key 影响。当前 synthesis 要求模型输出 `{"answer": "...", "claims": [...]}`，并要求每条 factual claim 使用输入 sources 中已有的 `[Sx]` citation ID。
 
 Researcher：`src/deepresearch_agent/orchestrator.py` 的 `_research_one`。输入是子问题，输出是 `Finding`。它调用 `SearchService` 和 `LocalRagRetriever`，再 dedup、verify、summary。`LocalRagRetriever` 内部已经从 keyword overlap 升级为可配置的 keyword / hybrid retrieval，但 orchestrator 仍只接收 `Source` 列表。局限是 summary 仍是模板化，不是自然语言 LLM 压缩。
+
+Reflection / Compression Loop：`src/deepresearch_agent/orchestrator.py` 的 `_run_reflection_rounds`、`_compress_findings`、`_reflect_on_evidence`。输入是初始 plan 和 researcher results，输出是可能扩展后的 plan/results。开启 `reflection_enabled` 后，每轮先把 findings 压成短文本写入 `compression.roundN` trace，再根据 fallback_count 和每个 finding 的唯一 source 数是否低于 `reflection_min_sources` 来决定是否追加 `R<N>` 子问题。`run_control.py` 的 researcher 阶段也调用同一个 helper，所以 `/research` 和 `/runs` 语义一致。局限是当前 policy 是启发式，不是 LLM reflection。
 
 Web Search / Crawler Provider：`src/deepresearch_agent/search.py`。`build_search_adapter()` 现在按 provider name 构造 `mock`、`wikipedia`、`searxng` 或 `jina`，`build_crawler()` 按配置构造 `JinaReaderCrawler`。`SearxngSearchAdapter` 调 `SEARXNG_BASE_URL/search?format=json`，解析 title/url/snippet，再可选调用 crawler 抽正文；`JinaReaderCrawler` 用 `https://r.jina.ai/<url>` 抽 LLM-friendly text；`JinaSearchAdapter` 用 `https://s.jina.ai/<query>`。`JINA_API_KEY` 是可选环境变量，不进入 Settings 快照。
 
@@ -308,7 +319,7 @@ Agent Run Control Plane：`src/deepresearch_agent/run_control.py` 外包现有 D
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
-测试验证：`py -3.11 -m pytest -q`，最新结果 `41 passed, 2 warnings in 111.07s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 Chroma/OpenTelemetry 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `43 passed, 2 warnings in 55.03s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 Chroma/OpenTelemetry 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -325,6 +336,8 @@ Reranker smoke：`py -3.11 -m deepresearch_agent.cli "How does citation checking
 Web search / crawler provider smoke：`py -3.11 -m pytest tests/test_web_search_providers.py tests/test_failure_handling.py -q` 成功，`10 passed in 0.36s`，覆盖 SearxNG JSON parsing、crawler 内容替换、Jina Reader URL prefix、Jina Search JSON parsing、provider registry 和 unknown provider fail-fast。真实外网 smoke：`https://r.jina.ai/https://example.com` 返回 `200` 和 clean text，说明 Jina Reader crawler 这层能 live 访问；`--search-provider jina` 的 CLI run 成功但触发 fallback，trace error 是 `HTTP Error 401: Unauthorized`，所以 Jina Search 真实检索在当前环境未通过。SearxNG 需要 `SEARXNG_BASE_URL`，当前没有自建实例，未做 live search。
 
 Claim-level evidence grounding smoke：`py -3.11 -m pytest tests/test_quality_and_citations.py -q` 成功，`6 passed in 0.26s`；新增测试覆盖 supported claim 提取 evidence quote，以及 missing source 标成 `unverifiable`。`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?" --search-provider mock --llm-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --json` 成功，输出里的 citation assessment 已包含 `support_level="supported"` 和 `evidence_quotes`，quote 示例来自本地 source 句子 “Normal RAG retrieves context once for a single answer...”。这只证明 evidence quote plumbing 和 lexical grounding 生效，不代表语义事实校验完成。
+
+Reflection loop smoke：`py -3.11 -m pytest tests/test_reflection_loop.py tests/test_run_control.py -q` 成功，`9 passed, 1 warning in 4.49s`。`tests/test_reflection_loop.py` 覆盖 orchestrator 在 `reflection_enabled=True`、`max_reflection_rounds=1`、`reflection_min_sources=4` 时追加 `R1` follow-up question，并写入 `compression.round1` / `reflection.round1` trace。`tests/test_run_control.py` 也覆盖了 `/runs` approve 后 result_json 的 plan 包含 `R1`，trace_events 包含 `reflection.round1`。CLI smoke：`py -3.11 -m deepresearch_agent.cli "How should citation grounding work in a research agent?" --search-provider mock --llm-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --reflection-enabled --max-reflection-rounds 1 --reflection-min-sources 4 --json` 成功，输出可见 `id="R1"`、`compression.round1`、`reflection.round1` 和 `should_add_question=true`。
 
 mock benchmark 原始记录：`logs/benchmark-20260606T152954Z.jsonl`。
 当前 benchmark summary：`results/benchmark_summary.json`，已被真实 DeepSeek + Wikipedia benchmark 覆盖。
@@ -392,7 +405,7 @@ hallucination rate：当前用 unsupported citation count 作为 proxy，不能�
 latency：benchmark 记录每 case latency_ms，并计算 P50/P90/max；mock latency 只能作为 plumbing 回归信号，DeepSeek + Wikipedia latency 包含真实网络/API 时间，也不能当线上 SLA。local hybrid 比 keyword baseline p50 多 `6151.778ms`；独立检索评测里 keyword 平均每 query `0.3070s`，hybrid `0.5781s`，hybrid+rerank `3.4431s`，这些都需要如实讲。
 cost：mock provider 成本为 0，token 用字符估算；DeepSeek provider 已接真实 usage，并按当前实现里的 v4-flash 价格常量估算成本，价格核对日期 `2026-06-07`。BEIR/scifact 独立检索评测不调用 LLM，LLM token 和 API cost 都是 0；本地 embedding/rerank 不产生 API 成本，但会产生本机 CPU/GPU 时间；DashScope 成本未实测。
 工具失败恢复：有 unit test 覆盖 primary failure fallback 和 circuit breaker open；第一次 DeepSeek + Wikipedia benchmark 出现过 fallback，修复 Wikipedia 长查询压缩后 fallback 曾降到 0，但最新 keyword/hybrid 对比里仍分别出现 `fallback_count_total=1` 和 `2`，已在第 7 节如实记录。
-multi-hop 成功率：当前没有真实 multi-hop 标注集，未实测。
+multi-hop / reflection 成功率：当前没有真实 multi-hop 标注集，未实测质量提升；但 reflection loop 的控制流已用 mock/keyword smoke 验证，会在证据不足启发式触发时追加 `R<N>` follow-up question，并把 compression/reflection payload 写入 trace。下一步需要公开多跳任务或人工标注集来评估是否真的提升答案质量。
 
 评测集构造方式：端到端 5 条 case 是围绕本项目核心能力手写的 smoke benchmark，覆盖 supervisor-researcher、citation faithfulness、tool failure、cost tracking、benchmark reproducibility。公开检索标准口径采用 BEIR/scifact test qrels，只评测 local retriever，不评测 LLM 回答质量。公开 Deep Research 端到端口径新增 LiveDRBench preview runner，会跑完整 orchestrator 并保存 answer/source/trace/cost/predictions artifacts；当前只跑了 1 条 mock 和 1 条 DeepSeek/Wikipedia 样本，官方 judge 分数尚未接入。
 

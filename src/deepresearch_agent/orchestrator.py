@@ -12,7 +12,14 @@ from deepresearch_agent.cost import CostTracker
 from deepresearch_agent.dedup import SourceDeduplicator
 from deepresearch_agent.llm import DeepSeekLLMProvider, MockLLMProvider, summarize_sources
 from deepresearch_agent.rag import LocalRagRetriever
-from deepresearch_agent.schemas import Finding, ResearchRequest, Source, StructuredReport, TraceEvent
+from deepresearch_agent.schemas import (
+    Finding,
+    ResearchRequest,
+    Source,
+    StructuredReport,
+    SubQuestion,
+    TraceEvent,
+)
 from deepresearch_agent.search import SearchOutcome, SearchService, build_search_service
 from deepresearch_agent.tracing import TraceLogger
 from deepresearch_agent.verifier import SourceVerifier
@@ -79,6 +86,15 @@ class DeepResearchOrchestrator:
             for subquestion in plan
         ]
         research_results = await asyncio.gather(*research_tasks)
+        research_results = await self._run_reflection_rounds(
+            plan=plan,
+            research_results=list(research_results),
+            request=request,
+            search_service=search_service,
+            semaphore=semaphore,
+            trace=trace,
+            emit=emit,
+        )
 
         raw_search_count = sum(len(outcome.sources) for _, outcome in research_results)
         fallback_count = sum(1 for _, outcome in research_results if outcome.fallback_used)
@@ -191,6 +207,116 @@ class DeepResearchOrchestrator:
             }
             await self._record(trace, stage, status, payload, stage_start, emit)
             return finding, outcome
+
+    async def _run_reflection_rounds(
+        self,
+        *,
+        plan: list[SubQuestion],
+        research_results: list[tuple[Finding, SearchOutcome]],
+        request: ResearchRequest,
+        search_service: SearchService,
+        semaphore: asyncio.Semaphore,
+        trace: TraceLogger,
+        emit: Emit | None,
+    ) -> list[tuple[Finding, SearchOutcome]]:
+        if not request.reflection_enabled or request.max_reflection_rounds <= 0:
+            return research_results
+
+        for round_index in range(1, request.max_reflection_rounds + 1):
+            findings = [finding for finding, _ in research_results]
+            outcomes = [outcome for _, outcome in research_results]
+            compressed_context = self._compress_findings(findings)
+            await self._record(
+                trace,
+                f"compression.round{round_index}",
+                "success",
+                {
+                    "finding_count": len(findings),
+                    "compressed_chars": len(compressed_context),
+                    "compressed_context": compressed_context,
+                },
+                emit=emit,
+            )
+            reflection = self._reflect_on_evidence(
+                request=request,
+                plan=plan,
+                findings=findings,
+                outcomes=outcomes,
+                round_index=round_index,
+            )
+            await self._record(
+                trace,
+                f"reflection.round{round_index}",
+                "success",
+                reflection,
+                emit=emit,
+            )
+            if not reflection["should_add_question"]:
+                break
+            subquestion = SubQuestion.model_validate(reflection["subquestion"])
+            plan.append(subquestion)
+            new_results = await asyncio.gather(
+                self._research_one(subquestion, request, search_service, semaphore, trace, emit)
+            )
+            research_results.extend(new_results)
+        return research_results
+
+    def _compress_findings(self, findings: list[Finding], max_chars: int = 1200) -> str:
+        lines = []
+        for finding in findings:
+            titles = ", ".join(source.title for source in finding.sources[:3]) or "no sources"
+            lines.append(
+                f"{finding.subquestion_id}: {finding.summary} Sources: {titles}"
+            )
+        compressed = "\n".join(lines)
+        if len(compressed) > max_chars:
+            return compressed[:max_chars].rstrip()
+        return compressed
+
+    def _reflect_on_evidence(
+        self,
+        *,
+        request: ResearchRequest,
+        plan: list[SubQuestion],
+        findings: list[Finding],
+        outcomes: list[SearchOutcome],
+        round_index: int,
+    ) -> dict[str, Any]:
+        unique_urls = {source.url for finding in findings for source in finding.sources}
+        fallback_count = sum(1 for outcome in outcomes if outcome.fallback_used)
+        low_source_questions = [
+            finding.subquestion_id
+            for finding in findings
+            if len({source.url for source in finding.sources}) < request.reflection_min_sources
+        ]
+        should_add = bool(low_source_questions or fallback_count) and len(plan) < request.max_researchers + request.max_reflection_rounds
+        if not should_add:
+            return {
+                "should_add_question": False,
+                "reason": "current evidence meets heuristic source coverage",
+                "unique_source_count": len(unique_urls),
+                "fallback_count": fallback_count,
+                "low_source_questions": low_source_questions,
+            }
+        subquestion = SubQuestion(
+            id=f"R{round_index}",
+            question=(
+                "What additional independent evidence, counterexamples, or primary sources are "
+                f"needed to verify: {request.query}"
+            ),
+            rationale=(
+                "Reflection found low source coverage or fallback in earlier research; "
+                "run one bounded follow-up search before synthesis."
+            ),
+        )
+        return {
+            "should_add_question": True,
+            "reason": "evidence coverage below reflection threshold",
+            "unique_source_count": len(unique_urls),
+            "fallback_count": fallback_count,
+            "low_source_questions": low_source_questions,
+            "subquestion": subquestion.model_dump(mode="json"),
+        }
 
     def _assign_source_ids(self, sources: list[Source]) -> list[Source]:
         return [source.model_copy(update={"id": f"S{i + 1}"}) for i, source in enumerate(sources)]

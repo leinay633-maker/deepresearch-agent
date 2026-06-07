@@ -18,6 +18,9 @@ class ResearchRequest(BaseModel):
     llm_model: str | None = None
     search_provider: str | None = None
     seed: int = 20260606
+    reflection_enabled: bool = False
+    max_reflection_rounds: int = Field(default=1, ge=0, le=3)
+    reflection_min_sources: int = Field(default=4, ge=1, le=20)
 
 
 class ResearchBrief(BaseModel):

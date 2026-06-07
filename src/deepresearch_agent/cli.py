@@ -20,6 +20,9 @@ async def _run(args: argparse.Namespace) -> int:
         llm_model=args.llm_model,
         search_provider=args.search_provider,
         seed=args.seed,
+        reflection_enabled=args.reflection_enabled,
+        max_reflection_rounds=args.max_reflection_rounds,
+        reflection_min_sources=args.reflection_min_sources,
     )
     report = await DeepResearchOrchestrator(settings=settings).run(request)
     if args.json:
@@ -85,6 +88,9 @@ def main() -> None:
     parser.add_argument("--crawler-max-chars", type=int, default=None)
     parser.add_argument("--max-researchers", type=int, default=3)
     parser.add_argument("--max-results", type=int, default=4)
+    parser.add_argument("--reflection-enabled", action="store_true")
+    parser.add_argument("--max-reflection-rounds", type=int, default=1)
+    parser.add_argument("--reflection-min-sources", type=int, default=4)
     parser.add_argument("--seed", type=int, default=20260606)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()

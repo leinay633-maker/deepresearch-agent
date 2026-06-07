@@ -105,12 +105,23 @@
 [状态: 待消化]
 标签：Planner / 局限
 检索关键词：mock planner, limitation
-回答：默认 Planner 是 deterministic mock，主要用于离线测试和 mock benchmark；DeepSeek Planner 已经实测能输出合法 JSON 并通过 Pydantic schema。当前局限不是“没有真实 LLM”，而是 planner 还不会根据搜索中间结果动态改 plan，也没有单独的 planner 质量评测集。
-关联模块：`llm.py`
+回答：默认 Planner 是 deterministic mock，主要用于离线测试和 mock benchmark；DeepSeek Planner 已经实测能输出合法 JSON 并通过 Pydantic schema。现在已经有一个默认关闭的 reflection loop，能在证据不足启发式触发时追加 `R1` follow-up question，但它不是 LLM 语义级动态规划，还没有单独的 planner/reflection 质量评测集。
+关联模块：`llm.py`, `orchestrator.py`
 可追问：
 1. 如何防止 LLM planner 输出非法 JSON？
 2. planner 结果怎么评测？
 3. 是否需要 human-in-the-loop？
+
+## Q：reflection / compression loop 做到了什么？
+[状态: 待消化]
+标签：Planner / Reflection / Trace
+检索关键词：reflection loop, compression, follow-up question
+回答：我在 `orchestrator.py` 里加了默认关闭的 bounded reflection loop。开启后，researcher 先跑初始 plan，系统把中间 findings 压缩成 `compression.round1` trace，然后根据 fallback 和 source coverage 判断是否追加 `R1` follow-up question。这个 loop 在 `/research` 和 run control `/runs` approve 路径都复用同一个 helper。它现在是启发式，不是 LLM judge，价值是先把“发现证据不足 -> 压缩 -> 追加问题 -> 再研究”的控制流打通。
+关联模块：`orchestrator.py`, `run_control.py`, `tests/test_reflection_loop.py`
+可追问：
+1. 为什么默认关闭？
+2. 会不会无限循环？
+3. 怎么证明它提升质量？
 
 ## Q：Planner 和普通 RAG 的 query rewrite 有什么区别？
 [状态: 待消化]

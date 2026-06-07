@@ -51,6 +51,9 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
 
     settings = load_settings()
     effective_llm_model = _effective_llm_model(args, settings)
+    reflection_enabled = getattr(args, "reflection_enabled", False)
+    max_reflection_rounds = getattr(args, "max_reflection_rounds", 1)
+    reflection_min_sources = getattr(args, "reflection_min_sources", 4)
     effective_settings = replace(
         settings,
         llm_provider=args.llm_provider,
@@ -90,6 +93,9 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
         "request_timeout_seconds": effective_settings.request_timeout_seconds,
         "web_crawler_provider": effective_settings.web_crawler_provider,
         "crawler_max_chars": effective_settings.crawler_max_chars,
+        "reflection_enabled": reflection_enabled,
+        "max_reflection_rounds": max_reflection_rounds,
+        "reflection_min_sources": reflection_min_sources,
         "judge_provider": args.judge_provider,
         "official_judge_score": "not_run",
         "settings": {
@@ -196,6 +202,9 @@ async def _run_case(
         llm_model=llm_model,
         search_provider=settings.search_provider,
         seed=args.seed,
+        reflection_enabled=getattr(args, "reflection_enabled", False),
+        max_reflection_rounds=getattr(args, "max_reflection_rounds", 1),
+        reflection_min_sources=getattr(args, "reflection_min_sources", 4),
     )
     try:
         report = await DeepResearchOrchestrator(settings=settings).run(request)
@@ -432,6 +441,9 @@ def main() -> None:
     parser.add_argument("--max-researchers", type=int, default=2)
     parser.add_argument("--max-results", type=int, default=3)
     parser.add_argument("--request-timeout-seconds", type=float, default=8.0)
+    parser.add_argument("--reflection-enabled", action="store_true")
+    parser.add_argument("--max-reflection-rounds", type=int, default=1)
+    parser.add_argument("--reflection-min-sources", type=int, default=4)
     parser.add_argument("--searxng-base-url", default=None)
     parser.add_argument("--web-crawler-provider", choices=["none", "jina", "jina_reader"], default=None)
     parser.add_argument("--jina-reader-base-url", default=None)

@@ -31,6 +31,14 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8000/research `
 curl.exe -N -X POST http://127.0.0.1:8000/research/stream -H "Content-Type: application/json" -d "{\"query\":\"How should agent tools fail safely?\"}"
 ```
 
+启用一次 bounded reflection loop：
+
+```powershell
+py -3.11 -m deepresearch_agent.cli "How should citation grounding work in a research agent?" --search-provider mock --llm-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --reflection-enabled --max-reflection-rounds 1 --reflection-min-sources 4
+```
+
+默认不开启 reflection；开启后系统会先压缩已有 findings，再按启发式判断是否追加 1 个 follow-up subquestion，相关 `compression.roundN` 和 `reflection.roundN` 会进入 trace。
+
 创建可审核的长任务 run，并在 planner 后 approve 继续：
 
 ```powershell

@@ -42,6 +42,27 @@ def test_approve_continues_to_succeeded(tmp_path, monkeypatch) -> None:
     assert store.require_run(run_id).result_json is not None
 
 
+def test_approve_run_can_execute_reflection_loop(tmp_path, monkeypatch) -> None:
+    client, store = _client(tmp_path, monkeypatch)
+    body = _run_body("How should reflection extend weak evidence?")
+    body.update(
+        {
+            "reflection_enabled": True,
+            "max_reflection_rounds": 1,
+            "reflection_min_sources": 4,
+        }
+    )
+    run_id = client.post("/runs", json=body).json()["run_id"]
+
+    response = client.post(f"/runs/{run_id}/approve")
+
+    assert response.status_code == 200
+    result = store.require_run(run_id).result_json
+    assert result is not None
+    assert any(item["id"] == "R1" for item in result["plan"])
+    assert any(event["stage"] == "reflection.round1" for event in result["trace_events"])
+
+
 def test_edit_plan_saves_subquestions_and_continues(tmp_path, monkeypatch) -> None:
     client, store = _client(tmp_path, monkeypatch)
     run_id = client.post("/runs", json=_run_body("How should plan editing work?")).json()["run_id"]

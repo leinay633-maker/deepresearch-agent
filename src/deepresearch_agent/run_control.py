@@ -369,6 +369,15 @@ class RunController:
                 for subquestion in plan
             ]
         )
+        research_results = await orchestrator._run_reflection_rounds(
+            plan=plan,
+            research_results=list(research_results),
+            request=request,
+            search_service=search_service,
+            semaphore=semaphore,
+            trace=trace,
+            emit=None,
+        )
         raw_search_count = sum(len(outcome.sources) for _, outcome in research_results)
         fallback_count = sum(1 for _, outcome in research_results if outcome.fallback_used)
         preliminary_findings = [finding for finding, _ in research_results]

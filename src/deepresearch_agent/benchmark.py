@@ -30,6 +30,9 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
     settings = load_settings()
     effective_llm_model = _effective_llm_model(args, settings)
+    reflection_enabled = getattr(args, "reflection_enabled", False)
+    max_reflection_rounds = getattr(args, "max_reflection_rounds", 1)
+    reflection_min_sources = getattr(args, "reflection_min_sources", 4)
     effective_settings = replace(
         settings,
         llm_provider=args.llm_provider,
@@ -82,6 +85,9 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "max_results": args.max_results,
         "request_timeout_seconds": effective_settings.request_timeout_seconds,
         "settings": settings_snapshot,
+        "reflection_enabled": reflection_enabled,
+        "max_reflection_rounds": max_reflection_rounds,
+        "reflection_min_sources": reflection_min_sources,
     }
 
     with raw_path.open("w", encoding="utf-8") as file:
@@ -95,6 +101,9 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 llm_model=effective_llm_model,
                 search_provider=effective_settings.search_provider,
                 seed=args.seed,
+                reflection_enabled=reflection_enabled,
+                max_reflection_rounds=max_reflection_rounds,
+                reflection_min_sources=reflection_min_sources,
             )
             report = await DeepResearchOrchestrator(settings=effective_settings).run(request)
             record = {
@@ -243,6 +252,9 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260606)
     parser.add_argument("--max-researchers", type=int, default=3)
     parser.add_argument("--max-results", type=int, default=4)
+    parser.add_argument("--reflection-enabled", action="store_true")
+    parser.add_argument("--max-reflection-rounds", type=int, default=1)
+    parser.add_argument("--reflection-min-sources", type=int, default=4)
     args = parser.parse_args()
     summary = asyncio.run(run_benchmark(args))
     print(json.dumps(summary, ensure_ascii=False, indent=2))
