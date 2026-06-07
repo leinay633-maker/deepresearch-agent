@@ -59,7 +59,7 @@
 [状态: 待消化]
 标签：LLM Provider / 选型
 检索关键词：DeepSeek, JSON mode, provider decision
-回答：我需要一个真实 provider 来验证 structured output、usage 解析和成本归因，但又不能让默认运行依赖 API key。DeepSeek 的 API 兼容 OpenAI Chat Completions，支持 JSON Output，足够验证 brief、planner、synthesis 这些结构化输出；默认仍保留 mock，只有显式传 `--llm-provider deepseek` 才走真实模型。现在默认真实模型已切到显式 `deepseek-v4-flash`，legacy alias 只为兼容旧配置保留。
+回答：我需要一个真实 provider 来验证 structured output、usage 解析和成本归因，但又不能让默认运行依赖 API key。DeepSeek 的 API 兼容 OpenAI Chat Completions，支持 JSON Output，足够验证 brief、planner、synthesis 这些结构化输出；默认仍保留 mock，只有显式传 `--llm-provider deepseek` 才走真实模型。现在默认真实模型已切到显式 `deepseek-v4-flash`，legacy alias 只为兼容旧配置保留。后面我又补了 `openai-compatible` 通用 adapter，但它目前只做了 stub 单测，还没有 live benchmark。
 关联模块：`llm.py`, `config.py`, `KNOWLEDGE_BASE.md`
 可追问：
 1. 为什么不用 OpenAI？
@@ -70,12 +70,23 @@
 [状态: 待消化]
 标签：LLM Provider / 多模型策略
 检索关键词：stage model, planner model, synthesis model
-回答：现在不是完整 model zoo，但已经把阶段模型路由打通了。`ResearchRequest` 支持 `brief_model`、`planner_model`、`synthesis_model`，环境变量也有 `LLM_BRIEF_MODEL`、`LLM_PLANNER_MODEL`、`LLM_SYNTHESIS_MODEL`。DeepSeek provider 发请求时会按 stage 写不同 `model`，`CostTracker` 每条记录也会保留实际 stage model。默认不配时仍回落到 `llm_model` / `DEEPSEEK_MODEL`，所以旧运行不受影响。
+回答：现在不是完整 model zoo，但已经把阶段模型路由和一个通用兼容 adapter 打通了。`ResearchRequest` 支持 `brief_model`、`planner_model`、`synthesis_model`，环境变量也有 `LLM_BRIEF_MODEL`、`LLM_PLANNER_MODEL`、`LLM_SYNTHESIS_MODEL`。DeepSeek provider 和 `OpenAICompatibleLLMProvider` 都会按 stage 写不同 `model`，`CostTracker` 每条记录也会保留实际 stage model。默认不配时仍回落到 `llm_model` / `DEEPSEEK_MODEL` 或 `OPENAI_COMPATIBLE_MODEL`，所以旧运行不受影响。
 关联模块：`schemas.py`, `orchestrator.py`, `llm.py`, `cost.py`
 可追问：
-1. 为什么不直接接 OpenAI/Anthropic？
+1. 为什么不直接接 OpenAI/Anthropic 原生 SDK？
 2. 阶段模型怎么影响成本归因？
 3. 什么时候需要动态模型选择？
+
+## Q：OpenAI-compatible provider 做到了什么？
+[状态: 待消化]
+标签：LLM Provider / 多模型
+检索关键词：OpenAI-compatible, Ollama, OpenRouter
+回答：我新增了 `OpenAICompatibleLLMProvider`，用于接本地 Ollama、OpenRouter 或其他兼容 Chat Completions 的网关。它复用 DeepResearch 的 JSON mode prompt 和 Pydantic schema validation，配置来自 `OPENAI_COMPATIBLE_BASE_URL`、`OPENAI_COMPATIBLE_MODEL`、`OPENAI_COMPATIBLE_API_KEY_ENV`、`OPENAI_COMPATIBLE_API_KEY_REQUIRED` 和显式成本单价。默认不启用，也不需要 key；如果接本地无 key endpoint，可以把 key required 保持 false。当前只做了 stub 单测，验证 stage model、usage 和成本记录，没有 live benchmark。
+关联模块：`llm.py`, `orchestrator.py`, `config.py`, `tests/test_stage_models.py`
+可追问：
+1. 和 DeepSeek provider 复用了什么？
+2. 为什么不默认启用？
+3. OpenAI-compatible endpoint 不支持 JSON mode 怎么办？
 
 # Planner 模块
 

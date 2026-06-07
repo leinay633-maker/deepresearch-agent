@@ -25,6 +25,12 @@ class Settings:
     otel_service_name: str = "deepresearch-agent"
     run_store_path: str = "data/runs.sqlite"
     deepseek_model: str = "deepseek-v4-flash"
+    openai_compatible_model: str = "llama3.1"
+    openai_compatible_base_url: str = "http://localhost:11434/v1"
+    openai_compatible_api_key_env: str = "OPENAI_COMPATIBLE_API_KEY"
+    openai_compatible_api_key_required: bool = False
+    openai_compatible_input_cost_per_1m_tokens: float = 0.0
+    openai_compatible_output_cost_per_1m_tokens: float = 0.0
     llm_brief_model: str = ""
     llm_planner_model: str = ""
     llm_synthesis_model: str = ""
@@ -117,6 +123,26 @@ def load_settings() -> Settings:
         deepseek_model=(
             os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip()
             or "deepseek-v4-flash"
+        ),
+        openai_compatible_model=(
+            os.getenv("OPENAI_COMPATIBLE_MODEL", "llama3.1").strip() or "llama3.1"
+        ),
+        openai_compatible_base_url=(
+            os.getenv("OPENAI_COMPATIBLE_BASE_URL", "http://localhost:11434/v1").strip()
+            or "http://localhost:11434/v1"
+        ),
+        openai_compatible_api_key_env=(
+            os.getenv("OPENAI_COMPATIBLE_API_KEY_ENV", "OPENAI_COMPATIBLE_API_KEY").strip()
+            or "OPENAI_COMPATIBLE_API_KEY"
+        ),
+        openai_compatible_api_key_required=_bool_env(
+            "OPENAI_COMPATIBLE_API_KEY_REQUIRED", False
+        ),
+        openai_compatible_input_cost_per_1m_tokens=_float_env(
+            "OPENAI_COMPATIBLE_INPUT_COST_PER_1M_TOKENS", 0.0
+        ),
+        openai_compatible_output_cost_per_1m_tokens=_float_env(
+            "OPENAI_COMPATIBLE_OUTPUT_COST_PER_1M_TOKENS", 0.0
         ),
         llm_brief_model=os.getenv("LLM_BRIEF_MODEL", "").strip(),
         llm_planner_model=os.getenv("LLM_PLANNER_MODEL", "").strip(),

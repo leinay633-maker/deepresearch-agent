@@ -11,7 +11,12 @@ from deepresearch_agent.citation_judge import build_citation_judge_provider
 from deepresearch_agent.config import Settings, load_settings
 from deepresearch_agent.cost import CostTracker
 from deepresearch_agent.dedup import SourceDeduplicator
-from deepresearch_agent.llm import DeepSeekLLMProvider, MockLLMProvider, summarize_sources
+from deepresearch_agent.llm import (
+    DeepSeekLLMProvider,
+    MockLLMProvider,
+    OpenAICompatibleLLMProvider,
+    summarize_sources,
+)
 from deepresearch_agent.rag import LocalRagRetriever
 from deepresearch_agent.schemas import (
     Finding,
@@ -176,11 +181,26 @@ class DeepResearchOrchestrator:
 
     def _build_llm_provider(self, request: ResearchRequest):
         provider = (request.llm_provider or self.settings.llm_provider).strip().lower()
+        provider = provider.replace("_", "-")
         stage_models = self._stage_models(request)
         if provider == "deepseek":
             return DeepSeekLLMProvider(
                 model=request.llm_model or self.settings.deepseek_model,
                 stage_models=stage_models,
+            )
+        if provider == "openai-compatible":
+            return OpenAICompatibleLLMProvider(
+                model=request.llm_model or self.settings.openai_compatible_model,
+                base_url=self.settings.openai_compatible_base_url,
+                api_key_env=self.settings.openai_compatible_api_key_env,
+                api_key_required=self.settings.openai_compatible_api_key_required,
+                stage_models=stage_models,
+                input_cost_per_1m_tokens=(
+                    self.settings.openai_compatible_input_cost_per_1m_tokens
+                ),
+                output_cost_per_1m_tokens=(
+                    self.settings.openai_compatible_output_cost_per_1m_tokens
+                ),
             )
         return MockLLMProvider(
             request.llm_model or self.settings.mock_model_name,

@@ -86,7 +86,11 @@ def main() -> None:
         choices=["mock", "wikipedia", "searxng", "jina", "brave", "tavily", "mcp"],
         default=None,
     )
-    parser.add_argument("--llm-provider", choices=["mock", "deepseek"], default=None)
+    parser.add_argument(
+        "--llm-provider",
+        choices=["mock", "deepseek", "openai-compatible", "openai_compatible"],
+        default=None,
+    )
     parser.add_argument("--llm-model", default=None)
     parser.add_argument("--brief-model", default=None)
     parser.add_argument("--planner-model", default=None)

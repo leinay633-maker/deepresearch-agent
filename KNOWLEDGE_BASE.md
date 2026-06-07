@@ -1,12 +1,12 @@
 # 0 项目一句话介绍
 
-本项目是我从空仓库开始手写的一个收窄版 DeepResearch Agent，目标不是复刻大而全的 open_deep_research，而是把「问题澄清、research brief、并发 researcher、来源去重、带引用合成、citation check、trace 和 benchmark」这条主链路做干净，并补上可管理的 run control plane。它解决的是普通 RAG 一次性检索后直接回答时，难以解释检索路径、引用是否支撑论断、工具失败如何降级的问题。当前版本默认使用 mock LLM 和 mock search，保证无 API key 也能一条命令跑通；同时已经接入 DeepSeek 真实 LLM provider、阶段级模型覆盖、Wikipedia 真实检索 adapter、本地关键词 + 向量 + RRF 融合的 hybrid local retrieval、SQLite run_id / checkpoint / HITL / SSE replay 控制平面，以及 LiveDRBench 这类公开 Deep Research 任务的端到端 artifact 评测 runner。这个项目体现的 Agent 后端能力主要是多阶段编排、并发工具调用、失败兜底、混合检索、可观测性、成本归因、可复现评测和长任务状态管理。
+本项目是我从空仓库开始手写的一个收窄版 DeepResearch Agent，目标不是复刻大而全的 open_deep_research，而是把「问题澄清、research brief、并发 researcher、来源去重、带引用合成、citation check、trace 和 benchmark」这条主链路做干净，并补上可管理的 run control plane。它解决的是普通 RAG 一次性检索后直接回答时，难以解释检索路径、引用是否支撑论断、工具失败如何降级的问题。当前版本默认使用 mock LLM 和 mock search，保证无 API key 也能一条命令跑通；同时已经接入 DeepSeek 真实 LLM provider、OpenAI-compatible 通用 LLM adapter、阶段级模型覆盖、Wikipedia 真实检索 adapter、本地关键词 + 向量 + RRF 融合的 hybrid local retrieval、SQLite run_id / checkpoint / HITL / SSE replay 控制平面，以及 LiveDRBench 这类公开 Deep Research 任务的端到端 artifact 评测 runner。这个项目体现的 Agent 后端能力主要是多阶段编排、并发工具调用、失败兜底、混合检索、可观测性、成本归因、可复现评测和长任务状态管理。
 
 # 1 岗位匹配
 
 我做这个项目时刻意对齐 Agent 后端 / LLM 应用岗，而不是做一个只会调用 LLM 的 demo。JD 里常见的 LangGraph、RAG、MCP、并发、可观测性、评测这些关键词，在本项目里对应到清晰的工程模块：`orchestrator.py` 做轻量编排，`rag.py` 做本地 keyword/vector hybrid RAG，`embeddings.py` 和 `rerankers.py` 做可切换 provider，`search.py` 做工具 adapter、重试、超时、熔断和降级，`tracing.py` 和 `cost.py` 做观测和成本归因，`benchmark.py` 做可复现评测。
 
-我在第一阶段没有强行让默认路径依赖真实 LLM provider，因为没有 API key 时会阻塞陌生人 clone 运行。最终选择是默认保留 `MockLLMProvider` 做可复现测试和 mock plumbing benchmark；当环境变量 `DEEPSEEK_API_KEY` 存在时，可以显式启用 `DeepSeekLLMProvider` 跑真实 structured output、synthesis、token usage 和 cost。OpenAI/Anthropic 等其他 provider 仍作为 v2 扩展。
+我在第一阶段没有强行让默认路径依赖真实 LLM provider，因为没有 API key 时会阻塞陌生人 clone 运行。最终选择是默认保留 `MockLLMProvider` 做可复现测试和 mock plumbing benchmark；当环境变量 `DEEPSEEK_API_KEY` 存在时，可以显式启用 `DeepSeekLLMProvider` 跑真实 structured output、synthesis、token usage 和 cost；如果有本地或托管的 OpenAI-compatible endpoint，也可以显式启用 `OpenAICompatibleLLMProvider`。OpenAI/Anthropic 原生 SDK 仍作为 v2 扩展。
 
 # 2 总体架构
 
@@ -265,6 +265,15 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 代价：当前只支持纯文本/Markdown，不解析 PDF/DOCX/网页，不做增量 manifest、embedding cache、文档删除同步、权限隔离或版本化 reindex。大规模知识库仍需要 Qdrant/Milvus/RAGFlow 这类生产系统。
 面试怎么答：我会说我先把“私有文档如何进入本地 RAG”打通，而不是直接引入重基础设施。这样能演示索引生命周期的第一步，同时保留后续迁移到向量数据库的接口空间。
 
+## 决策 27：为什么先做 OpenAI-compatible adapter，而不是一次性接多家原生 SDK
+
+背景：本项目已有 DeepSeek provider 和阶段模型路由，但多模型策略仍偏单一。OpenRouter、Ollama、LM Studio 以及很多自建网关都暴露 OpenAI-compatible Chat Completions 接口；直接接每家原生 SDK 会引入大量 key、错误码和依赖差异。
+可选方案：继续只用 DeepSeek；直接接 OpenAI/Anthropic/OpenRouter/Ollama 全家桶；抽一个 OpenAI-compatible adapter；先只做文档计划不写代码。
+最终选择：新增 `OpenAICompatibleLLMProvider`，复用 DeepResearch 的 JSON mode prompt、stage model 路由和 usage/cost 记录逻辑；通过 `OPENAI_COMPATIBLE_BASE_URL`、`OPENAI_COMPATIBLE_MODEL`、`OPENAI_COMPATIBLE_API_KEY_ENV`、`OPENAI_COMPATIBLE_API_KEY_REQUIRED`、`OPENAI_COMPATIBLE_INPUT_COST_PER_1M_TOKENS`、`OPENAI_COMPATIBLE_OUTPUT_COST_PER_1M_TOKENS` 配置。默认 provider 仍是 mock。
+理由：这一步先把“兼容 Chat Completions 的模型网关”接入同一个 LLM provider contract，不新增默认 key 依赖，也不影响 DeepSeek 真实 benchmark。对本地 Ollama 这类无 key endpoint，`OPENAI_COMPATIBLE_API_KEY_REQUIRED=false` 可以直接尝试；对 OpenRouter 等托管网关，可以把 key 环境变量名显式配置出来。
+代价：当前只用 stub provider 测了请求模型路由和 usage 成本记录，没有 live 调 OpenRouter/Ollama/OpenAI-compatible endpoint；不同网关对 `response_format={"type":"json_object"}` 的支持不完全一致，真实质量和错误处理仍需分别验证。
+面试怎么答：我会说我没有把“多 provider”做成一堆硬编码分支，而是先抽了 OpenAI-compatible 这条公共接口；这能覆盖很多本地/托管模型，但我不会声称已经完成所有 provider 的真实评测。
+
 # 5 实现细节
 
 Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。`ResearchRequest.planner_model` 或 `LLM_PLANNER_MODEL` 可以覆盖 planning stage 的模型名。局限是 planner 还不会根据 researcher 中间结果做 LLM 语义级动态追加子问题。
@@ -272,6 +281,8 @@ Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出�
 DeepSeek Planner 验证：`src/deepresearch_agent/llm.py` 里新增了 `DeepSeekLLMProvider.plan`，第一步先独立验证结构化输出；验证脚本是 `src/deepresearch_agent/validate_deepseek_structured_output.py`，它从环境变量读取 `DEEPSEEK_API_KEY`，用 JSON mode 请求默认 `deepseek-v4-flash`，并用现有 `SubQuestion` Pydantic schema 解析输出。后续步骤再把同一个 provider 扩展到 `create_brief` 和 `synthesize`，避免一次性接太多导致错误边界不清。
 
 DeepSeek Synthesizer 接入：步骤 2 以后，`DeepSeekLLMProvider.create_brief`、`plan`、`synthesize` 都走 DeepSeek JSON mode。CLI 和 API 可以通过 `llm_provider="deepseek"` 或 CLI 参数 `--llm-provider deepseek` 显式启用；默认仍是 mock，保证离线测试不受 API key 影响。当前 synthesis 要求模型输出 `{"answer": "...", "claims": [...]}`，并要求每条 factual claim 使用输入 sources 中已有的 `[Sx]` citation ID。`brief_model`、`planner_model`、`synthesis_model` 会分别覆盖 DeepSeek 请求体中的 `model` 字段；不填时回落到 `llm_model` / `DEEPSEEK_MODEL`。
+
+OpenAI-compatible LLM Provider：`src/deepresearch_agent/llm.py` 的 `OpenAICompatibleLLMProvider` 复用 DeepSeek provider 的 brief/plan/synthesis JSON prompt 和 schema validation，但 `_post_chat_completions()` 改为读取通用 `base_url`、model 和可选 API key。`orchestrator.py` 里 `llm_provider="openai-compatible"` 或 `openai_compatible` 会构造它；`cli.py`、`benchmark.py`、`deep_research_eval.py` 的 provider choices 也已同步。成本记录不使用 DeepSeek 官方价格，而是用 `OPENAI_COMPATIBLE_INPUT_COST_PER_1M_TOKENS` / `OPENAI_COMPATIBLE_OUTPUT_COST_PER_1M_TOKENS` 这两个显式配置，默认 0。局限是尚未 live 测试任何真实 OpenAI-compatible endpoint。
 
 Researcher：`src/deepresearch_agent/orchestrator.py` 的 `_research_one`。输入是子问题，输出是 `Finding`。它调用 `SearchService` 和 `LocalRagRetriever`，再 dedup、verify、summary。`LocalRagRetriever` 内部已经从 keyword overlap 升级为可配置的 keyword / hybrid retrieval，但 orchestrator 仍只接收 `Source` 列表。局限是 summary 仍是模板化，不是自然语言 LLM 压缩。
 
@@ -513,7 +524,7 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
-测试验证：`py -3.11 -m pytest -q`，最新结果 `74 passed, 2 warnings in 144.23s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `76 passed, 2 warnings in 63.67s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -549,7 +560,7 @@ Persistent vector index smoke：`py -3.11 -m pytest tests/test_hybrid_retrieval.
 
 Document corpus ingest smoke：`py -3.11 -m pytest tests/test_ingest_corpus.py tests/test_hybrid_retrieval.py -q` 成功，`5 passed, 1 warning in 2.85s`。新增测试覆盖 Markdown YAML frontmatter 清理、H1 title 抽取、TXT 文件名 title、`.obsidian` 目录排除、空文档跳过、输出 JSONL 的 `id/title/url/content/metadata` 字段，以及生成的 corpus 能被 `LocalRagRetriever(local_retrieval_mode="keyword")` 直接检索。这里没有测试 PDF/DOCX、增量 reindex、权限过滤或大规模 corpus。
 
-Stage model routing smoke：`py -3.11 -m pytest tests/test_stage_models.py -q` 成功，`2 passed in 0.35s`。测试覆盖 mock orchestrator 在 `brief_model`、`planner_model`、`synthesis_model` 不同时，`CostRecord.model` 分别记录 `mock-brief`、`mock-planner`、`mock-synthesis`；同时用不联网的 `RecordingDeepSeekProvider` 验证 DeepSeek 请求体按 stage 发送 `deepseek-chat`、`deepseek-reasoner`、`deepseek-v4-flash`，且 cost records 记录同一模型序列。CLI smoke：`py -3.11 -m deepresearch_agent.cli "How should model routing work in a research agent?" --llm-provider mock --llm-model mock-default --brief-model mock-brief --planner-model mock-planner --synthesis-model mock-synthesis --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --json` 后抽取 `cost.records[].model`，输出 `['mock-brief', 'mock-planner', 'mock-synthesis']`。这只验证路由和记录，不代表这些模型组合已做真实质量/成本对比。
+Stage model / OpenAI-compatible provider smoke：`py -3.11 -m pytest tests/test_stage_models.py -q` 成功，`4 passed in 0.40s`。测试覆盖 mock orchestrator 在 `brief_model`、`planner_model`、`synthesis_model` 不同时，`CostRecord.model` 分别记录 `mock-brief`、`mock-planner`、`mock-synthesis`；用不联网的 `RecordingDeepSeekProvider` 验证 DeepSeek 请求体按 stage 发送 `deepseek-chat`、`deepseek-reasoner`、`deepseek-v4-flash`；用 `RecordingOpenAICompatibleProvider` 验证 OpenAI-compatible provider 按 stage 发送 `local-brief/local-planner/local-synthesis`，并按显式配置的 input/output 单价把 usage 记为 `$0.00042`；还覆盖 orchestrator 能从 `llm_provider="openai-compatible"` 构造通用 provider。CLI smoke：`py -3.11 -m deepresearch_agent.cli "How should model routing work in a research agent?" --llm-provider mock --llm-model mock-default --brief-model mock-brief --planner-model mock-planner --synthesis-model mock-synthesis --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --json` 后抽取 `cost.records[].model`，输出 `['mock-brief', 'mock-planner', 'mock-synthesis']`。这只验证路由和记录，不代表 OpenAI-compatible endpoint 已 live benchmark。
 
 Report exporter smoke：`py -3.11 -m pytest tests/test_report_exporter.py -q` 成功，`3 passed in 1.10s`。测试覆盖 Markdown/HTML/JSON/PDF/DOCX 五种文件写出、HTML answer 内容转义、PDF 文件头为 `%PDF`、DOCX 的 `word/document.xml` 包含报告内容和 evidence quote、未知格式报错。CLI smoke：`py -3.11 -m deepresearch_agent.cli "How should report export work?" --llm-provider mock --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --export-dir <temp> --export-formats markdown,html,json,pdf,docx` 成功，在临时目录生成 `d448115039a4.md/.html/.json/.pdf/.docx`。这只验证文本版报告 artifact 导出，不代表 PPT/TTS 或复杂办公排版已实现。
 
@@ -611,7 +622,7 @@ benchmark 汇总：管线 plumbing 指标，mock，非真实性能。具体 late
 
 这条公开真实 case 的 query 是让系统根据 `American Community Survey / FEMA Harvey flood depths / USDA Food Access Research Atlas / Streetlight / SafeGraph POI` 找使用全部数据集的论文，并按 JSON 返回 `paper_title`。真实组没有报错，也没有 fallback，但 success 为 0，说明当前 DeepSeek + Wikipedia + 本地 keyword RAG 没有解决这类公开精确查证任务；citation retention 只有 `0.5`，也说明 lexical citation check 已经暴露支撑不足。面试里我会把它讲成“公开评测入口已经打通，但质量短板被暴露出来”，不会把 mock 组的 `1.0` 当质量成果。
 
-未实测：LiveDRBench/Deep Research Bench 官方 judge 分数、真实搜索 API 高并发限流、Brave/Tavily live search benchmark、DeepSeek citation judge live benchmark、Redis/PostgreSQL 缓存、多进程 worker pool / 分布式队列、真实 OpenTelemetry collector / LangSmith tracing、真实用户流量、DashScope 真实 embedding/rerank、PDF/DOCX ingest、大规模私有语料增量 reindex、rerank 5 case 全量 benchmark。
+未实测：LiveDRBench/Deep Research Bench 官方 judge 分数、真实搜索 API 高并发限流、Brave/Tavily live search benchmark、OpenAI-compatible LLM live endpoint、DeepSeek citation judge live benchmark、Redis/PostgreSQL 缓存、多进程 worker pool / 分布式队列、真实 OpenTelemetry collector / LangSmith tracing、真实用户流量、DashScope 真实 embedding/rerank、PDF/DOCX ingest、大规模私有语料增量 reindex、rerank 5 case 全量 benchmark。
 
 # 8 评测设计
 
@@ -666,7 +677,7 @@ multi-hop / reflection 成功率：当前没有真实 multi-hop 标注集，未�
 
 # 10 局限与优化空间
 
-真实 LLM provider 覆盖还窄：当前只接了 DeepSeek v4-flash 及其兼容 alias，并支持 brief/planner/synthesis 的阶段模型覆盖，但一个 provider 不能代表所有模型/价格/限流行为。可行方案是继续实现 OpenAI/Anthropic/OpenRouter/Ollama 等 provider，并统一 structured output、usage 解析、重试、模型定价表、动态降级和测试替身。工程代价是 API key、价格、限流、错误码差异和 CI mock。面试怎么讲：我会说我已经把真实 provider 接入路径和阶段模型路由打通，但不会把单 provider 小样本夸成通用生产能力。
+真实 LLM provider 覆盖仍需 live 验证：当前接了 DeepSeek v4-flash 及其兼容 alias，也新增了 OpenAI-compatible adapter，并支持 brief/planner/synthesis 的阶段模型覆盖；但真实端到端 benchmark 主要仍是 DeepSeek，OpenAI-compatible endpoint 没有 live 跑。可行方案是继续验证本地 Ollama/OpenRouter/OpenAI-compatible 网关，再实现 OpenAI/Anthropic 原生 provider，并统一 structured output、usage 解析、重试、模型定价表、动态降级和测试替身。工程代价是 API key、价格、限流、错误码差异和 CI mock。面试怎么讲：我会说我已经把真实 provider 接入路径、通用兼容 adapter 和阶段模型路由打通，但不会把 stub 单测夸成通用生产能力。
 
 Citation checker 语义能力仍需实测：当前已经有可选 heuristic / DeepSeek citation judge provider，但默认 benchmark 仍是 lexical overlap，DeepSeek judge 没有 live 跑完整评测。可行方案是用公开/人工标注 claim-evidence 集测 judge agreement，再接 NLI 模型或 sentence embedding entailment。工程代价是成本、延迟、标注和 judge 可靠性评估。面试怎么讲：我会说现在是“lexical baseline + optional judge 接口”，不是最终事实评审。
 

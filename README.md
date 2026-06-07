@@ -2,7 +2,7 @@
 
 一个故意收窄的 DeepResearch Agent：从用户问题出发，生成 research brief，拆分子问题，并发检索，去重和来源质量过滤后，合成带引用的结构化报告，并对引用做 faithfulness 检查。
 
-默认运行不需要 API key。默认 LLM 和 search 都走 `mock`，用于稳定演示、测试和 mock plumbing benchmark；local retrieval 默认使用本地 BGE embedding 做 keyword + vector hybrid，不需要 API key。也可以显式切到 DeepSeek 真实 LLM provider、Wikipedia 真实无 key search adapter、Brave/Tavily/Jina 搜索 adapter，以及 DashScope embedding/rerank provider。所有 key 只从环境变量读取：DeepSeek 用 `DEEPSEEK_API_KEY`，DashScope 用 `DASHSCOPE_API_KEY`，Brave 用 `BRAVE_SEARCH_API_KEY`，Tavily 用 `TAVILY_API_KEY`，Jina 用 `JINA_API_KEY`。
+默认运行不需要 API key。默认 LLM 和 search 都走 `mock`，用于稳定演示、测试和 mock plumbing benchmark；local retrieval 默认使用本地 BGE embedding 做 keyword + vector hybrid，不需要 API key。也可以显式切到 DeepSeek 真实 LLM provider、OpenAI-compatible LLM adapter、Wikipedia 真实无 key search adapter、Brave/Tavily/Jina 搜索 adapter，以及 DashScope embedding/rerank provider。所有 key 只从环境变量读取：DeepSeek 用 `DEEPSEEK_API_KEY`，OpenAI-compatible adapter 默认读 `OPENAI_COMPATIBLE_API_KEY`（可配置为非必需，方便接本地 Ollama 兼容端点），DashScope 用 `DASHSCOPE_API_KEY`，Brave 用 `BRAVE_SEARCH_API_KEY`，Tavily 用 `TAVILY_API_KEY`，Jina 用 `JINA_API_KEY`。
 
 ## Quickstart
 
@@ -186,6 +186,7 @@ LLM providers：
 
 - `mock`：默认 LLM provider，离线可复现，用于测试和 mock plumbing benchmark。
 - `deepseek`：真实 OpenAI-compatible LLM provider，默认模型 `deepseek-v4-flash`，使用 DeepSeek JSON mode 生成 brief、plan 和 cited synthesis；需要 `DEEPSEEK_API_KEY`，可用 `DEEPSEEK_MODEL` 覆盖默认模型，也可用 `LLM_BRIEF_MODEL` / `LLM_PLANNER_MODEL` / `LLM_SYNTHESIS_MODEL` 做阶段模型覆盖。
+- `openai-compatible`：通用 OpenAI-compatible Chat Completions adapter，默认 base URL `http://localhost:11434/v1`、默认模型 `llama3.1`，适合接本地 Ollama 或 OpenRouter 等兼容端点。配置项：`OPENAI_COMPATIBLE_BASE_URL`、`OPENAI_COMPATIBLE_MODEL`、`OPENAI_COMPATIBLE_API_KEY_ENV`、`OPENAI_COMPATIBLE_API_KEY_REQUIRED`、`OPENAI_COMPATIBLE_INPUT_COST_PER_1M_TOKENS`、`OPENAI_COMPATIBLE_OUTPUT_COST_PER_1M_TOKENS`。当前只做了 stub 单测，未做 live benchmark。
 
 Search providers：
 

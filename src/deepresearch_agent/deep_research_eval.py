@@ -51,13 +51,14 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
 
     settings = load_settings()
     effective_llm_model = _effective_llm_model(args, settings)
+    effective_llm_provider = _normalize_llm_provider(args.llm_provider)
     stage_models = _effective_stage_models(args, settings)
     reflection_enabled = getattr(args, "reflection_enabled", False)
     max_reflection_rounds = getattr(args, "max_reflection_rounds", 1)
     reflection_min_sources = getattr(args, "reflection_min_sources", 4)
     effective_settings = replace(
         settings,
-        llm_provider=args.llm_provider,
+        llm_provider=effective_llm_provider,
         search_provider=args.search_provider,
         max_researchers=args.max_researchers,
         request_timeout_seconds=args.request_timeout_seconds,
@@ -72,8 +73,11 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
         or settings.jina_search_base_url,
         crawler_max_chars=getattr(args, "crawler_max_chars", None) or settings.crawler_max_chars,
         deepseek_model=effective_llm_model
-        if args.llm_provider == "deepseek"
+        if effective_llm_provider == "deepseek"
         else settings.deepseek_model,
+        openai_compatible_model=effective_llm_model
+        if effective_llm_provider == "openai-compatible"
+        else settings.openai_compatible_model,
         llm_brief_model=stage_models["brief_generation"] or settings.llm_brief_model,
         llm_planner_model=stage_models["planning"] or settings.llm_planner_model,
         llm_synthesis_model=stage_models["synthesis"] or settings.llm_synthesis_model,
@@ -420,9 +424,16 @@ def _summarize(
 def _effective_llm_model(args: argparse.Namespace, settings: Any) -> str:
     if args.llm_model:
         return args.llm_model
-    if args.llm_provider == "deepseek":
+    provider = _normalize_llm_provider(args.llm_provider)
+    if provider == "deepseek":
         return settings.deepseek_model
+    if provider == "openai-compatible":
+        return settings.openai_compatible_model
     return settings.mock_model_name
+
+
+def _normalize_llm_provider(value: str) -> str:
+    return value.strip().lower().replace("_", "-")
 
 
 def _effective_stage_models(args: argparse.Namespace, settings: Any) -> dict[str, str]:
@@ -470,7 +481,11 @@ def main() -> None:
         choices=["mock", "wikipedia", "searxng", "jina", "brave", "tavily", "mcp"],
         default="mock",
     )
-    parser.add_argument("--llm-provider", choices=["mock", "deepseek"], default="mock")
+    parser.add_argument(
+        "--llm-provider",
+        choices=["mock", "deepseek", "openai-compatible", "openai_compatible"],
+        default="mock",
+    )
     parser.add_argument("--llm-model", default=None)
     parser.add_argument("--brief-model", default=None)
     parser.add_argument("--planner-model", default=None)

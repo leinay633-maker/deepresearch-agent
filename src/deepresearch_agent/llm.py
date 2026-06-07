@@ -171,6 +171,7 @@ class MockLLMProvider:
 
 class DeepSeekLLMProvider:
     name = "deepseek"
+    provider_label = "DeepSeek"
     supports_structured_output = True
     supports_tool_calling = True
 
@@ -373,7 +374,7 @@ class DeepSeekLLMProvider:
                 )
                 content = _extract_content(payload)
                 if not content.strip():
-                    raise ValueError("DeepSeek returned empty content")
+                    raise ValueError(f"{self.provider_label} returned empty content")
                 return LLMJsonResult(
                     parsed=_parse_json_object(content),
                     content=content,
@@ -385,7 +386,9 @@ class DeepSeekLLMProvider:
                 if attempt >= self.max_retries:
                     break
                 time.sleep(0.8 * (attempt + 1))
-        raise RuntimeError(f"DeepSeek {stage} JSON validation failed: {last_error}") from last_error
+        raise RuntimeError(
+            f"{self.provider_label} {stage} JSON validation failed: {last_error}"
+        ) from last_error
 
     def _post_chat_completions(
         self,
@@ -419,9 +422,11 @@ class DeepSeekLLMProvider:
                 payload = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"DeepSeek HTTP {exc.code}: {_redact(error_body)}") from exc
+            raise RuntimeError(
+                f"{self.provider_label} HTTP {exc.code}: {_redact(error_body)}"
+            ) from exc
         except URLError as exc:
-            raise RuntimeError(f"DeepSeek request failed: {exc.reason}") from exc
+            raise RuntimeError(f"{self.provider_label} request failed: {exc.reason}") from exc
 
         _extract_content(payload)
         return payload
@@ -434,6 +439,94 @@ class DeepSeekLLMProvider:
     ):
         input_tokens, output_tokens, estimated_cost = deepseek_usage_cost_usd(
             result.model, result.usage
+        )
+        return cost.add_usage(
+            stage=stage,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            estimated_cost_usd=estimated_cost,
+            model=result.model,
+        )
+
+
+class OpenAICompatibleLLMProvider(DeepSeekLLMProvider):
+    name = "openai_compatible"
+    provider_label = "OpenAI-compatible"
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str,
+        api_key_env: str = "OPENAI_COMPATIBLE_API_KEY",
+        api_key_required: bool = False,
+        timeout_seconds: float = 60.0,
+        max_retries: int = 2,
+        stage_models: dict[str, str] | None = None,
+        input_cost_per_1m_tokens: float = 0.0,
+        output_cost_per_1m_tokens: float = 0.0,
+    ) -> None:
+        super().__init__(
+            model=model,
+            base_url=base_url,
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+            stage_models=stage_models,
+        )
+        self.api_key_env = api_key_env
+        self.api_key_required = api_key_required
+        self.input_cost_per_1m_tokens = input_cost_per_1m_tokens
+        self.output_cost_per_1m_tokens = output_cost_per_1m_tokens
+
+    def _post_chat_completions(
+        self,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+        model: str,
+    ) -> dict:
+        api_key = os.environ.get(self.api_key_env)
+        if self.api_key_required and not api_key:
+            raise RuntimeError(f"{self.api_key_env} environment variable is required")
+        body = json.dumps(
+            {
+                "model": model,
+                "messages": messages,
+                "response_format": {"type": "json_object"},
+                "temperature": 0.2,
+                "max_tokens": max_tokens,
+            }
+        ).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        request = Request(
+            f"{self.base_url}/chat/completions",
+            data=body,
+            method="POST",
+            headers=headers,
+        )
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"{self.provider_label} HTTP {exc.code}: {_redact(error_body)}"
+            ) from exc
+        except URLError as exc:
+            raise RuntimeError(f"{self.provider_label} request failed: {exc.reason}") from exc
+
+        _extract_content(payload)
+        return payload
+
+    def _add_usage_cost(
+        self, cost: CostTracker, stage: str, result: LLMJsonResult
+    ):
+        input_tokens = int(result.usage.get("prompt_tokens") or 0)
+        output_tokens = int(result.usage.get("completion_tokens") or 0)
+        estimated_cost = round(
+            input_tokens * self.input_cost_per_1m_tokens / 1_000_000
+            + output_tokens * self.output_cost_per_1m_tokens / 1_000_000,
+            8,
         )
         return cost.add_usage(
             stage=stage,
