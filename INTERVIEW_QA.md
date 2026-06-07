@@ -191,6 +191,17 @@
 2. RRF 的参数怎么选？
 3. 下一步怎么证明相关性真的提升？
 
+## Q：为什么还要做 BEIR/scifact 独立检索评测？
+[状态: 待消化]
+标签：RAG / 评测 / BEIR
+检索关键词：BEIR, scifact, Recall@10, nDCG@10, MRR
+回答：5 case 端到端 benchmark 会混在一起考 planner、Wikipedia、synthesis、citation checker 和网络波动，所以它不能单独证明 retriever 变好了。BEIR/scifact 是公开检索 benchmark，我只加载 corpus/query/qrels，复用 `LocalRagRetriever` 跑 keyword、hybrid、hybrid+rerank，不调用 LLM 和 Wikipedia。真实结果是 keyword Recall@10 `0.6000`、nDCG@10 `0.4823`、MRR `0.4548`；hybrid 到 `0.8206`、`0.6576`、`0.6098`；hybrid+rerank 到 `0.8239`、`0.7307`、`0.7083`。我的解读是 hybrid 明显补召回，rerank 主要改善排序，但平均延迟从 `0.3318s` 到 `3.4022s`，不能默认开启。
+关联模块：`retrieval_eval.py`, `rag.py`, `rerankers.py`, `results/retrieval_eval_scifact.json`
+可追问：
+1. SciFact 和中文知识库场景有什么差异？
+2. 为什么不用完整 BEIR 框架？
+3. rerank 为什么 Recall 提升不大但 nDCG 提升明显？
+
 ## Q：reranker 在项目里怎么接？
 [状态: 待消化]
 标签：RAG / Rerank
@@ -423,8 +434,8 @@
 [状态: 待消化]
 标签：Benchmark / 评测
 检索关键词：benchmark, latency, token, citation
-回答：`benchmark.py` 记录 seed、配置快照、case_id、query、latency_ms、total_tokens、estimated_cost_usd、deduped_source_count、raw_search_result_count、citation_retention_rate、success、fallback_count 和 output_summary。现在有三类口径：mock plumbing run 只证明离线路径；DeepSeek + Wikipedia + keyword baseline 是当前检索基线，5 条全成功、fallback 1、p50 24595.506ms；DeepSeek + Wikipedia + local hybrid 是混合检索小样本，5 条成功 3 条、fallback 2、p50 30747.284ms。对比结果在 `results/retrieval_benchmark_comparison.json`，我不会只挑好看的数字说。
-关联模块：`benchmark.py`, `results/benchmark_summary.json`, `results/retrieval_benchmark_comparison.json`
+回答：`benchmark.py` 记录 seed、配置快照、case_id、query、latency_ms、total_tokens、estimated_cost_usd、deduped_source_count、raw_search_result_count、citation_retention_rate、success、fallback_count 和 output_summary。现在有四类口径：mock plumbing run 只证明离线路径；DeepSeek + Wikipedia + keyword baseline 是端到端检索基线；DeepSeek + Wikipedia + local hybrid 是混合检索小样本；BEIR/scifact 是独立检索模块评测，只看 Recall@10、nDCG@10、MRR，不调用 LLM。对比结果分别在 `results/retrieval_benchmark_comparison.json` 和 `results/retrieval_eval_scifact.json`，我不会只挑好看的数字说。
+关联模块：`benchmark.py`, `retrieval_eval.py`, `results/benchmark_summary.json`, `results/retrieval_benchmark_comparison.json`, `results/retrieval_eval_scifact.json`
 可追问：
 1. 为什么只 5 条 case？
 2. success 怎么定义？
