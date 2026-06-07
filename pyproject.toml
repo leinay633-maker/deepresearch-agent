@@ -27,6 +27,7 @@ dev = [
 deepresearch = "deepresearch_agent.cli:main"
 deepresearch-api = "deepresearch_agent.api:main"
 deepresearch-benchmark = "deepresearch_agent.benchmark:main"
+deepresearch-ingest-corpus = "deepresearch_agent.ingest_corpus:main"
 deepresearch-public-eval = "deepresearch_agent.deep_research_eval:main"
 deepresearch-retrieval-eval = "deepresearch_agent.retrieval_eval:main"
 deepresearch-worker = "deepresearch_agent.run_worker:main"

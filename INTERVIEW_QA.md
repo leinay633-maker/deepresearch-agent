@@ -217,8 +217,8 @@
 [状态: 待消化]
 标签：RAG / Retriever
 检索关键词：LocalRagRetriever, local_corpus, hybrid retrieval
-回答：当前 RAG 是 `LocalRagRetriever`，读取 `data/local_corpus.jsonl` 后先分块。它支持两种模式：`keyword` 是旧基线，用 token overlap 排序；`hybrid` 是默认模式，用关键词召回和 BGE 向量召回两路并存，再用 RRF 融合。向量侧用 `sentence-transformers` 的 `BAAI/bge-small-zh-v1.5` 生成 embedding，用 Chroma 建本地 index；如果设置 `LOCAL_VECTOR_INDEX_PERSIST=true`，会按 corpus 和 embedding 模型指纹复用本地 Chroma collection。无论哪种模式，最后都返回统一的 `Source`，所以下游 dedup、verifier、synthesizer 不需要改。
-关联模块：`rag.py`, `embeddings.py`, `data/local_corpus.jsonl`
+回答：当前 RAG 是 `LocalRagRetriever`，读取 `data/local_corpus.jsonl` 后先分块。语料既可以手写 JSONL，也可以用 `ingest_corpus.py` 从 Markdown/TXT 文件夹生成。检索支持两种模式：`keyword` 是旧基线，用 token overlap 排序；`hybrid` 是默认模式，用关键词召回和 BGE 向量召回两路并存，再用 RRF 融合。向量侧用 `sentence-transformers` 的 `BAAI/bge-small-zh-v1.5` 生成 embedding，用 Chroma 建本地 index；如果设置 `LOCAL_VECTOR_INDEX_PERSIST=true`，会按 corpus 和 embedding 模型指纹复用本地 Chroma collection。无论哪种模式，最后都返回统一的 `Source`，所以下游 dedup、verifier、synthesizer 不需要改。
+关联模块：`rag.py`, `ingest_corpus.py`, `embeddings.py`, `data/local_corpus.jsonl`
 可追问：
 1. 为什么不用向量替换关键词？
 2. embedding 成本和延迟怎么控制？
@@ -228,12 +228,23 @@
 [状态: 待消化]
 标签：RAG / 向量库
 检索关键词：persistent vector index, Chroma, Qdrant, Milvus
-回答：这个项目的默认要求是无外部服务也能跑通，所以我先把 Chroma 从每次临时建 index 升级成可选持久化：`LOCAL_VECTOR_INDEX_PERSIST=true` 时写到 `LOCAL_VECTOR_INDEX_PATH`，collection 名由 corpus chunk、embedding provider 和 model 指纹决定，第二次 retriever 可以直接复用，不重新 embed corpus。Qdrant/Milvus 更接近生产，但会引入服务部署、索引生命周期、并发写和运维成本；当前阶段先把检索层 contract 和本地索引复用打通。
-关联模块：`rag.py`, `config.py`, `tests/test_hybrid_retrieval.py`
+回答：这个项目的默认要求是无外部服务也能跑通，所以我先把 Chroma 从每次临时建 index 升级成可选持久化：`LOCAL_VECTOR_INDEX_PERSIST=true` 时写到 `LOCAL_VECTOR_INDEX_PATH`，collection 名由 corpus chunk、embedding provider 和 model 指纹决定，第二次 retriever 可以直接复用，不重新 embed corpus。现在还补了 `ingest_corpus.py`，可以把 Markdown/TXT 私有文档生成同一 JSONL corpus。Qdrant/Milvus 更接近生产，但会引入服务部署、索引生命周期、并发写和运维成本；当前阶段先把语料入口、检索层 contract 和本地索引复用打通。
+关联模块：`rag.py`, `ingest_corpus.py`, `config.py`, `tests/test_hybrid_retrieval.py`
 可追问：
 1. 什么时候该换 Qdrant？
 2. corpus 变了怎么重建索引？
 3. 持久化索引会不会污染测试？
+
+## Q：私有知识库怎么接入？
+[状态: 待消化]
+标签：RAG / 私有知识库
+检索关键词：ingest corpus, Markdown, local_corpus.jsonl
+回答：我没有一开始上 RAGFlow 或 Qdrant，而是先做了一个离线 ingest 入口。`ingest_corpus.py` 会递归读取 Markdown/TXT，默认跳过 `.git`、`.obsidian`、`.claude`、`node_modules`、`__pycache__`，清理 YAML frontmatter，用 H1 或文件名生成 title，输出 `id/title/url/content/metadata` 的 JSONL。这个 JSONL 可以直接给 `LocalRagRetriever` 用 keyword 或 hybrid 检索。局限是还不支持 PDF/DOCX、增量 manifest、权限过滤和自动 reindex。
+关联模块：`ingest_corpus.py`, `rag.py`, `tests/test_ingest_corpus.py`
+可追问：
+1. 为什么不直接接 RAGFlow？
+2. Obsidian 文件夹怎么避免读到配置？
+3. 后续怎么做增量索引？
 
 ## Q：为什么要做混合检索，实测效果怎么样？
 [状态: 待消化]

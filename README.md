@@ -55,6 +55,14 @@ py -3.11 -m deepresearch_agent.cli "How should report export work?" --llm-provid
 
 当前导出支持 Markdown、HTML、JSON；PDF、DOCX、PPT 还未实现。
 
+从本地 Markdown/TXT 文件夹生成私有知识库 JSONL：
+
+```powershell
+py -3.11 -m deepresearch_agent.ingest_corpus .\my_notes --output data\local_corpus.jsonl --json
+```
+
+安装 editable package 后，也可以用 console script：`deepresearch-ingest-corpus .\my_notes --output data\local_corpus.jsonl --json`。生成的 JSONL 可被 `LocalRagRetriever` 的 keyword / hybrid 两种模式直接读取；默认会跳过 `.git`、`.obsidian`、`.claude`、`node_modules` 和 `__pycache__`。
+
 可选导出 OpenTelemetry OTLP HTTP trace：
 
 ```powershell
@@ -221,6 +229,7 @@ src/deepresearch_agent/
   llm.py              Mock and DeepSeek structured-output model providers
   search.py           Search adapters, retry, timeout, circuit breaker, fallback
   rag.py              Local keyword/vector hybrid RAG retriever
+  ingest_corpus.py    Markdown/TXT to local JSONL corpus ingestion
   embeddings.py       Local and DashScope embedding providers
   rerankers.py        Optional local and DashScope rerank providers
   verifier.py         Source quality filtering

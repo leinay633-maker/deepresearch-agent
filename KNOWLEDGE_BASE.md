@@ -14,7 +14,7 @@ API 层：`src/deepresearch_agent/api.py`。输入是 `ResearchRequest` 或 `Cre
 
 Agent 编排层：`src/deepresearch_agent/orchestrator.py`。输入是用户 query 和配置，输出是完整报告。它按 clarify/normalize、planner、并发 researcher、source dedup、synthesizer、citation check 的顺序执行。这里我没有直接用 LangGraph，是因为当前目标是可讲清楚的收窄项目，轻量 orchestrator 更便于展示每个阶段的输入输出和失败边界。
 
-工具 Adapter 层：`src/deepresearch_agent/search.py`、`src/deepresearch_agent/rag.py`、`src/deepresearch_agent/embeddings.py`、`src/deepresearch_agent/rerankers.py`。搜索层有 `MockSearchAdapter`、`WikipediaSearchAdapter`、`SearxngSearchAdapter`、`JinaSearchAdapter` 和 `JinaReaderCrawler`，外加 `SearchService` 负责 retry、timeout、circuit breaker 和 fallback。本地 RAG 用 `data/local_corpus.jsonl`，默认走关键词 + BGE 向量 + Chroma + RRF 融合；也可以显式切回 keyword baseline，开启持久化 Chroma index，或者开启本地 / DashScope rerank。
+工具 Adapter 层：`src/deepresearch_agent/search.py`、`src/deepresearch_agent/rag.py`、`src/deepresearch_agent/ingest_corpus.py`、`src/deepresearch_agent/embeddings.py`、`src/deepresearch_agent/rerankers.py`。搜索层有 `MockSearchAdapter`、`WikipediaSearchAdapter`、`SearxngSearchAdapter`、`JinaSearchAdapter` 和 `JinaReaderCrawler`，外加 `SearchService` 负责 retry、timeout、circuit breaker 和 fallback。本地 RAG 用 `data/local_corpus.jsonl`，默认走关键词 + BGE 向量 + Chroma + RRF 融合；`ingest_corpus.py` 可以把 Markdown/TXT 私有文档生成同一 JSONL 格式；也可以显式切回 keyword baseline，开启持久化 Chroma index，或者开启本地 / DashScope rerank。
 
 检索质量层：`src/deepresearch_agent/dedup.py`、`src/deepresearch_agent/verifier.py`。Dedup 按规范化 URL 合并重复来源，Verifier 按标题、正文长度、稳定 URL、已知 adapter、低质量模式打分过滤。
 
@@ -256,6 +256,15 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 代价：它仍是单机轮询 worker，不提供任务优先级、并发 worker pool、backpressure、队列可视化、死信队列、broker ack 或跨机器调度。FastAPI 进程也没有自动托管 worker，部署时需要单独启动。
 面试怎么答：我会说我做的是从 worker-once 到本地 worker loop 的最小生产化增量，目的是让 run control 的队列消费闭环能实际运行；真正上生产仍会换成 Redis/Postgres + worker pool，但 API 和 store contract 已经先稳定下来。
 
+## 决策 26：为什么先做 Markdown/TXT ingest，而不是直接上 RAGFlow/Qdrant/Milvus
+
+背景：本地 RAG 已经有 keyword/vector/hybrid 和可选持久化 Chroma，但语料入口仍是手写的 `data/local_corpus.jsonl`。这不适合把一批私有笔记或项目文档快速接进来。
+可选方案：继续手写 JSONL；直接接 RAGFlow；直接上 Qdrant/Milvus document pipeline；先做 Markdown/TXT 到 JSONL 的离线 ingest。
+最终选择：新增 `src/deepresearch_agent/ingest_corpus.py` 和 console script `deepresearch-ingest-corpus`。它递归读取 `.md/.markdown/.txt`，默认跳过 `.git/.obsidian/.claude/node_modules/__pycache__`，清理 YAML frontmatter，优先用 Markdown H1 做 title，输出现有 `LocalRagRetriever` 可直接消费的 JSONL。
+理由：这一步补的是私有知识库的入口和格式契约，不引入服务端向量库、后台任务或账号。生成的 JSONL 仍能走 keyword baseline、hybrid vector、持久化 Chroma 和 rerank，所以下游能力不需要改。
+代价：当前只支持纯文本/Markdown，不解析 PDF/DOCX/网页，不做增量 manifest、embedding cache、文档删除同步、权限隔离或版本化 reindex。大规模知识库仍需要 Qdrant/Milvus/RAGFlow 这类生产系统。
+面试怎么答：我会说我先把“私有文档如何进入本地 RAG”打通，而不是直接引入重基础设施。这样能演示索引生命周期的第一步，同时保留后续迁移到向量数据库的接口空间。
+
 # 5 实现细节
 
 Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。`ResearchRequest.planner_model` 或 `LLM_PLANNER_MODEL` 可以覆盖 planning stage 的模型名。局限是 planner 还不会根据 researcher 中间结果做 LLM 语义级动态追加子问题。
@@ -275,6 +284,8 @@ MCP Tool Adapter：`src/deepresearch_agent/mcp_tools.py`。`McpToolSearchAdapter
 Embedding Provider：`src/deepresearch_agent/embeddings.py`。输入文本列表，输出向量列表。默认 `LocalEmbeddingProvider` 使用 `sentence-transformers` 加载 `BAAI/bge-small-zh-v1.5`，无 API key；`DashScopeEmbeddingProvider` 调百炼 OpenAI-compatible embeddings endpoint，key 只从 `DASHSCOPE_API_KEY` 读。验证脚本是 `src/deepresearch_agent/validate_embeddings.py`，本机 local BGE 实测维度 `512`；DashScope 因未配置 key，只做了 stub endpoint 解析测试。
 
 Hybrid Local Retriever：`src/deepresearch_agent/rag.py`。输入 query 和 top-k，输出统一 `Source`。keyword 路按 token overlap 排序；vector 路先把 `data/local_corpus.jsonl` 分块，用 embedding 建 Chroma collection，再按 cosine distance 检索；融合用 RRF，metadata 记录 keyword_rank、vector_rank、fusion score 和权重。默认不强制写本地索引；设置 `LOCAL_VECTOR_INDEX_PERSIST=true` 后，Chroma 会写入 `LOCAL_VECTOR_INDEX_PATH`，collection 名由 corpus chunk、embedding provider 和 model 指纹决定，count 匹配时复用已有 collection。局限是当前还没有 Qdrant/Milvus 这种独立向量数据库，也没有索引管理后台。
+
+Document Corpus Ingestor：`src/deepresearch_agent/ingest_corpus.py`。输入是本地文件夹，输出是 `LocalRagRetriever` 可直接消费的 JSONL，每行包含 `id/title/url/content/metadata`。它支持 `.md/.markdown/.txt`，默认排除 `.git/.obsidian/.claude/node_modules/__pycache__`，会清理 YAML frontmatter，用 Markdown H1 或文件名生成 title，并把文件路径写进 metadata。局限是它只处理文本文件，不做 PDF/DOCX 解析、增量 manifest、去重、权限过滤或自动触发 vector index rebuild。
 
 Rerank Provider：`src/deepresearch_agent/rerankers.py`。输入 query 和候选 source，输出重排分数。默认 provider 是本地 `BAAI/bge-reranker-base`，但 `rerank_enabled` 默认关闭；DashScope rerank provider 调 `https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank`，key 仍只读 `DASHSCOPE_API_KEY`。本地 rerank 单条 smoke 跑通过，但首次模型下载/加载使 latency 约 `279692.721ms`，所以没有把它放进默认 benchmark。
 
@@ -502,7 +513,7 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
-测试验证：`py -3.11 -m pytest -q`，最新结果 `72 passed, 2 warnings in 89.48s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `74 passed, 2 warnings in 76.28s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -535,6 +546,8 @@ Deferred worker smoke：`py -3.11 -m pytest tests/test_run_control.py -q` 成功
 Local worker loop smoke：`py -3.11 -m pytest tests/test_run_worker.py tests/test_run_control.py -q` 成功，`16 passed, 1 warning in 8.19s`。新增测试覆盖 `run_worker_loop(max_runs=1)` 能消费一个 `defer_execution=true` 的 queued run 并执行到 `succeeded`，summary 记录 `processed_count=1`、`stopped_reason=max_runs`；空队列时 `idle_exit=True` 返回 `processed_count=0`、`idle_polls=1`、`stopped_reason=idle`。这里没有做多进程 worker 竞争压测，也没有 Redis/Celery broker。
 
 Persistent vector index smoke：`py -3.11 -m pytest tests/test_hybrid_retrieval.py -q` 成功，`3 passed, 1 warning in 2.77s`。新增测试用静态 embedding provider 和临时 Chroma PersistentClient 验证：第一次检索会 embed 2 个 corpus chunk 和 1 个 query，第二个 `LocalRagRetriever` 指向同一 `LOCAL_VECTOR_INDEX_PATH` 时只 embed query，不重新 embed corpus；`ChromaVectorIndex.reused_existing` 为 `True`。这只验证索引复用语义，没有做真实 BGE 冷/热启动延迟 benchmark。
+
+Document corpus ingest smoke：`py -3.11 -m pytest tests/test_ingest_corpus.py tests/test_hybrid_retrieval.py -q` 成功，`5 passed, 1 warning in 2.85s`。新增测试覆盖 Markdown YAML frontmatter 清理、H1 title 抽取、TXT 文件名 title、`.obsidian` 目录排除、空文档跳过、输出 JSONL 的 `id/title/url/content/metadata` 字段，以及生成的 corpus 能被 `LocalRagRetriever(local_retrieval_mode="keyword")` 直接检索。这里没有测试 PDF/DOCX、增量 reindex、权限过滤或大规模 corpus。
 
 Stage model routing smoke：`py -3.11 -m pytest tests/test_stage_models.py -q` 成功，`2 passed in 0.35s`。测试覆盖 mock orchestrator 在 `brief_model`、`planner_model`、`synthesis_model` 不同时，`CostRecord.model` 分别记录 `mock-brief`、`mock-planner`、`mock-synthesis`；同时用不联网的 `RecordingDeepSeekProvider` 验证 DeepSeek 请求体按 stage 发送 `deepseek-chat`、`deepseek-reasoner`、`deepseek-v4-flash`，且 cost records 记录同一模型序列。CLI smoke：`py -3.11 -m deepresearch_agent.cli "How should model routing work in a research agent?" --llm-provider mock --llm-model mock-default --brief-model mock-brief --planner-model mock-planner --synthesis-model mock-synthesis --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --json` 后抽取 `cost.records[].model`，输出 `['mock-brief', 'mock-planner', 'mock-synthesis']`。这只验证路由和记录，不代表这些模型组合已做真实质量/成本对比。
 
@@ -598,7 +611,7 @@ benchmark 汇总：管线 plumbing 指标，mock，非真实性能。具体 late
 
 这条公开真实 case 的 query 是让系统根据 `American Community Survey / FEMA Harvey flood depths / USDA Food Access Research Atlas / Streetlight / SafeGraph POI` 找使用全部数据集的论文，并按 JSON 返回 `paper_title`。真实组没有报错，也没有 fallback，但 success 为 0，说明当前 DeepSeek + Wikipedia + 本地 keyword RAG 没有解决这类公开精确查证任务；citation retention 只有 `0.5`，也说明 lexical citation check 已经暴露支撑不足。面试里我会把它讲成“公开评测入口已经打通，但质量短板被暴露出来”，不会把 mock 组的 `1.0` 当质量成果。
 
-未实测：LiveDRBench/Deep Research Bench 官方 judge 分数、真实搜索 API 高并发限流、Brave/Tavily live search benchmark、DeepSeek citation judge live benchmark、Redis/PostgreSQL 缓存、多进程 worker pool / 分布式队列、真实 OpenTelemetry collector / LangSmith tracing、真实用户流量、DashScope 真实 embedding/rerank、rerank 5 case 全量 benchmark。
+未实测：LiveDRBench/Deep Research Bench 官方 judge 分数、真实搜索 API 高并发限流、Brave/Tavily live search benchmark、DeepSeek citation judge live benchmark、Redis/PostgreSQL 缓存、多进程 worker pool / 分布式队列、真实 OpenTelemetry collector / LangSmith tracing、真实用户流量、DashScope 真实 embedding/rerank、PDF/DOCX ingest、大规模私有语料增量 reindex、rerank 5 case 全量 benchmark。
 
 # 8 评测设计
 
@@ -659,7 +672,7 @@ Citation checker 语义能力仍需实测：当前已经有可选 heuristic / De
 
 搜索质量仍需 live 验证：Wikipedia 能跑但相关性和覆盖有限；SearxNG 需要自建实例；Jina Search 在当前环境返回过 401/403；Brave/Tavily 已接 adapter 但没有 key 跑 live benchmark。可行方案是配置真实 Brave/Tavily/SerpAPI/自建 SearxNG，并做页面正文抽取与相关性评测。工程代价是 key、限流、费用和 provider schema 差异。面试怎么讲：我会强调 adapter 已经抽象好，替换 provider 不影响 orchestrator，但不会把未 live 的 provider 包装成生产搜索。
 
-Hybrid retrieval 还没有证明质量稳定提升：当前已经实现 keyword + vector + RRF、可选持久化 Chroma index 和可选 rerank，但 5 case 小样本里 hybrid success_rate 反而低于 keyword baseline。可行方案是扩大本地语料、补人工相关性标注、调 RRF 权重、引入 Qdrant/Milvus 这类外部向量库，并把 rerank 纳入全量 benchmark。工程代价是索引生命周期、模型加载时间、评测集标注和更多运行成本。面试怎么讲：我会说我完成了检索结构升级，但不会把一次小样本结果包装成质量提升。
+Hybrid retrieval / private corpus 还没有证明质量稳定提升：当前已经实现 keyword + vector + RRF、Markdown/TXT 到 JSONL ingest、可选持久化 Chroma index 和可选 rerank，但 5 case 小样本里 hybrid success_rate 反而低于 keyword baseline。可行方案是扩大本地语料、补人工相关性标注、调 RRF 权重、增加 PDF/DOCX loader、做增量 manifest/embedding cache、引入 Qdrant/Milvus 这类外部向量库，并把 rerank 纳入全量 benchmark。工程代价是索引生命周期、模型加载时间、评测集标注和更多运行成本。面试怎么讲：我会说我完成了检索结构和私有文档入口升级，但不会把一次小样本结果包装成质量提升，也不会把文本 ingest 说成完整 RAGFlow。
 
 Run control 还不是分布式调度：当前已经有 SQLite run store、request_json 请求快照、planner checkpoint、approval/resume/cancel/retry、SSE replay、单机 worker lease/heartbeat、`defer_execution=true` + `/runs/worker/next` 的 worker-once 消费入口，以及本地 polling worker CLI，但它仍是轻量实现。可行方案是引入真正的 worker queue、多进程 worker pool、PostgreSQL/Redis、阶段幂等和更细粒度 checkpoint。工程代价是并发一致性、任务抢占、schema migration 和运维复杂度。面试怎么讲：我会说我先把长任务控制平面闭环、worker ownership 和最小队列消费语义做出来，生产化再升级存储和调度，不把 SQLite 版本包装成高并发任务系统。
 
