@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import hashlib
 import json
+import pickle
 import ssl
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 from zipfile import BadZipFile, ZipFile
 
 import certifi
+
+from deepresearch_agent.config import load_settings
+from deepresearch_agent.embeddings import EmbeddingProvider, build_embedding_provider
+from deepresearch_agent.rag import LocalRagRetriever
+from deepresearch_agent.schemas import Source
 
 
 # Public BEIR benchmark dataset. SciFact is not project-owned data; it is used
@@ -18,6 +27,8 @@ BEIR_SCIFACT_URL = (
     "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/scifact.zip"
 )
 BEIR_SCIFACT_QRELS_SPLIT = "test"
+DEFAULT_SCIFACT_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+RETRIEVAL_EVAL_MODES = ("keyword", "hybrid", "hybrid_rerank")
 
 
 @dataclass(frozen=True)
@@ -42,6 +53,17 @@ class ScifactDataset:
     corpus: dict[str, ScifactDocument]
     queries: dict[str, ScifactQuery]
     qrels: dict[str, dict[str, int]]
+
+
+@dataclass(frozen=True)
+class RetrievalEvalConfig:
+    modes: list[str]
+    top_k: int
+    max_queries: int | None
+    embedding_provider: str
+    embedding_model: str
+    rerank_provider: str
+    rerank_candidate_k: int
 
 
 def load_scifact_dataset(
@@ -84,6 +106,180 @@ def validate_scifact_dataset(dataset: ScifactDataset) -> dict[str, int | str]:
         "query_count": len(dataset.queries),
         "qrels_query_count": len(dataset.qrels),
         "qrels_relevant_pair_count": sum(len(items) for items in dataset.qrels.values()),
+    }
+
+
+async def run_scifact_retrieval(
+    dataset: ScifactDataset,
+    config: RetrievalEvalConfig,
+) -> dict[str, Any]:
+    query_ids = list(dataset.qrels)
+    if config.max_queries is not None:
+        query_ids = query_ids[: config.max_queries]
+    corpus_path = _write_local_corpus(dataset)
+    embedding_provider = _build_cached_embedding_provider(dataset, config)
+    runs = {}
+    for mode in config.modes:
+        retriever = _build_retriever(mode, corpus_path, config, embedding_provider)
+        rankings: dict[str, list[dict[str, Any]]] = {}
+        for query_id in query_ids:
+            query = dataset.queries[query_id].text
+            sources = await retriever.retrieve(query, max_results=config.top_k)
+            rankings[query_id] = [_source_to_ranking_item(source) for source in sources]
+        runs[mode] = {
+            "mode": mode,
+            "top_k": config.top_k,
+            "query_count": len(query_ids),
+            "rankings": rankings,
+        }
+    return {
+        "dataset": {
+            "name": dataset.name,
+            "source_url": dataset.source_url,
+            "qrels_split": dataset.qrels_split,
+            "corpus_doc_count": len(dataset.corpus),
+            "query_count": len(dataset.queries),
+            "evaluated_query_count": len(query_ids),
+            "qrels_query_count": len(dataset.qrels),
+        },
+        "config": {
+            "modes": config.modes,
+            "top_k": config.top_k,
+            "max_queries": config.max_queries,
+            "embedding_provider": config.embedding_provider,
+            "embedding_model": config.embedding_model,
+            "rerank_provider": config.rerank_provider,
+            "rerank_candidate_k": config.rerank_candidate_k,
+        },
+        "runs": runs,
+    }
+
+
+def _build_retriever(
+    mode: str,
+    corpus_path: Path,
+    config: RetrievalEvalConfig,
+    embedding_provider: EmbeddingProvider,
+) -> LocalRagRetriever:
+    if mode not in RETRIEVAL_EVAL_MODES:
+        raise ValueError(f"unknown retrieval eval mode: {mode}")
+    settings = load_settings()
+    retrieval_mode = "keyword" if mode == "keyword" else "hybrid"
+    rerank_enabled = mode == "hybrid_rerank"
+    settings = replace(
+        settings,
+        embedding_provider=config.embedding_provider,
+        local_embedding_model=config.embedding_model,
+        local_retrieval_mode=retrieval_mode,
+        local_keyword_top_k=max(config.top_k, config.rerank_candidate_k),
+        local_vector_top_k=max(config.top_k, config.rerank_candidate_k),
+        rerank_enabled=rerank_enabled,
+        rerank_provider=config.rerank_provider,
+        local_rerank_candidate_k=max(config.top_k, config.rerank_candidate_k),
+        # SciFact abstracts should be evaluated at document granularity.
+        local_chunk_size_chars=100_000,
+        local_chunk_overlap_chars=0,
+    )
+    return LocalRagRetriever(
+        corpus_path=corpus_path,
+        settings=settings,
+        embedding_provider=embedding_provider,
+    )
+
+
+def _build_cached_embedding_provider(
+    dataset: ScifactDataset, config: RetrievalEvalConfig
+) -> EmbeddingProvider:
+    settings = replace(
+        load_settings(),
+        embedding_provider=config.embedding_provider,
+        local_embedding_model=config.embedding_model,
+    )
+    base_provider = build_embedding_provider(settings, config.embedding_provider)
+    cache_path = dataset.root / f"embedding_cache_{_safe_name(base_provider.model)}.pkl"
+    return CachedCorpusEmbeddingProvider(base_provider=base_provider, cache_path=cache_path)
+
+
+@dataclass
+class CachedCorpusEmbeddingProvider(EmbeddingProvider):
+    base_provider: EmbeddingProvider
+    cache_path: Path
+
+    @property
+    def name(self) -> str:
+        return self.base_provider.name
+
+    @property
+    def model(self) -> str:
+        return self.base_provider.model
+
+    async def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        if len(texts) <= 1:
+            return await self.base_provider.embed_texts(texts)
+        digest = _texts_digest(texts)
+        cached = self._load_cache(digest)
+        if cached is not None:
+            return cached
+        vectors = await self.base_provider.embed_texts(texts)
+        self._save_cache(digest, vectors)
+        return vectors
+
+    def _load_cache(self, digest: str) -> list[list[float]] | None:
+        if not self.cache_path.exists():
+            return None
+        with self.cache_path.open("rb") as file:
+            payload = pickle.load(file)
+        if (
+            payload.get("model") == self.model
+            and payload.get("digest") == digest
+            and isinstance(payload.get("vectors"), list)
+        ):
+            return payload["vectors"]
+        return None
+
+    def _save_cache(self, digest: str, vectors: list[list[float]]) -> None:
+        with self.cache_path.open("wb") as file:
+            pickle.dump(
+                {"model": self.model, "digest": digest, "vectors": vectors},
+                file,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+
+
+def _texts_digest(texts: list[str]) -> str:
+    hasher = hashlib.sha256()
+    for text in texts:
+        encoded = text.encode("utf-8")
+        hasher.update(len(encoded).to_bytes(8, "big"))
+        hasher.update(encoded)
+    return hasher.hexdigest()
+
+
+def _safe_name(name: str) -> str:
+    return "".join(char if char.isalnum() else "_" for char in name).strip("_")
+
+
+def _write_local_corpus(dataset: ScifactDataset) -> Path:
+    path = dataset.root / "deepresearch_local_corpus.jsonl"
+    with path.open("w", encoding="utf-8") as file:
+        for document in dataset.corpus.values():
+            row = {
+                "id": document.doc_id,
+                "title": document.title,
+                "url": f"beir://scifact/{document.doc_id}",
+                "content": document.text,
+            }
+            file.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return path
+
+
+def _source_to_ranking_item(source: Source) -> dict[str, Any]:
+    doc_id = str(source.metadata.get("local_doc_id", ""))
+    return {
+        "doc_id": doc_id,
+        "score": source.score,
+        "title": source.title,
+        "metadata": source.metadata,
     }
 
 
@@ -207,12 +403,51 @@ def main() -> None:
     )
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--force-download", action="store_true")
+    parser.add_argument("--run", action="store_true", help="Run retrieval and output rankings.")
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        choices=RETRIEVAL_EVAL_MODES,
+        default=list(RETRIEVAL_EVAL_MODES),
+    )
+    parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument("--max-queries", type=int, default=None)
+    parser.add_argument("--embedding-provider", choices=["local", "dashscope"], default="local")
+    parser.add_argument("--embedding-model", default=DEFAULT_SCIFACT_EMBEDDING_MODEL)
+    parser.add_argument("--rerank-provider", choices=["local", "dashscope"], default="local")
+    parser.add_argument("--rerank-candidate-k", type=int, default=20)
+    parser.add_argument(
+        "--output",
+        default="results/retrieval_eval_scifact_rankings.json",
+        help="Where to write retrieval rankings when --run is set.",
+    )
     args = parser.parse_args()
     dataset = load_scifact_dataset(
         cache_dir=Path(args.cache_dir) if args.cache_dir else None,
         force_download=args.force_download,
     )
-    print(json.dumps(validate_scifact_dataset(dataset), ensure_ascii=False, indent=2))
+    validation = validate_scifact_dataset(dataset)
+    if not args.run:
+        print(json.dumps(validation, ensure_ascii=False, indent=2))
+        return
+    result = asyncio.run(
+        run_scifact_retrieval(
+            dataset,
+            RetrievalEvalConfig(
+                modes=args.modes,
+                top_k=args.top_k,
+                max_queries=args.max_queries,
+                embedding_provider=args.embedding_provider,
+                embedding_model=args.embedding_model,
+                rerank_provider=args.rerank_provider,
+                rerank_candidate_k=args.rerank_candidate_k,
+            ),
+        )
+    )
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({"validation": validation, "output": str(output_path)}, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
