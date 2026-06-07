@@ -522,7 +522,7 @@
 [状态: 待消化]
 标签：Durability / SQLite
 检索关键词：restart recovery, SQLite
-回答：当前不是分布式恢复，但服务重启后可以从 SQLite 读回 run、steps、events、request_json 和 planner checkpoint。比如 run 在 `waiting_approval`，重启后用户仍可以查 `/runs/{run_id}`，然后 approve/edit/reject；如果 run 是 `defer_execution=true` 创建出来的 queued run，`/runs/worker/next` 可以从 request_json 恢复原始配置继续执行；如果 run failed 且已有 plan_json，`/retry` 会复用 planner 输出从 researcher 阶段重跑。
+回答：当前不是分布式恢复，但服务重启后可以从 SQLite 读回 run、steps、events、request_json、planner checkpoint 和 researcher 成功 checkpoint。比如 run 在 `waiting_approval`，重启后用户仍可以查 `/runs/{run_id}`，然后 approve/edit/reject；如果 run 是 `defer_execution=true` 创建出来的 queued run，`/runs/worker/next` 可以从 request_json 恢复原始配置继续执行；如果 run failed 且已有 plan_json，`/retry` 会复用 planner 输出；如果 researcher 已成功，还会复用 researcher checkpoint，直接从 synthesis/verifier 往后跑，避免重复检索。
 关联模块：`run_store.py`, `run_control.py`, `api.py`
 可追问：
 1. running 中途宕机怎么办？
@@ -533,7 +533,7 @@
 [状态: 待消化]
 标签：Run Control / Failure Recovery
 检索关键词：cancel, retry, failed run
-回答：`cancel` 会把非终态 run 标成 `cancelled`，后续 approve 会被拒绝；运行中取消现在也有阶段边界检查，`RunCancelledError` 会被单独捕获，保证用户取消不会被通用异常路径误记成 `failed`，lease 也会释放。它不是强杀正在进行的 LLM/search 请求，而是在 planner/researcher/synthesizer/verifier 阶段边界协作式生效。`retry` 只允许 failed run，优先复用 planner checkpoint，从 researcher 阶段重新跑，并在 step 里写 `retry_count=1`、event 里写 `retrying`。这不是精确恢复到某个 researcher 内部，而是可解释的稳定 checkpoint 重跑。
+回答：`cancel` 会把非终态 run 标成 `cancelled`，后续 approve 会被拒绝；运行中取消现在也有阶段边界检查，`RunCancelledError` 会被单独捕获，保证用户取消不会被通用异常路径误记成 `failed`，lease 也会释放。它不是强杀正在进行的 LLM/search 请求，而是在 planner/researcher/synthesizer/verifier 阶段边界协作式生效。`retry` 只允许 failed run，优先复用 planner checkpoint；如果上一次 researcher 已经成功，step 里有 `output_json.checkpoint`，retry 会写 `researcher.checkpoint_reused` event，直接从 synthesis/verifier 往后跑，避免重复检索。它还不是每个 subquestion 的精确恢复，而是阶段级 checkpoint 重跑。
 关联模块：`run_control.py`, `tests/test_run_control.py`
 可追问：
 1. 为什么 retry 不重跑 planner？
@@ -632,7 +632,7 @@
 [状态: 待消化]
 标签：生产化 / Roadmap
 检索关键词：worker queue, lease, production
-回答：下一步不是再加 provider，而是把 run control 继续生产化：真正的任务队列、多进程 worker pool、幂等阶段执行、Postgres 持久化、对象存储保存大结果、权限和审计、provider 级限流和 abort signal。现在版本已经把状态机、checkpoint、request_json、单机 lease/heartbeat、worker-once、本地 polling worker，以及运行中取消的终态一致性打出来，后面替换存储和调度不会影响 Agent 主链路。
+回答：下一步不是再加 provider，而是把 run control 继续生产化：真正的任务队列、多进程 worker pool、子任务级幂等执行、Postgres 持久化、对象存储保存大结果、权限和审计、provider 级限流和 abort signal。现在版本已经把状态机、checkpoint、request_json、单机 lease/heartbeat、worker-once、本地 polling worker、运行中取消的终态一致性，以及 researcher 阶段 checkpoint 复用打出来，后面替换存储和调度不会影响 Agent 主链路。
 关联模块：`run_control.py`, `run_store.py`, `api.py`
 可追问：
 1. 哪一步最该先做？

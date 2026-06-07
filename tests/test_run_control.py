@@ -367,6 +367,61 @@ def test_retry_failed_run_reuses_planner_checkpoint(tmp_path, monkeypatch) -> No
     assert any(event.status == "retrying" for event in store.list_events(run_id))
 
 
+def test_retry_reuses_researcher_checkpoint_after_later_stage_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "runs.sqlite"
+    monkeypatch.setenv("RUN_STORE_PATH", str(db_path))
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("SEARCH_PROVIDER", "mock")
+    monkeypatch.setenv("LOCAL_RETRIEVAL_MODE", "keyword")
+    store = RunStore(db_path)
+    calls = {"researcher": 0, "synthesizer": 0}
+    original_researcher = RunController._run_researcher_stage
+    original_synthesizer = RunController._run_synthesizer_stage
+
+    async def counting_researcher(self, *args, **kwargs):
+        calls["researcher"] += 1
+        return await original_researcher(self, *args, **kwargs)
+
+    async def flaky_synthesizer(self, *args, **kwargs):
+        calls["synthesizer"] += 1
+        if calls["synthesizer"] == 1:
+            raise RuntimeError("synthetic synthesis failure")
+        return await original_synthesizer(self, *args, **kwargs)
+
+    monkeypatch.setattr(RunController, "_run_researcher_stage", counting_researcher)
+    monkeypatch.setattr(RunController, "_run_synthesizer_stage", flaky_synthesizer)
+    controller = RunController(store=store, settings=load_settings())
+
+    failed = asyncio.run(
+        controller.create_run(
+            CreateRunRequest(
+                query="How should retry reuse researcher checkpoints?",
+                search_provider="mock",
+                llm_provider="mock",
+                max_researchers=1,
+                max_results_per_researcher=1,
+                require_approval=False,
+            )
+        )
+    )
+    retried = asyncio.run(controller.retry(failed.run_id))
+
+    assert failed.status == "failed"
+    assert retried.status == "succeeded"
+    assert calls == {"researcher": 1, "synthesizer": 2}
+    researcher_steps = [
+        step for step in store.list_steps(failed.run_id) if step.stage == "researcher"
+    ]
+    assert any((step.output_json or {}).get("checkpoint") for step in researcher_steps)
+    assert any(
+        event.stage == "researcher" and event.status == "checkpoint_reused"
+        for event in store.list_events(failed.run_id)
+    )
+
+
 def test_sse_replay_uses_last_event_id(tmp_path, monkeypatch) -> None:
     client, _store = _client(tmp_path, monkeypatch)
     run_id = client.post("/runs", json=_run_body("How should SSE replay work?")).json()["run_id"]

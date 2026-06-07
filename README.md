@@ -100,7 +100,7 @@ Invoke-RestMethod http://127.0.0.1:8000/runs/$($run.run_id)/trace
 http://127.0.0.1:8000/ui
 ```
 
-这个页面复用上面的 run control API，支持创建 mock run、查看最近 runs、编辑 planner subquestions、approve/reject/cancel，并展示 SSE events、report、sources 和 citation evidence。运行中取消是阶段边界协作式取消：系统会保留 `cancelled` 终态并释放 lease，但不会强制打断已经发出的 LLM/search 请求。它是本地审核面，不包含登录权限或多人协作。
+这个页面复用上面的 run control API，支持创建 mock run、查看最近 runs、编辑 planner subquestions、approve/reject/cancel，并展示 SSE events、report、sources 和 citation evidence。运行中取消是阶段边界协作式取消：系统会保留 `cancelled` 终态并释放 lease，但不会强制打断已经发出的 LLM/search 请求。`retry` 会优先复用 planner checkpoint；如果 researcher 已成功，还会复用 researcher checkpoint，避免后续阶段失败时重复检索。它是本地审核面，不包含登录权限或多人协作。
 
 创建后先排队，再由单次 worker 消费下一条 queued run：
 

@@ -384,17 +384,41 @@ class RunController:
         search_service = build_search_service(self.settings, request.search_provider)
         max_researchers = min(request.max_researchers, self.settings.max_researchers)
 
-        self._raise_if_cancelled(run_id)
-        findings, raw_search_count, fallback_count, all_sources, sources = await self._run_researcher_stage(
-            run_id,
-            request,
-            plan,
-            orchestrator,
-            search_service,
-            trace,
-            max_researchers,
-            retry_count,
+        researcher_checkpoint = (
+            self._load_researcher_checkpoint(run_id) if retry_count > 0 else None
         )
+        if researcher_checkpoint is None:
+            self._raise_if_cancelled(run_id)
+            (
+                findings,
+                raw_search_count,
+                fallback_count,
+                all_sources,
+                sources,
+            ) = await self._run_researcher_stage(
+                run_id,
+                request,
+                plan,
+                orchestrator,
+                search_service,
+                trace,
+                max_researchers,
+                retry_count,
+            )
+        else:
+            self._heartbeat_execution_lease(run_id)
+            self.store.update_run(run_id, status="running", current_stage="researcher")
+            findings, raw_search_count, fallback_count, all_sources, sources = researcher_checkpoint
+            self._event(
+                run_id,
+                "researcher",
+                "checkpoint_reused",
+                {
+                    "finding_count": len(findings),
+                    "source_count": len(sources),
+                    "retry_count": retry_count,
+                },
+            )
 
         self._raise_if_cancelled(run_id)
         answer, claims, _synthesis_cost = await self._run_synthesizer_stage(
@@ -520,6 +544,13 @@ class RunController:
                 "raw_search_result_count": raw_search_count,
                 "fallback_count": fallback_count,
                 "deduped_source_count": len(sources),
+                "checkpoint": {
+                    "findings": [finding.model_dump(mode="json") for finding in findings],
+                    "all_sources": [source.model_dump(mode="json") for source in all_sources],
+                    "sources": [source.model_dump(mode="json") for source in sources],
+                    "raw_search_result_count": raw_search_count,
+                    "fallback_count": fallback_count,
+                },
             },
             latency_ms=_elapsed_ms(started_at),
             retry_count=retry_count,
@@ -655,6 +686,39 @@ class RunController:
         if run.plan_json is None:
             raise ValueError(f"run has no planner checkpoint: {run.run_id}")
         return run.plan_json
+
+    def _load_researcher_checkpoint(
+        self,
+        run_id: str,
+    ) -> tuple[list[Finding], int, int, list[Source], list[Source]] | None:
+        for step in reversed(self.store.list_steps(run_id)):
+            if step.stage != "researcher" or step.status != "succeeded":
+                continue
+            output = step.output_json or {}
+            checkpoint = output.get("checkpoint")
+            if not isinstance(checkpoint, dict):
+                return None
+            try:
+                findings = [
+                    Finding.model_validate(item)
+                    for item in checkpoint.get("findings", [])
+                ]
+                all_sources = [
+                    Source.model_validate(item)
+                    for item in checkpoint.get("all_sources", [])
+                ]
+                sources = [
+                    Source.model_validate(item)
+                    for item in checkpoint.get("sources", [])
+                ]
+                raw_search_count = int(checkpoint.get("raw_search_result_count", 0))
+                fallback_count = int(checkpoint.get("fallback_count", 0))
+            except Exception:  # noqa: BLE001
+                return None
+            if not findings or not sources:
+                return None
+            return findings, raw_search_count, fallback_count, all_sources, sources
+        return None
 
     def _require_status(self, run_id: str, statuses: set[str]) -> AgentRun:
         run = self.store.require_run(run_id)
