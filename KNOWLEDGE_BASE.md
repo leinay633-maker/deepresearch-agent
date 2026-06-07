@@ -107,8 +107,8 @@ Agent 编排层：`src/deepresearch_agent/orchestrator.py`。输入是用户 que
 可选方案：继续只看端到端 benchmark；手写小语料相关性标注；接入完整 BEIR 框架；只加载 BEIR/scifact 数据并自己算指标。
 最终选择：新增 `src/deepresearch_agent/retrieval_eval.py`，下载公开 BEIR/scifact 数据集，只用 corpus/query/qrels 评测本地 retriever 的 keyword、hybrid、hybrid+rerank 三种模式，并自己计算 Recall@10、nDCG@10、MRR。
 理由：SciFact 是公开信息检索 benchmark，不是我项目自造数据；它有 qrels，可以直接评价召回和排序质量；自己写 loader 和 metric 能避免引入完整 BEIR 框架的重量，也能把评测逻辑讲清楚。
-代价：SciFact 是英文科学摘要任务，所以评测时 embedding 模型切到 `BAAI/bge-small-en-v1.5`，不等于中文求职知识库场景；本地 reranker 在 CPU 上明显变慢，hybrid+rerank 的平均 query latency 到 `3.4022s`。
-面试怎么答：我会说端到端 benchmark 看系统整体，BEIR/scifact 看检索模块本身；这次独立评测证明 hybrid 的 Recall@10 从 `0.6000` 到 `0.8206`，rerank 主要提升排序质量，把 nDCG@10 从 `0.6576` 提到 `0.7307`，但延迟代价也很明显。
+代价：SciFact 是英文科学摘要任务，所以评测时 embedding 模型切到 `BAAI/bge-small-en-v1.5`，不等于中文求职知识库场景；本地 reranker 在 CPU 上明显变慢，hybrid+rerank 的平均 query latency 到 `3.4431s`。
+面试怎么答：我会说端到端 benchmark 看系统整体，BEIR/scifact 看检索模块本身；这次独立评测证明 hybrid 的 Recall@10 从 `0.6000` 到 `0.8239`。因为本次 `rerank_candidate_k=10` 且 `top_k=10`，rerank 只重排同一批 top10 候选，所以 Recall@10 与 hybrid 保持一致；它主要提升排序质量，把 nDCG@10 从 `0.6597` 提到 `0.7307`，但延迟代价也很明显。
 
 # 5 实现细节
 
@@ -217,7 +217,7 @@ Trace Logger：`src/deepresearch_agent/tracing.py`。每个 run 写 `logs/resear
 现象：第一次把 keyword、hybrid、hybrid+rerank 三组一起跑完整 SciFact test qrels 时，30 分钟超时且没有写出最终 JSON。
 原因：评测脚本最初没有向 `LocalRagRetriever` 注入可复用的 rerank provider，导致本地 `BAAI/bge-reranker-base` 在多个 query 上重复构造；即使复用后，CPU 上 cross-encoder rerank 300 个 query 仍然明显慢。
 排查：先分模式运行，keyword 全量约 `99.55s`，hybrid 全量约 `171.57s`；再跑 10 query rerank，发现输出里反复出现 reranker weights loading。
-修复：评测脚本中对 hybrid+rerank 先用 hybrid retriever 取候选，再复用同一个本地 reranker 对 query-candidate pair 批量打分；最终全量 hybrid+rerank 跑出 `1020.67s`。
+修复：评测脚本中对 hybrid+rerank 先用 hybrid retriever 取候选，再复用同一个本地 reranker 对 query-candidate pair 批量打分；最新全量重跑里 hybrid+rerank 跑出 `1032.93s`。
 复盘：rerank 的质量收益要和延迟一起讲，不能只展示 nDCG/MRR 变好；本地 CPU cross-encoder 在独立评测里可以接受，在默认端到端 benchmark 里仍不应默认开启。
 面试可能追问：这算不算为结果调参？回答：不是调参，top_k 和 candidate_k 仍是 10；我只是让评测脚本复用同一个 provider 并批量打分，避免重复加载模型造成的工程噪声。
 
@@ -275,15 +275,15 @@ benchmark 汇总：管线 plumbing 指标，mock，非真实性能。具体 late
 
 检索模块独立评测（BEIR/scifact）：这组只评测本地 retriever，不调用 DeepSeek、不调用 Wikipedia、不跑 orchestrator，也不产生 LLM token/cost。数据集是公开 BEIR/scifact，不是本项目自有数据；来源 URL 写在代码注释和结果文件里：`https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/scifact.zip`。验证结果：corpus `5183` 篇，queries `1109` 条，test qrels query `300` 条，relevant pair `339` 对。结果文件：`results/retrieval_eval_scifact.json`。
 
-实际运行方式：先用 `py -3.11 -m deepresearch_agent.retrieval_eval` 校验数据集；全量评测为了避免早期 30 分钟超时，按 `keyword`、`hybrid`、`hybrid_rerank` 三个 mode 分别跑完后合并到最终 JSON。最终配置是 `top_k=10`、`rerank_candidate_k=10`、`embedding_provider=local`、`embedding_model=BAAI/bge-small-en-v1.5`、`rerank_provider=local`、`rerank_model=BAAI/bge-reranker-base`。这里把 embedding 模型从默认中文 BGE 切到英文 BGE，是因为 SciFact 本身是英文科学摘要检索任务；项目默认中文模型没有因此改变。
+实际运行方式：先用 `py -3.11 -m deepresearch_agent.retrieval_eval` 校验数据集；然后用 `py -3.11 -m deepresearch_agent.retrieval_eval --run --modes keyword hybrid hybrid_rerank --top-k 10 --rerank-candidate-k 10 --output results\retrieval_eval_scifact.json` 全量重跑并由脚本覆盖结果 JSON。最终配置是 `top_k=10`、`rerank_candidate_k=10`、`embedding_provider=local`、`embedding_model=BAAI/bge-small-en-v1.5`、`rerank_provider=local`；本地 rerank provider 使用默认模型 `BAAI/bge-reranker-base`。这里把 embedding 模型从默认中文 BGE 切到英文 BGE，是因为 SciFact 本身是英文科学摘要检索任务；项目默认中文模型没有因此改变。
 
 | 检索模式 | Recall@10 | nDCG@10 | MRR | 总耗时 | 平均每 query 延迟 | LLM tokens | API cost |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | keyword baseline | 0.6000 | 0.4823 | 0.4548 | 99.55s | 0.3318s | 0 | $0 |
-| hybrid：keyword + local BGE vector + RRF | 0.8206 | 0.6576 | 0.6098 | 171.57s | 0.5719s | 0 | $0 |
-| hybrid + local rerank | 0.8239 | 0.7307 | 0.7083 | 1020.67s | 3.4022s | 0 | $0 |
+| hybrid：keyword + local BGE vector + RRF | 0.8239 | 0.6597 | 0.6114 | 173.43s | 0.5781s | 0 | $0 |
+| hybrid + local rerank | 0.8239 | 0.7307 | 0.7083 | 1032.93s | 3.4431s | 0 | $0 |
 
-这组结果比 5 case 端到端 benchmark 更能说明 retriever 本身：hybrid 相对 keyword 的 Recall@10 从 `0.6000` 提到 `0.8206`，说明向量召回确实补到了更多 qrels 正例；hybrid+rerank 的 Recall@10 只小幅到 `0.8239`，但 nDCG@10 从 `0.6576` 到 `0.7307`、MRR 从 `0.6098` 到 `0.7083`，说明 reranker 主要改善排序位置，不是大幅增加候选覆盖。代价也很明显：hybrid 比 keyword 慢，rerank 在本地 CPU 上慢得更多，所以默认端到端 benchmark 仍不开 rerank。
+这组结果比 5 case 端到端 benchmark 更能说明 retriever 本身：hybrid 相对 keyword 的 Recall@10 从 `0.6000` 提到 `0.8239`，说明向量召回确实补到了更多 qrels 正例。本次 `rerank_candidate_k=10`、`top_k=10`，hybrid+rerank 只是重排 hybrid 的 top10 候选，所以 Recall@10 必须和 hybrid 一致，不能把 rerank 说成提升召回；它的价值体现在 nDCG@10 从 `0.6597` 到 `0.7307`、MRR 从 `0.6114` 到 `0.7083`，也就是相关文档排得更靠前。代价也很明显：hybrid 比 keyword 慢，rerank 在本地 CPU 上慢得更多，所以默认端到端 benchmark 仍不开 rerank。
 
 这组评测不能外推成“线上问答质量提升”。SciFact 是英文科学摘要，query/qrels 来自公开 IR benchmark，和本项目求职知识库、小规模 local corpus、中文问题不是同一分布。面试里我会把它作为“检索模块结构升级的独立证据”，同时主动说它和 DeepSeek + Wikipedia 的端到端成功率、fallback、citation retention 是两套指标。
 
@@ -293,10 +293,10 @@ benchmark 汇总：管线 plumbing 指标，mock，非真实性能。具体 late
 
 answer completeness：当前未做 LLM judge，只用 case success 间接衡量，未实测完整性。
 citation faithfulness：当前实测指标是 claim/source lexical overlap。mock plumbing run 平均 retention 是 `1.0`，只能说明 mock 引用链路没断；最新 DeepSeek v4-flash + Wikipedia 对比里，keyword baseline 平均 retention 是 `0.8867`，local hybrid 是 `0.8929`，但 hybrid success_rate 更低，说明不能只看均值。
-retrieval quality：端到端 benchmark 里的 citation_retention 会受 LLM 和 search 波动影响，所以我新增了 BEIR/scifact 独立检索评测，直接用 qrels 计算 Recall@10、nDCG@10、MRR。当前真实结果是 keyword `0.6000/0.4823/0.4548`，hybrid `0.8206/0.6576/0.6098`，hybrid+rerank `0.8239/0.7307/0.7083`。
+retrieval quality：端到端 benchmark 里的 citation_retention 会受 LLM 和 search 波动影响，所以我新增了 BEIR/scifact 独立检索评测，直接用 qrels 计算 Recall@10、nDCG@10、MRR。当前真实结果是 keyword `0.6000/0.4823/0.4548`，hybrid `0.8239/0.6597/0.6114`，hybrid+rerank `0.8239/0.7307/0.7083`。
 source diversity：当前记录 deduped_source_count，也记录 local retrieval metadata 里的 keyword/vector/rerank rank；但还没有按 domain/provider 多样性和人工相关性打分。
 hallucination rate：当前用 unsupported citation count 作为 proxy，不能覆盖无引用幻觉。
-latency：benchmark 记录每 case latency_ms，并计算 P50/P90/max；mock latency 只能作为 plumbing 回归信号，DeepSeek + Wikipedia latency 包含真实网络/API 时间，也不能当线上 SLA。local hybrid 比 keyword baseline p50 多 `6151.778ms`；独立检索评测里 keyword 平均每 query `0.3318s`，hybrid `0.5719s`，hybrid+rerank `3.4022s`，这些都需要如实讲。
+latency：benchmark 记录每 case latency_ms，并计算 P50/P90/max；mock latency 只能作为 plumbing 回归信号，DeepSeek + Wikipedia latency 包含真实网络/API 时间，也不能当线上 SLA。local hybrid 比 keyword baseline p50 多 `6151.778ms`；独立检索评测里 keyword 平均每 query `0.3070s`，hybrid `0.5781s`，hybrid+rerank `3.4431s`，这些都需要如实讲。
 cost：mock provider 成本为 0，token 用字符估算；DeepSeek provider 已接真实 usage，并按当前实现里的 v4-flash 价格常量估算成本，价格核对日期 `2026-06-07`。BEIR/scifact 独立检索评测不调用 LLM，LLM token 和 API cost 都是 0；本地 embedding/rerank 不产生 API 成本，但会产生本机 CPU/GPU 时间；DashScope 成本未实测。
 工具失败恢复：有 unit test 覆盖 primary failure fallback 和 circuit breaker open；第一次 DeepSeek + Wikipedia benchmark 出现过 fallback，修复 Wikipedia 长查询压缩后 fallback 曾降到 0，但最新 keyword/hybrid 对比里仍分别出现 `fallback_count_total=1` 和 `2`，已在第 7 节如实记录。
 multi-hop 成功率：当前没有真实 multi-hop 标注集，未实测。

@@ -195,7 +195,7 @@
 [状态: 待消化]
 标签：RAG / 评测 / BEIR
 检索关键词：BEIR, scifact, Recall@10, nDCG@10, MRR
-回答：5 case 端到端 benchmark 会混在一起考 planner、Wikipedia、synthesis、citation checker 和网络波动，所以它不能单独证明 retriever 变好了。BEIR/scifact 是公开检索 benchmark，我只加载 corpus/query/qrels，复用 `LocalRagRetriever` 跑 keyword、hybrid、hybrid+rerank，不调用 LLM 和 Wikipedia。真实结果是 keyword Recall@10 `0.6000`、nDCG@10 `0.4823`、MRR `0.4548`；hybrid 到 `0.8206`、`0.6576`、`0.6098`；hybrid+rerank 到 `0.8239`、`0.7307`、`0.7083`。我的解读是 hybrid 明显补召回，rerank 主要改善排序，但平均延迟从 `0.3318s` 到 `3.4022s`，不能默认开启。
+回答：5 case 端到端 benchmark 会混在一起考 planner、Wikipedia、synthesis、citation checker 和网络波动，所以它不能单独证明 retriever 变好了。BEIR/scifact 是公开检索 benchmark，我只加载 corpus/query/qrels，复用 `LocalRagRetriever` 跑 keyword、hybrid、hybrid+rerank，不调用 LLM 和 Wikipedia。真实结果是 keyword Recall@10 `0.6000`、nDCG@10 `0.4823`、MRR `0.4548`；hybrid 到 `0.8239`、`0.6597`、`0.6114`；hybrid+rerank 到 `0.8239`、`0.7307`、`0.7083`。这里 `rerank_candidate_k=10`、`top_k=10`，所以 rerank 只是重排同一批 top10，Recall@10 不应该也没有变化；它主要改善 nDCG/MRR，但平均延迟从 `0.5781s` 到 `3.4431s`，不能默认开启。
 关联模块：`retrieval_eval.py`, `rag.py`, `rerankers.py`, `results/retrieval_eval_scifact.json`
 可追问：
 1. SciFact 和中文知识库场景有什么差异？
