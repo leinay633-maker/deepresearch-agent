@@ -10,6 +10,7 @@ review_package/
 data/beir/
 data/runs.sqlite
 data/runs.sqlite-*
+data/vector_index/
 .env
 .env.*
 

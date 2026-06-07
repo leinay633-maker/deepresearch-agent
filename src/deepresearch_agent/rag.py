@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
@@ -98,6 +99,11 @@ class LocalRagRetriever:
             self._vector_index = ChromaVectorIndex(
                 chunks=self.chunks,
                 embedding_provider=provider,
+                persist_path=(
+                    Path(self.settings.local_vector_index_path)
+                    if self.settings.local_vector_index_persist
+                    else None
+                ),
             )
             await self._vector_index.build()
         return self._vector_index
@@ -259,11 +265,15 @@ class ChromaVectorIndex:
         self,
         chunks: list[LocalChunk],
         embedding_provider: EmbeddingProvider,
+        persist_path: Path | None = None,
     ) -> None:
         self.chunks = chunks
         self.embedding_provider = embedding_provider
+        self.persist_path = persist_path
         self.collection: Any | None = None
         self.chunk_by_id = {chunk.id: chunk for chunk in chunks}
+        self.collection_name = self._collection_name()
+        self.reused_existing = False
 
     async def build(self) -> None:
         try:
@@ -272,12 +282,28 @@ class ChromaVectorIndex:
         except ImportError as exc:
             raise RuntimeError("hybrid local retrieval requires chromadb") from exc
 
-        client = chromadb.Client(ChromaSettings(anonymized_telemetry=False))
-        collection_name = f"local_rag_{uuid.uuid4().hex[:12]}"
-        self.collection = client.create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"},
-        )
+        settings = ChromaSettings(anonymized_telemetry=False)
+        if self.persist_path is not None:
+            self.persist_path.mkdir(parents=True, exist_ok=True)
+            client = chromadb.PersistentClient(path=str(self.persist_path), settings=settings)
+            self.collection = client.get_or_create_collection(
+                name=self.collection_name,
+                metadata={"hnsw:space": "cosine"},
+            )
+            if self.collection.count() == len(self.chunks):
+                self.reused_existing = True
+                return
+            client.delete_collection(self.collection_name)
+            self.collection = client.create_collection(
+                name=self.collection_name,
+                metadata={"hnsw:space": "cosine"},
+            )
+        else:
+            client = chromadb.Client(settings)
+            self.collection = client.create_collection(
+                name=f"local_rag_{uuid.uuid4().hex[:12]}",
+                metadata={"hnsw:space": "cosine"},
+            )
         embeddings = await self.embedding_provider.embed_texts(
             [f"{chunk.title}\n{chunk.content}" for chunk in self.chunks]
         )
@@ -315,6 +341,22 @@ class ChromaVectorIndex:
                 RankedChunk(chunk=chunk, score=score, rank=index + 1, method="vector")
             )
         return ranked
+
+    def _collection_name(self) -> str:
+        digest = hashlib.sha256()
+        digest.update(self.embedding_provider.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(self.embedding_provider.model.encode("utf-8"))
+        for chunk in self.chunks:
+            digest.update(b"\0")
+            digest.update(chunk.id.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(chunk.title.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(chunk.url.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(chunk.content.encode("utf-8"))
+        return f"local_rag_{digest.hexdigest()[:16]}"
 
 
 def _tokens(text: str) -> set[str]:

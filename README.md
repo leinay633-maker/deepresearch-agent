@@ -145,6 +145,7 @@ Local retrieval：
 - `hybrid`：默认本地检索模式，关键词召回 + BGE 向量召回 + Chroma index + RRF 融合，仍输出统一 `Source`。
 - embedding provider 默认 `local`，模型是 `BAAI/bge-small-zh-v1.5`；可显式切到 `dashscope`，key 从 `DASHSCOPE_API_KEY` 读。
 - rerank provider 默认 `local`，模型是 `BAAI/bge-reranker-base`，但 `--rerank-enabled` 才会启用；也可以显式切到 DashScope rerank。
+- 持久化向量索引默认关闭；设置 `LOCAL_VECTOR_INDEX_PERSIST=true` 后会把 Chroma index 写到 `LOCAL_VECTOR_INDEX_PATH`（默认 `data/vector_index`，已 gitignore），按 corpus + embedding provider + model 指纹复用 collection。
 
 ## Project Layout
 

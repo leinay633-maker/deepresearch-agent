@@ -206,12 +206,23 @@
 [状态: 待消化]
 标签：RAG / Retriever
 检索关键词：LocalRagRetriever, local_corpus, hybrid retrieval
-回答：当前 RAG 是 `LocalRagRetriever`，读取 `data/local_corpus.jsonl` 后先分块。它支持两种模式：`keyword` 是旧基线，用 token overlap 排序；`hybrid` 是默认模式，用关键词召回和 BGE 向量召回两路并存，再用 RRF 融合。向量侧用 `sentence-transformers` 的 `BAAI/bge-small-zh-v1.5` 生成 embedding，用 Chroma 建本地 index。无论哪种模式，最后都返回统一的 `Source`，所以下游 dedup、verifier、synthesizer 不需要改。
+回答：当前 RAG 是 `LocalRagRetriever`，读取 `data/local_corpus.jsonl` 后先分块。它支持两种模式：`keyword` 是旧基线，用 token overlap 排序；`hybrid` 是默认模式，用关键词召回和 BGE 向量召回两路并存，再用 RRF 融合。向量侧用 `sentence-transformers` 的 `BAAI/bge-small-zh-v1.5` 生成 embedding，用 Chroma 建本地 index；如果设置 `LOCAL_VECTOR_INDEX_PERSIST=true`，会按 corpus 和 embedding 模型指纹复用本地 Chroma collection。无论哪种模式，最后都返回统一的 `Source`，所以下游 dedup、verifier、synthesizer 不需要改。
 关联模块：`rag.py`, `embeddings.py`, `data/local_corpus.jsonl`
 可追问：
 1. 为什么不用向量替换关键词？
 2. embedding 成本和延迟怎么控制？
 3. 本地 RAG 和 web search 冲突怎么办？
+
+## Q：为什么持久化向量索引默认不是 Qdrant/Milvus？
+[状态: 待消化]
+标签：RAG / 向量库
+检索关键词：persistent vector index, Chroma, Qdrant, Milvus
+回答：这个项目的默认要求是无外部服务也能跑通，所以我先把 Chroma 从每次临时建 index 升级成可选持久化：`LOCAL_VECTOR_INDEX_PERSIST=true` 时写到 `LOCAL_VECTOR_INDEX_PATH`，collection 名由 corpus chunk、embedding provider 和 model 指纹决定，第二次 retriever 可以直接复用，不重新 embed corpus。Qdrant/Milvus 更接近生产，但会引入服务部署、索引生命周期、并发写和运维成本；当前阶段先把检索层 contract 和本地索引复用打通。
+关联模块：`rag.py`, `config.py`, `tests/test_hybrid_retrieval.py`
+可追问：
+1. 什么时候该换 Qdrant？
+2. corpus 变了怎么重建索引？
+3. 持久化索引会不会污染测试？
 
 ## Q：为什么要做混合检索，实测效果怎么样？
 [状态: 待消化]

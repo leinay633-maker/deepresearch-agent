@@ -13,7 +13,11 @@ class StaticEmbeddingProvider(EmbeddingProvider):
     name = "static"
     model = "static-test"
 
+    def __init__(self) -> None:
+        self.batch_sizes: list[int] = []
+
     async def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        self.batch_sizes.append(len(texts))
         vectors = []
         for text in texts:
             if "neural meaning" in text or "latent idea" in text:
@@ -90,6 +94,59 @@ def test_hybrid_retrieval_fuses_keyword_and_vector_results(tmp_path: Path) -> No
     assert results[0].metadata["fusion"] == "rrf"
     assert results[0].metadata["local_doc_id"] == "vector"
     assert results[0].metadata["vector_rank"] == 1
+
+
+def test_persistent_vector_index_reuses_existing_collection(tmp_path: Path) -> None:
+    corpus = tmp_path / "corpus.jsonl"
+    index_path = tmp_path / "vector_index"
+    _write_corpus(
+        corpus,
+        [
+            {
+                "id": "keyword",
+                "title": "Keyword note",
+                "url": "file://keyword",
+                "content": "literal overlap term",
+            },
+            {
+                "id": "vector",
+                "title": "Vector note",
+                "url": "file://vector",
+                "content": "neural meaning",
+            },
+        ],
+    )
+    settings = Settings(
+        local_retrieval_mode="hybrid",
+        local_keyword_top_k=2,
+        local_vector_top_k=2,
+        local_vector_weight=4.0,
+        local_vector_index_persist=True,
+        local_vector_index_path=str(index_path),
+    )
+
+    first_provider = StaticEmbeddingProvider()
+    first = LocalRagRetriever(
+        corpus_path=corpus,
+        settings=settings,
+        embedding_provider=first_provider,
+    )
+    first_results = asyncio.run(first.retrieve("latent idea", max_results=1))
+
+    second_provider = StaticEmbeddingProvider()
+    second = LocalRagRetriever(
+        corpus_path=corpus,
+        settings=settings,
+        embedding_provider=second_provider,
+    )
+    second_results = asyncio.run(second.retrieve("latent idea", max_results=1))
+
+    assert first_results[0].metadata["local_doc_id"] == "vector"
+    assert second_results[0].metadata["local_doc_id"] == "vector"
+    assert first_provider.batch_sizes == [2, 1]
+    assert second_provider.batch_sizes == [1]
+    assert second._vector_index is not None
+    assert second._vector_index.reused_existing is True
 
 
 def _write_corpus(path: Path, rows: list[dict[str, str]]) -> None:
