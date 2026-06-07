@@ -24,6 +24,7 @@ class RunStore:
         run_id: str,
         query: str,
         require_approval: bool,
+        request_json: dict[str, Any] | None = None,
         current_stage: str = "planner",
     ) -> AgentRun:
         now = utc_now()
@@ -33,6 +34,7 @@ class RunStore:
             status="queued",
             current_stage=current_stage,  # type: ignore[arg-type]
             require_approval=require_approval,
+            request_json=request_json,
             created_at=now,
             updated_at=now,
         )
@@ -41,10 +43,11 @@ class RunStore:
                 """
                 INSERT INTO agent_runs (
                     run_id, query, status, current_stage, require_approval,
-                    plan_json, result_json, total_tokens, total_cost, error_message,
-                    leased_by, heartbeat_at, lease_expires_at, created_at, updated_at
+                    request_json, plan_json, result_json, total_tokens, total_cost,
+                    error_message, leased_by, heartbeat_at, lease_expires_at, created_at,
+                    updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run.run_id,
@@ -52,6 +55,7 @@ class RunStore:
                     run.status,
                     run.current_stage,
                     int(run.require_approval),
+                    _json_dumps(run.request_json),
                     _json_dumps(run.plan_json),
                     _json_dumps(run.result_json),
                     run.total_tokens,
@@ -97,6 +101,7 @@ class RunStore:
             "status",
             "current_stage",
             "require_approval",
+            "request_json",
             "plan_json",
             "result_json",
             "total_tokens",
@@ -155,6 +160,45 @@ class RunStore:
         if cursor.rowcount != 1:
             return None
         return self.require_run(run_id)
+
+    def claim_next_queued_run(
+        self,
+        *,
+        worker_id: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> AgentRun | None:
+        current_time = now or utc_now()
+        expires_at = current_time + timedelta(seconds=lease_seconds)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE agent_runs
+                SET leased_by = ?, heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+                WHERE run_id = (
+                    SELECT run_id FROM agent_runs
+                    WHERE status = 'queued'
+                      AND current_stage = 'planner'
+                      AND (
+                        leased_by IS NULL
+                        OR lease_expires_at IS NULL
+                        OR lease_expires_at <= ?
+                      )
+                    ORDER BY created_at ASC, updated_at ASC
+                    LIMIT 1
+                )
+                RETURNING *
+                """,
+                (
+                    worker_id,
+                    _dt(current_time),
+                    _dt(expires_at),
+                    _dt(current_time),
+                    _dt(current_time),
+                ),
+            )
+            row = cursor.fetchone()
+        return _run_from_row(row) if row is not None else None
 
     def heartbeat_lease(
         self,
@@ -345,6 +389,7 @@ class RunStore:
                     status TEXT NOT NULL,
                     current_stage TEXT NOT NULL,
                     require_approval INTEGER NOT NULL,
+                    request_json TEXT,
                     plan_json TEXT,
                     result_json TEXT,
                     total_tokens INTEGER NOT NULL DEFAULT 0,
@@ -391,6 +436,7 @@ class RunStore:
             row["name"] for row in connection.execute("PRAGMA table_info(agent_runs)").fetchall()
         }
         additions = {
+            "request_json": "ALTER TABLE agent_runs ADD COLUMN request_json TEXT",
             "leased_by": "ALTER TABLE agent_runs ADD COLUMN leased_by TEXT",
             "heartbeat_at": "ALTER TABLE agent_runs ADD COLUMN heartbeat_at TEXT",
             "lease_expires_at": "ALTER TABLE agent_runs ADD COLUMN lease_expires_at TEXT",
@@ -407,6 +453,7 @@ def _run_from_row(row: sqlite3.Row) -> AgentRun:
         status=row["status"],
         current_stage=row["current_stage"],
         require_approval=bool(row["require_approval"]),
+        request_json=_json_loads(row["request_json"]),
         plan_json=_json_loads(row["plan_json"]),
         result_json=_json_loads(row["result_json"]),
         total_tokens=int(row["total_tokens"]),
@@ -461,7 +508,7 @@ def _json_loads(value: str | None) -> dict[str, Any] | None:
 
 
 def _db_value(key: str, value: Any) -> Any:
-    if key in {"plan_json", "result_json"}:
+    if key in {"request_json", "plan_json", "result_json"}:
         return _json_dumps(value)
     if key == "require_approval":
         return int(value)

@@ -96,6 +96,11 @@ async def recover_stale_runs(request: RecoverStaleRunsRequest | None = None) -> 
     return RunController().recover_stale_runs(payload)
 
 
+@app.post("/runs/worker/next", response_model=AgentRun | None)
+async def process_next_queued_run() -> AgentRun | None:
+    return await _run_action(RunController().process_next_queued())
+
+
 @app.get("/runs/{run_id}", response_model=AgentRun)
 async def get_run(run_id: str) -> AgentRun:
     return _get_controller_run(run_id)

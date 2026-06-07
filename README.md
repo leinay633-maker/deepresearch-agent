@@ -94,6 +94,16 @@ http://127.0.0.1:8000/ui
 
 这个页面复用上面的 run control API，支持创建 mock run、查看最近 runs、编辑 planner subquestions、approve/reject/cancel，并展示 SSE events、report、sources 和 citation evidence。它是本地审核面，不包含登录权限或多人协作。
 
+创建后先排队，再由单次 worker 消费下一条 queued run：
+
+```powershell
+$deferredBody = '{"query":"How should deferred agent runs work?","search_provider":"mock","llm_provider":"mock","max_researchers":1,"max_results_per_researcher":1,"require_approval":false,"defer_execution":true}'
+$queued = Invoke-RestMethod -Method Post http://127.0.0.1:8000/runs -ContentType "application/json" -Body $deferredBody
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/runs/worker/next
+```
+
+`defer_execution=true` 只影响 run control 创建路径：系统会把本次请求快照存到 SQLite 的 `request_json`，worker 执行时从该快照恢复 provider、模型、并发数和检索参数。`/runs/worker/next` 是 SQLite 单机 worker-once 入口，当前不是 Redis/Celery worker pool。
+
 手动验证 worker lease / heartbeat：
 
 ```powershell

@@ -478,7 +478,7 @@
 [状态: 待消化]
 标签：Run Control / 状态机
 检索关键词：run_id, agent_runs
-回答：`run_id` 是一次 Agent 任务的主键。没有它，客户端断线、服务重启、用户审核和失败重试都只能靠临时内存状态。现在 `agent_runs` 用 `run_id` 记录 status、current_stage、plan_json、result_json、token/cost 和 error，API 可以随时查 `/runs/{run_id}`、`/steps`、`/trace`。
+回答：`run_id` 是一次 Agent 任务的主键。没有它，客户端断线、服务重启、用户审核和失败重试都只能靠临时内存状态。现在 `agent_runs` 用 `run_id` 记录 status、current_stage、request_json、plan_json、result_json、token/cost 和 error，API 可以随时查 `/runs/{run_id}`、`/steps`、`/trace`。
 关联模块：`run_models.py`, `run_store.py`
 可追问：
 1. run_id 怎么生成？
@@ -489,7 +489,7 @@
 [状态: 待消化]
 标签：Checkpoint / 可恢复
 检索关键词：SQLite checkpoint, agent_steps
-回答：我把 checkpoint 分两层：`agent_runs.plan_json` 存 planner 稳定输出，包括 request、brief、subquestions 和 planner cost；`agent_steps` 记录每个阶段的 start/succeeded/failed、input_json、output_json、latency_ms、token_usage、cost、error、retry_count。这样失败后能看出是哪个阶段、什么输入、什么错误。
+回答：我把 checkpoint 分三块：`agent_runs.request_json` 存创建 run 时的完整请求快照，保证 deferred worker 以后按同一组 provider、模型和并发参数恢复；`agent_runs.plan_json` 存 planner 稳定输出，包括 request、brief、subquestions 和 planner cost；`agent_steps` 记录每个阶段的 start/succeeded/failed、input_json、output_json、latency_ms、token_usage、cost、error、retry_count。这样失败后能看出是哪个阶段、什么输入、什么错误。
 关联模块：`run_store.py`, `run_control.py`
 可追问：
 1. 为什么 JSON 字段不用 pickle？
@@ -500,7 +500,7 @@
 [状态: 待消化]
 标签：Durability / SQLite
 检索关键词：restart recovery, SQLite
-回答：当前不是分布式恢复，但服务重启后可以从 SQLite 读回 run、steps、events 和 planner checkpoint。比如 run 在 `waiting_approval`，重启后用户仍可以查 `/runs/{run_id}`，然后 approve/edit/reject；如果 run failed 且已有 plan_json，`/retry` 会复用 planner 输出从 researcher 阶段重跑。
+回答：当前不是分布式恢复，但服务重启后可以从 SQLite 读回 run、steps、events、request_json 和 planner checkpoint。比如 run 在 `waiting_approval`，重启后用户仍可以查 `/runs/{run_id}`，然后 approve/edit/reject；如果 run 是 `defer_execution=true` 创建出来的 queued run，`/runs/worker/next` 可以从 request_json 恢复原始配置继续执行；如果 run failed 且已有 plan_json，`/retry` 会复用 planner 输出从 researcher 阶段重跑。
 关联模块：`run_store.py`, `run_control.py`, `api.py`
 可追问：
 1. running 中途宕机怎么办？
@@ -566,7 +566,7 @@
 [状态: 待消化]
 标签：存储 / 局限
 检索关键词：SQLite, run store limitation
-回答：SQLite 适合本地 demo、测试和单机轻量 checkpoint，但不适合高并发生产任务队列。现在我补了单机 worker lease、heartbeat 和 stale recovery，但它仍没有真正的 worker queue、跨进程抢占、复杂锁调度和水平扩展。生产化我会把 `RunStore` 抽象后面换成 Postgres/Redis/队列，但当前不引入这些，是为了不把项目变成基础设施工程。
+回答：SQLite 适合本地 demo、测试和单机轻量 checkpoint，但不适合高并发生产任务队列。现在我补了单机 worker lease、heartbeat、stale recovery，以及 `defer_execution=true` + `/runs/worker/next` 的 worker-once 消费入口；它可以演示 queued run 被 worker claim 后执行，但还不是 Redis/Celery 那种常驻 worker pool、复杂调度和水平扩展。生产化我会把 `RunStore` 抽象后面换成 Postgres/Redis/队列，但当前不引入这些，是为了不把项目变成基础设施工程。
 关联模块：`run_store.py`
 可追问：
 1. SQLite 会不会锁表？
@@ -577,18 +577,29 @@
 [状态: 待消化]
 标签：Run Control / Worker Lease
 检索关键词：worker lease, heartbeat, stale recovery
-回答：它解决的是“同一个 run 不能被两个 worker 同时执行”的问题。我在 `agent_runs` 里加了 `leased_by`、`heartbeat_at`、`lease_expires_at`，获取 lease 时用原子 SQL 条件判断空 lease、过期 lease 或同一 worker 续租。内部 planner/researcher/synthesizer/verifier 会自动 acquire/heartbeat/release，外部也可以调 `/runs/{run_id}/lease`、`/heartbeat`、`/runs/stale`、`/runs/recover-stale`。这还不是完整队列，但已经把 worker ownership 和 stale recovery 的语义打出来了。
+回答：它解决的是“同一个 run 不能被两个 worker 同时执行”的问题。我在 `agent_runs` 里加了 `leased_by`、`heartbeat_at`、`lease_expires_at`，获取 lease 时用原子 SQL 条件判断空 lease、过期 lease 或同一 worker 续租。内部 planner/researcher/synthesizer/verifier 会自动 acquire/heartbeat/release，外部也可以调 `/runs/{run_id}/lease`、`/heartbeat`、`/runs/stale`、`/runs/recover-stale`。`/runs/worker/next` 也是先 claim lease 再执行 queued run。它还不是完整队列，但已经把 worker ownership、stale recovery 和最小 worker 消费语义打出来了。
 关联模块：`run_store.py`, `run_control.py`, `api.py`
 可追问：
 1. 为什么用 lease 而不是普通 status？
 2. heartbeat 过期后怎么恢复？
 3. 这个和 Redis/Celery 还差什么？
 
+## Q：deferred run 和 worker/next 做了什么？
+[状态: 待消化]
+标签：Run Control / Worker Queue
+检索关键词：defer_execution, worker next, request_json
+回答：`CreateRunRequest` 现在有 `defer_execution`，默认还是 false，所以原来的 `/runs` 同步 planner 行为不变。显式设为 true 时，系统只创建 `queued/planner` 的 run，把完整请求写进 `agent_runs.request_json`，不产生 planner step。之后 `POST /runs/worker/next` 会用原子 SQL claim 最早的 queued run，写 `worker.claimed` event，再从 request_json 恢复本次 provider、模型、并发和检索参数执行。这个功能的重点是把“API 入队、worker 消费”的边界打通，不是宣称已经有生产级队列。
+关联模块：`run_models.py`, `run_store.py`, `run_control.py`, `api.py`
+可追问：
+1. 为什么必须存 request_json？
+2. 无 queued run 时返回什么？
+3. 为什么不直接接 Celery？
+
 ## Q：怎么从 demo 变成生产系统？
 [状态: 待消化]
 标签：生产化 / Roadmap
 检索关键词：worker queue, lease, production
-回答：下一步不是再加 provider，而是把 run control 继续生产化：真正的任务队列、worker pool、幂等阶段执行、Postgres 持久化、对象存储保存大结果、权限和审计、前端 approval 页面、provider 级限流。现在版本已经把状态机、checkpoint、单机 lease/heartbeat 边界打出来，后面替换存储和调度不会影响 Agent 主链路。
+回答：下一步不是再加 provider，而是把 run control 继续生产化：真正的任务队列、常驻 worker pool、幂等阶段执行、Postgres 持久化、对象存储保存大结果、权限和审计、provider 级限流。现在版本已经把状态机、checkpoint、request_json、单机 lease/heartbeat、worker-once 消费边界打出来，后面替换存储和调度不会影响 Agent 主链路。
 关联模块：`run_control.py`, `run_store.py`, `api.py`
 可追问：
 1. 哪一步最该先做？

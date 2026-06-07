@@ -45,6 +45,44 @@ def test_run_review_ui_and_run_list(tmp_path, monkeypatch) -> None:
     assert runs.json()[0]["run_id"] == created.json()["run_id"]
 
 
+def test_deferred_run_waits_for_worker_next(tmp_path, monkeypatch) -> None:
+    client, store = _client(tmp_path, monkeypatch)
+    body = _run_body("How should deferred worker execution work?")
+    body.update({"require_approval": False, "defer_execution": True})
+
+    created = client.post("/runs", json=body)
+    run_id = created.json()["run_id"]
+    queued = store.require_run(run_id)
+
+    assert created.status_code == 200
+    assert created.json()["status"] == "queued"
+    assert created.json()["current_stage"] == "planner"
+    assert queued.request_json is not None
+    assert queued.request_json["defer_execution"] is True
+    assert queued.request_json["max_researchers"] == 1
+    assert store.list_steps(run_id) == []
+
+    processed = client.post("/runs/worker/next")
+
+    assert processed.status_code == 200
+    assert processed.json()["run_id"] == run_id
+    assert processed.json()["status"] == "succeeded"
+    assert processed.json()["leased_by"] is None
+    assert {"planner", "researcher", "synthesizer", "verifier"} <= {
+        step.stage for step in store.list_steps(run_id)
+    }
+    assert any(event.stage == "worker" and event.status == "claimed" for event in store.list_events(run_id))
+
+
+def test_worker_next_returns_null_when_no_queued_run(tmp_path, monkeypatch) -> None:
+    client, _store = _client(tmp_path, monkeypatch)
+
+    response = client.post("/runs/worker/next")
+
+    assert response.status_code == 200
+    assert response.json() is None
+
+
 def test_run_store_lease_heartbeat_and_release(tmp_path) -> None:
     store = RunStore(tmp_path / "runs.sqlite")
     store.create_run(
@@ -130,6 +168,7 @@ def test_run_store_migrates_existing_runs_table_for_leases(tmp_path) -> None:
 
     assert run is not None
     assert run.leased_by == "worker-a"
+    assert store.require_run("migrated-run").request_json is None
 
 
 def test_run_lease_api_and_stale_recovery(tmp_path, monkeypatch) -> None:

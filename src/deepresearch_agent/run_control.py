@@ -54,8 +54,11 @@ class RunController:
             run_id=run_id,
             query=request.query,
             require_approval=request.require_approval,
+            request_json=request.model_dump(mode="json"),
         )
         self._event(run_id, "run", "queued", {"query": request.query})
+        if request.defer_execution:
+            return run
         try:
             return await self._run_planner(run_id, request)
         except Exception as exc:  # noqa: BLE001
@@ -112,11 +115,30 @@ class RunController:
         run = self.store.require_run(run_id)
         if run.plan_json is not None:
             return await self._continue_from_plan(run, retry_count=1)
-        request = CreateRunRequest(query=run.query, require_approval=False)
+        request = self._request_from_run(run, require_approval=False)
         try:
             return await self._run_planner(run_id, request, retry_count=1)
         except Exception as exc:  # noqa: BLE001
             return self._fail_run(run_id, "planner", exc, retry_count=1)
+
+    async def process_next_queued(self) -> AgentRun | None:
+        run = self.store.claim_next_queued_run(
+            worker_id=self.worker_id,
+            lease_seconds=self.settings.run_lease_seconds,
+        )
+        if run is None:
+            return None
+        self._event(
+            run.run_id,
+            "worker",
+            "claimed",
+            {"worker_id": self.worker_id},
+        )
+        request = self._request_from_run(run)
+        try:
+            return await self._run_planner(run.run_id, request)
+        except Exception as exc:  # noqa: BLE001
+            return self._fail_run(run.run_id, "planner", exc)
 
     def get_run(self, run_id: str) -> AgentRun:
         return self.store.require_run(run_id)
@@ -624,6 +646,20 @@ class RunController:
             expected = ", ".join(sorted(statuses))
             raise ValueError(f"run {run_id} status is {run.status}; expected {expected}")
         return run
+
+    def _request_from_run(
+        self,
+        run: AgentRun,
+        *,
+        require_approval: bool | None = None,
+    ) -> CreateRunRequest:
+        payload = dict(run.request_json or {"query": run.query})
+        if require_approval is not None:
+            payload["require_approval"] = require_approval
+        else:
+            payload.setdefault("require_approval", run.require_approval)
+        payload["defer_execution"] = False
+        return CreateRunRequest.model_validate(payload)
 
     def _raise_if_cancelled(self, run_id: str) -> None:
         if self.store.require_run(run_id).status == "cancelled":

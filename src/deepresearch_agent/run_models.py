@@ -35,6 +35,7 @@ class AgentRun(BaseModel):
     status: RunStatus
     current_stage: RunStage
     require_approval: bool = True
+    request_json: dict[str, Any] | None = None
     plan_json: dict[str, Any] | None = None
     result_json: dict[str, Any] | None = None
     total_tokens: int = 0
@@ -73,6 +74,7 @@ class AgentEvent(BaseModel):
 
 class CreateRunRequest(ResearchRequest):
     require_approval: bool = True
+    defer_execution: bool = False
 
 
 class RunActionResponse(BaseModel):
