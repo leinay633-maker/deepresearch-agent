@@ -97,6 +97,8 @@ open_deep_research、DeerFlow v1 均为 MIT。保持本仓库是自己重写的�
 4. 涉及面试点则更新 `INTERVIEW_QA.md`
 5. 一个干净的 git commit（commit message 说清这次做了什么、为什么）
 
+补充硬规则：每完成一个功能就立刻更新知识库，不允许把多个功能做完后最后再集中补 `KNOWLEDGE_BASE.md`；评测结果、失败、取舍和未实测项都要随功能同步落库。
+
 ---
 
 ## 5. 里程碑小结（输出后继续推进，不等我）
