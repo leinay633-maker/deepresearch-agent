@@ -139,7 +139,7 @@ def main() -> None:
     parser.add_argument(
         "--export-formats",
         default="markdown,html,json",
-        help="Comma-separated report export formats: markdown, html, json.",
+        help="Comma-separated report export formats: markdown, html, json, pdf, docx, pptx, wav.",
     )
     args = parser.parse_args()
     raise SystemExit(asyncio.run(_run(args)))

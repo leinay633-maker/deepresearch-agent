@@ -397,12 +397,12 @@
 [状态: 待消化]
 标签：Report / Optional
 检索关键词：report exporter, optional
-回答：现在已经有 `report_exporter.py`，能把 `StructuredReport` 导出成 Markdown、HTML、JSON、PDF、DOCX 和 PPTX。CLI 支持 `--export-dir`、`--export-formats markdown,html,json,pdf,docx,pptx`；导出的文件会包含 answer、sources、citation assessments 和 evidence quotes，JSON 保留完整结构化报告。PDF 用 reportlab，DOCX 用 python-docx，PPTX 用 python-pptx。我要主动说明它们是文本版报告 artifact，不是复杂排版系统；TTS 还没做。
-关联模块：`report_exporter.py`, `cli.py`, `schemas.py`
+回答：现在已经有 `report_exporter.py`，能把 `StructuredReport` 导出成 Markdown、HTML、JSON、PDF、DOCX、PPTX 和 WAV。CLI 支持 `--export-dir`、`--export-formats markdown,html,json,pdf,docx,pptx,wav`；导出的文件会包含 answer、sources、citation assessments 和 evidence quotes，JSON 保留完整结构化报告。PDF 用 reportlab，DOCX 用 python-docx，PPTX 用 python-pptx，WAV 通过 `tts.py` 的 Windows SAPI provider 把报告摘要转成语音。我会主动说明这些是 report artifact：PDF/DOCX/PPTX 是文本版，WAV 是本地语音摘要，不是复杂排版系统或 podcast 生产系统。
+关联模块：`report_exporter.py`, `tts.py`, `cli.py`, `schemas.py`
 可追问：
 1. PDF/DOCX/PPTX 为什么说是文本版？
 2. 导出会影响 citation 吗？
-3. 怎么继续做 TTS？
+3. WAV 和完整 podcast 差在哪里？
 
 # Citation Checker 模块
 

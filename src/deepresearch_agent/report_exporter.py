@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from pathlib import Path
 from typing import Iterable
 
@@ -11,15 +12,26 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
 from deepresearch_agent.schemas import StructuredReport
+from deepresearch_agent.tts import TtsProvider, WindowsSapiTtsProvider
 
 
-SUPPORTED_EXPORT_FORMATS = {"markdown", "md", "html", "json", "pdf", "docx", "pptx"}
+SUPPORTED_EXPORT_FORMATS = {
+    "markdown",
+    "md",
+    "html",
+    "json",
+    "pdf",
+    "docx",
+    "pptx",
+    "wav",
+}
 
 
 def export_report(
     report: StructuredReport,
     output_dir: str | Path,
     formats: Iterable[str] = ("markdown", "html", "json"),
+    tts_provider: TtsProvider | None = None,
 ) -> dict[str, str]:
     target_dir = Path(output_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -43,6 +55,8 @@ def export_report(
             write_report_docx(report, path)
         elif fmt == "pptx":
             write_report_pptx(report, path)
+        elif fmt == "wav":
+            write_report_wav(report, path, provider=tts_provider)
         paths[fmt] = str(path)
     return paths
 
@@ -122,6 +136,30 @@ def report_to_html(report: StructuredReport) -> str:
             "",
         ]
     )
+
+
+def report_to_tts_text(report: StructuredReport, max_chars: int = 6000) -> str:
+    parts = [
+        "DeepResearch report.",
+        f"Question: {report.query}.",
+        f"Run ID: {report.run_id}.",
+        "Answer.",
+        _speech_text(report.answer),
+        "Sources.",
+    ]
+    for source in report.sources[:5]:
+        parts.append(f"Source {source.id}: {source.title}.")
+    if report.citation_check.assessments:
+        parts.append("Citation check summary.")
+        for assessment in report.citation_check.assessments[:5]:
+            parts.append(
+                f"{assessment.support_level}. "
+                f"{_speech_text(assessment.claim)}. "
+                f"Overlap score {assessment.overlap_score}."
+            )
+    text = " ".join(part.strip() for part in parts if part.strip())
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_chars]
 
 
 def write_report_docx(report: StructuredReport, path: Path) -> None:
@@ -233,6 +271,15 @@ def write_report_pptx(report: StructuredReport, path: Path) -> None:
     presentation.save(path)
 
 
+def write_report_wav(
+    report: StructuredReport,
+    path: Path,
+    provider: TtsProvider | None = None,
+) -> None:
+    selected_provider = provider or WindowsSapiTtsProvider()
+    selected_provider.synthesize_to_wav(report_to_tts_text(report), path)
+
+
 def _normalize_format(value: str) -> str:
     fmt = value.strip().lower()
     if fmt == "md":
@@ -245,6 +292,11 @@ def _normalize_format(value: str) -> str:
 
 def _text_blocks(text: str) -> list[str]:
     return [block.strip() for block in text.strip().split("\n\n") if block.strip()]
+
+
+def _speech_text(text: str) -> str:
+    without_citations = re.sub(r"\[S(\d+)\]", r" source S\1 ", text)
+    return without_citations.replace("#", " ").replace("*", " ")
 
 
 def _docx_paragraph(document: Document, text: str, style: str | None = None) -> None:

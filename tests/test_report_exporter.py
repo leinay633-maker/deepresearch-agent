@@ -5,7 +5,7 @@ import zipfile
 
 import pytest
 
-from deepresearch_agent.report_exporter import export_report, report_to_html
+from deepresearch_agent.report_exporter import export_report, report_to_html, report_to_tts_text
 from deepresearch_agent.schemas import (
     CitationAssessment,
     CitationCheckReport,
@@ -26,14 +26,16 @@ def test_export_report_writes_markdown_html_and_json(tmp_path) -> None:
     paths = export_report(
         report,
         tmp_path,
-        formats=["markdown", "html", "json", "pdf", "docx", "pptx"],
+        formats=["markdown", "html", "json", "pdf", "docx", "pptx", "wav"],
+        tts_provider=FakeTtsProvider(),
     )
 
-    assert set(paths) == {"markdown", "html", "json", "pdf", "docx", "pptx"}
+    assert set(paths) == {"markdown", "html", "json", "pdf", "docx", "pptx", "wav"}
     markdown = (tmp_path / "run-export.md").read_text(encoding="utf-8")
     html = (tmp_path / "run-export.html").read_text(encoding="utf-8")
     payload = json.loads((tmp_path / "run-export.json").read_text(encoding="utf-8"))
     pdf = (tmp_path / "run-export.pdf").read_bytes()
+    wav = (tmp_path / "run-export.wav").read_bytes()
     with zipfile.ZipFile(tmp_path / "run-export.docx") as archive:
         docx_xml = archive.read("word/document.xml").decode("utf-8")
     with zipfile.ZipFile(tmp_path / "run-export.pptx") as archive:
@@ -47,6 +49,8 @@ def test_export_report_writes_markdown_html_and_json(tmp_path) -> None:
     assert "&lt;unsafe&gt;" in html
     assert payload["run_id"] == "run-export"
     assert pdf.startswith(b"%PDF")
+    assert wav.startswith(b"RIFF")
+    assert b"source S1" in wav
     assert "DeepResearch Report" in docx_xml
     assert "Exported reports preserve cited evidence" in docx_xml
     assert "DeepResearch Report" in pptx_xml
@@ -63,6 +67,21 @@ def test_report_to_html_escapes_answer_content() -> None:
 
     assert "<unsafe>" not in html
     assert "&lt;unsafe&gt;" in html
+
+
+def test_report_to_tts_text_expands_citation_markers() -> None:
+    text = report_to_tts_text(_report())
+
+    assert "[S1]" not in text
+    assert "source S1" in text
+    assert "Citation check summary" in text
+
+
+class FakeTtsProvider:
+    name = "fake_tts"
+
+    def synthesize_to_wav(self, text, path) -> None:
+        path.write_bytes(b"RIFF" + text.encode("utf-8"))
 
 
 def _report() -> StructuredReport:
