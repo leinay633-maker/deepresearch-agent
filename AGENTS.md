@@ -174,3 +174,57 @@ open_deep_research、DeerFlow v1 均为 MIT。保持本仓库是自己重写的�
 2. 有真实、可复现的指标（记录 seed + 配置快照）
 3. 能对着架构图讲 10 分钟不卡，答得上「为什么不是单 agent / 普通 RAG」
 4. 至少一处能讲「我在参考项目 X 上做了它没做的 Y，因为 Z」
+
+---
+
+## 9. 高阶对齐路线图（2026-06-07 起）
+
+目标：在保持本项目“收窄、可测、可解释”的前提下，补齐与 `open_deep_research`、DeerFlow v1 的主要能力差距。允许参考 MIT 项目的架构和小段实现，但每次直接迁移都必须保留许可证/来源说明，并在 `KNOWLEDGE_BASE.md` 第 9 节写清楚参考了什么、没有照搬什么、我做了哪些适配。优先级按“可信度差距 > 工具生态 > 长任务生产化 > 展示层”排序。
+
+### P0：公开 Deep Research 级评测
+
+先补端到端研究报告评测，而不是只停在 BEIR/scifact 检索指标。新增公开 benchmark 适配层，能加载 Deep Research Bench / BrowseComp / FutureX 等公开任务格式，跑完整 orchestrator，保存每题的 query、配置快照、report、sources、trace、latency、token、cost、citation 结果和失败原因。没有评测 judge key 时，默认输出可复查 artifacts；有 judge provider 时再计算 answer/citation quality。所有数字必须由脚本重跑生成。
+
+### P1：真实 Web Search 与正文抽取
+
+把 `search.py` 从 Wikipedia/mock 扩展成 provider registry。优先顺序：SearxNG（可自建、无商业锁定）、Brave/Tavily（key optional）、Jina Reader / trafilatura / readability-lxml crawler。搜索 provider 只负责候选 URL，crawler 负责正文抽取、清洗、超时、robots/HTTP 错误记录和 fallback。默认仍保证无 key 可跑。
+
+### P2：MCP 工具接入
+
+新增 MCP tool adapter，把 MCP server 暴露的 tools 统一包装成 `ToolProvider`，下游 researcher 仍看到统一 `Source` / tool result 对象。先支持 stdio/http MCP server 配置、工具白名单、超时、错误隔离、trace 记录；不要求一开始替换现有 Python adapter。
+
+### P3：动态 planning / reflection / compression
+
+把一次性 plan 扩成 bounded research loop：planner 先拆初始问题，researcher 返回 evidence gaps，reflection 判断是否需要追加子问题，compression 压缩中间 findings，达到预算/轮次/证据足够后 synthesis。所有 loop 决策必须进入 trace 和 benchmark artifacts。
+
+### P4：更强 citation faithfulness
+
+在 lexical overlap 之外增加 claim-level grounding：先抽 claim，再定位 evidence span / quote，再用可选 LLM judge 或 NLI provider 做 entailment。默认无 key 时保留 lexical checker；启用 judge 时输出 supported / unsupported / partial / unverifiable 和证据片段。
+
+### P5：前端审核页面
+
+基于已有 run control API 做最小 Web UI：run list、plan 审核/编辑、event stream、source/claim/citation 检查、报告编辑。第一版只做本地可运行，不追求复杂权限。
+
+### P6：生产级 run control
+
+把 SQLite 单机 checkpoint 演进为可替换后端：Postgres run store、Redis/队列 worker、lease/heartbeat、跨进程 cancel、阶段幂等、失败恢复和审计日志。当前 API 语义保持稳定，避免影响 orchestrator 主链路。
+
+### P7：私有知识库与持久化向量库
+
+把本地 JSONL + 临时 Chroma 升级成索引生命周期：document loader、chunk manifest、embedding cache、Qdrant/Milvus provider、增量更新、版本化索引和检索评测。默认仍保留小 JSONL 语料，保证离线 demo。
+
+### P8：多模型策略
+
+把单一 DeepSeek provider 扩成 provider/model policy：planner、researcher、synthesis、compression、judge 可以分别选模型；支持 DeepSeek、OpenAI、Anthropic/OpenRouter/Ollama 的统一接口。默认保持 DeepSeek v4-flash 或 mock，所有 key 从环境变量读取。
+
+### P9：内容导出
+
+在结构化 JSON/Markdown 之外加 Docx/PDF/PPT/TTS optional exporter。导出层必须保持 citation ID、source appendix 和评测 metadata，不能为了展示破坏可追溯性。
+
+### 执行顺序
+
+1. 先做 P0 的公开端到端 benchmark adapter 和 artifacts，因为这是目前与 open_deep_research 最大的可信度差距。
+2. 再做 P1 的搜索/crawler provider registry，让 benchmark 不再只依赖 Wikipedia。
+3. 接 P4 的 citation grounding，使端到端评测能解释“错在哪里”。
+4. 做 P3 的动态 planning loop，让系统从一次性 pipeline 接近真实 deep research agent。
+5. 再做 P2/P5/P6/P7/P8/P9，分别补工具生态、审核体验、生产控制面、私有知识库、多模型和内容交付。
