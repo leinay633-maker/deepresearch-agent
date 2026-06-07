@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -42,9 +42,9 @@ class RunStore:
                 INSERT INTO agent_runs (
                     run_id, query, status, current_stage, require_approval,
                     plan_json, result_json, total_tokens, total_cost, error_message,
-                    created_at, updated_at
+                    leased_by, heartbeat_at, lease_expires_at, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run.run_id,
@@ -57,6 +57,9 @@ class RunStore:
                     run.total_tokens,
                     run.total_cost,
                     run.error_message,
+                    run.leased_by,
+                    _dt_or_none(run.heartbeat_at),
+                    _dt_or_none(run.lease_expires_at),
                     _dt(run.created_at),
                     _dt(run.updated_at),
                 ),
@@ -99,6 +102,9 @@ class RunStore:
             "total_tokens",
             "total_cost",
             "error_message",
+            "leased_by",
+            "heartbeat_at",
+            "lease_expires_at",
         }
         updates = {key: value for key, value in fields.items() if key in allowed}
         updates["updated_at"] = utc_now()
@@ -111,6 +117,114 @@ class RunStore:
                 values,
             )
         return self.require_run(run_id)
+
+    def acquire_lease(
+        self,
+        run_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> AgentRun | None:
+        current_time = now or utc_now()
+        expires_at = current_time + timedelta(seconds=lease_seconds)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE agent_runs
+                SET leased_by = ?, heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+                WHERE run_id = ?
+                  AND status NOT IN ('succeeded', 'failed', 'cancelled')
+                  AND (
+                    leased_by IS NULL
+                    OR lease_expires_at IS NULL
+                    OR lease_expires_at <= ?
+                    OR leased_by = ?
+                  )
+                """,
+                (
+                    worker_id,
+                    _dt(current_time),
+                    _dt(expires_at),
+                    _dt(current_time),
+                    run_id,
+                    _dt(current_time),
+                    worker_id,
+                ),
+            )
+        if cursor.rowcount != 1:
+            return None
+        return self.require_run(run_id)
+
+    def heartbeat_lease(
+        self,
+        run_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> AgentRun | None:
+        current_time = now or utc_now()
+        expires_at = current_time + timedelta(seconds=lease_seconds)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE agent_runs
+                SET heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+                WHERE run_id = ?
+                  AND leased_by = ?
+                  AND status NOT IN ('succeeded', 'failed', 'cancelled')
+                """,
+                (
+                    _dt(current_time),
+                    _dt(expires_at),
+                    _dt(current_time),
+                    run_id,
+                    worker_id,
+                ),
+            )
+        if cursor.rowcount != 1:
+            return None
+        return self.require_run(run_id)
+
+    def release_lease(self, run_id: str, *, worker_id: str) -> AgentRun:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE agent_runs
+                SET leased_by = NULL, heartbeat_at = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE run_id = ? AND leased_by = ?
+                """,
+                (_dt(utc_now()), run_id, worker_id),
+            )
+        return self.require_run(run_id)
+
+    def clear_lease(self, run_id: str) -> AgentRun:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE agent_runs
+                SET leased_by = NULL, heartbeat_at = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (_dt(utc_now()), run_id),
+            )
+        return self.require_run(run_id)
+
+    def list_stale_runs(self, now: datetime | None = None) -> list[AgentRun]:
+        current_time = now or utc_now()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM agent_runs
+                WHERE status = 'running'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= ?
+                ORDER BY lease_expires_at ASC, updated_at ASC
+                """,
+                (_dt(current_time),),
+            ).fetchall()
+        return [_run_from_row(row) for row in rows]
 
     def add_step(
         self,
@@ -236,6 +350,9 @@ class RunStore:
                     total_tokens INTEGER NOT NULL DEFAULT 0,
                     total_cost REAL NOT NULL DEFAULT 0.0,
                     error_message TEXT,
+                    leased_by TEXT,
+                    heartbeat_at TEXT,
+                    lease_expires_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -267,6 +384,20 @@ class RunStore:
                 );
                 """
             )
+            self._ensure_agent_run_columns(connection)
+
+    def _ensure_agent_run_columns(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(agent_runs)").fetchall()
+        }
+        additions = {
+            "leased_by": "ALTER TABLE agent_runs ADD COLUMN leased_by TEXT",
+            "heartbeat_at": "ALTER TABLE agent_runs ADD COLUMN heartbeat_at TEXT",
+            "lease_expires_at": "ALTER TABLE agent_runs ADD COLUMN lease_expires_at TEXT",
+        }
+        for name, statement in additions.items():
+            if name not in columns:
+                connection.execute(statement)
 
 
 def _run_from_row(row: sqlite3.Row) -> AgentRun:
@@ -281,6 +412,9 @@ def _run_from_row(row: sqlite3.Row) -> AgentRun:
         total_tokens=int(row["total_tokens"]),
         total_cost=float(row["total_cost"]),
         error_message=row["error_message"],
+        leased_by=row["leased_by"],
+        heartbeat_at=_parse_dt_or_none(row["heartbeat_at"]),
+        lease_expires_at=_parse_dt_or_none(row["lease_expires_at"]),
         created_at=_parse_dt(row["created_at"]),
         updated_at=_parse_dt(row["updated_at"]),
     )
@@ -331,8 +465,8 @@ def _db_value(key: str, value: Any) -> Any:
         return _json_dumps(value)
     if key == "require_approval":
         return int(value)
-    if key == "updated_at":
-        return _dt(value)
+    if key in {"updated_at", "heartbeat_at", "lease_expires_at"}:
+        return _dt_or_none(value)
     return value
 
 
@@ -340,5 +474,15 @@ def _dt(value: datetime) -> str:
     return value.isoformat()
 
 
+def _dt_or_none(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
 def _parse_dt(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
+def _parse_dt_or_none(value: str | None) -> datetime | None:
+    if value is None:
+        return None
     return datetime.fromisoformat(value)

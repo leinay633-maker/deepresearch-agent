@@ -49,6 +49,7 @@ class Settings:
     mcp_http_url: str = ""
     mcp_search_tool: str = ""
     mcp_query_argument: str = "query"
+    run_lease_seconds: int = 120
 
 
 def _float_env(name: str, default: float) -> float:
@@ -139,4 +140,5 @@ def load_settings() -> Settings:
         mcp_http_url=os.getenv("MCP_HTTP_URL", "").strip(),
         mcp_search_tool=os.getenv("MCP_SEARCH_TOOL", "").strip(),
         mcp_query_argument=os.getenv("MCP_QUERY_ARGUMENT", "query").strip() or "query",
+        run_lease_seconds=_int_env("RUN_LEASE_SECONDS", 120),
     )

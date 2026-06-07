@@ -471,7 +471,7 @@
 关联模块：`run_store.py`, `run_control.py`, `api.py`
 可追问：
 1. running 中途宕机怎么办？
-2. 为什么现在不做 worker lease？
+2. worker lease 只能恢复哪些情况？
 3. SQLite 文件放在哪里？
 
 ## Q：cancel 和 retry 怎么设计？
@@ -533,18 +533,29 @@
 [状态: 待消化]
 标签：存储 / 局限
 检索关键词：SQLite, run store limitation
-回答：SQLite 适合本地 demo、测试和单机轻量 checkpoint，但不适合高并发生产任务队列。它没有 worker lease、跨进程抢占、复杂锁调度和水平扩展。生产化我会把 `RunStore` 抽象后面换成 Postgres/Redis/队列，但当前不引入这些，是为了不把项目变成基础设施工程。
+回答：SQLite 适合本地 demo、测试和单机轻量 checkpoint，但不适合高并发生产任务队列。现在我补了单机 worker lease、heartbeat 和 stale recovery，但它仍没有真正的 worker queue、跨进程抢占、复杂锁调度和水平扩展。生产化我会把 `RunStore` 抽象后面换成 Postgres/Redis/队列，但当前不引入这些，是为了不把项目变成基础设施工程。
 关联模块：`run_store.py`
 可追问：
 1. SQLite 会不会锁表？
 2. schema migration 怎么做？
 3. 为什么默认文件不提交？
 
+## Q：worker lease 解决什么问题？
+[状态: 待消化]
+标签：Run Control / Worker Lease
+检索关键词：worker lease, heartbeat, stale recovery
+回答：它解决的是“同一个 run 不能被两个 worker 同时执行”的问题。我在 `agent_runs` 里加了 `leased_by`、`heartbeat_at`、`lease_expires_at`，获取 lease 时用原子 SQL 条件判断空 lease、过期 lease 或同一 worker 续租。内部 planner/researcher/synthesizer/verifier 会自动 acquire/heartbeat/release，外部也可以调 `/runs/{run_id}/lease`、`/heartbeat`、`/runs/stale`、`/runs/recover-stale`。这还不是完整队列，但已经把 worker ownership 和 stale recovery 的语义打出来了。
+关联模块：`run_store.py`, `run_control.py`, `api.py`
+可追问：
+1. 为什么用 lease 而不是普通 status？
+2. heartbeat 过期后怎么恢复？
+3. 这个和 Redis/Celery 还差什么？
+
 ## Q：怎么从 demo 变成生产系统？
 [状态: 待消化]
 标签：生产化 / Roadmap
 检索关键词：worker queue, lease, production
-回答：下一步不是再加 provider，而是把 run control 生产化：任务队列、worker lease/heartbeat、幂等阶段执行、Postgres 持久化、对象存储保存大结果、权限和审计、前端 approval 页面、provider 级限流。现在版本已经把状态机和 checkpoint 边界打出来，后面替换存储和调度不会影响 Agent 主链路。
+回答：下一步不是再加 provider，而是把 run control 继续生产化：真正的任务队列、worker pool、幂等阶段执行、Postgres 持久化、对象存储保存大结果、权限和审计、前端 approval 页面、provider 级限流。现在版本已经把状态机、checkpoint、单机 lease/heartbeat 边界打出来，后面替换存储和调度不会影响 Agent 主链路。
 关联模块：`run_control.py`, `run_store.py`, `api.py`
 可追问：
 1. 哪一步最该先做？

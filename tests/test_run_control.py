@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import re
+import sqlite3
+from datetime import timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from deepresearch_agent.api import app
 from deepresearch_agent.run_store import RunStore
+from deepresearch_agent.schemas import utc_now
 
 
 def test_create_run_persists_waiting_approval(tmp_path, monkeypatch) -> None:
@@ -40,6 +43,144 @@ def test_run_review_ui_and_run_list(tmp_path, monkeypatch) -> None:
     assert "planEditor" in ui.text
     assert runs.status_code == 200
     assert runs.json()[0]["run_id"] == created.json()["run_id"]
+
+
+def test_run_store_lease_heartbeat_and_release(tmp_path) -> None:
+    store = RunStore(tmp_path / "runs.sqlite")
+    store.create_run(
+        run_id="lease-run",
+        query="How should worker leases behave?",
+        require_approval=True,
+    )
+
+    acquired = store.acquire_lease(
+        "lease-run",
+        worker_id="worker-a",
+        lease_seconds=30,
+    )
+    blocked = store.acquire_lease(
+        "lease-run",
+        worker_id="worker-b",
+        lease_seconds=30,
+    )
+    heartbeat = store.heartbeat_lease(
+        "lease-run",
+        worker_id="worker-a",
+        lease_seconds=60,
+    )
+    released = store.release_lease("lease-run", worker_id="worker-a")
+    reacquired = store.acquire_lease(
+        "lease-run",
+        worker_id="worker-b",
+        lease_seconds=30,
+    )
+    expired_same_worker = store.heartbeat_lease(
+        "lease-run",
+        worker_id="worker-b",
+        lease_seconds=30,
+        now=utc_now() + timedelta(seconds=120),
+    )
+
+    assert acquired is not None
+    assert acquired.leased_by == "worker-a"
+    assert acquired.lease_expires_at is not None
+    assert blocked is None
+    assert heartbeat is not None
+    assert heartbeat.leased_by == "worker-a"
+    assert released.leased_by is None
+    assert reacquired is not None
+    assert reacquired.leased_by == "worker-b"
+    assert expired_same_worker is not None
+    assert expired_same_worker.leased_by == "worker-b"
+
+
+def test_run_store_migrates_existing_runs_table_for_leases(tmp_path) -> None:
+    db_path = tmp_path / "runs.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE agent_runs (
+                run_id TEXT PRIMARY KEY,
+                query TEXT NOT NULL,
+                status TEXT NOT NULL,
+                current_stage TEXT NOT NULL,
+                require_approval INTEGER NOT NULL,
+                plan_json TEXT,
+                result_json TEXT,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cost REAL NOT NULL DEFAULT 0.0,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+    store = RunStore(db_path)
+    store.create_run(
+        run_id="migrated-run",
+        query="How should existing run tables migrate?",
+        require_approval=True,
+    )
+    run = store.acquire_lease(
+        "migrated-run",
+        worker_id="worker-a",
+        lease_seconds=30,
+    )
+
+    assert run is not None
+    assert run.leased_by == "worker-a"
+
+
+def test_run_lease_api_and_stale_recovery(tmp_path, monkeypatch) -> None:
+    client, store = _client(tmp_path, monkeypatch)
+    run_id = client.post("/runs", json=_run_body("How should worker leases be exposed?")).json()["run_id"]
+
+    lease = client.post(
+        f"/runs/{run_id}/lease",
+        json={"worker_id": "worker-a", "lease_seconds": 60},
+    )
+    conflict = client.post(
+        f"/runs/{run_id}/lease",
+        json={"worker_id": "worker-b", "lease_seconds": 60},
+    )
+    heartbeat = client.post(
+        f"/runs/{run_id}/heartbeat",
+        json={"worker_id": "worker-a", "lease_seconds": 60},
+    )
+
+    stale_id = "stale-run"
+    store.create_run(
+        run_id=stale_id,
+        query="How should stale worker runs recover?",
+        require_approval=False,
+    )
+    store.update_run(stale_id, status="running", current_stage="researcher")
+    store.acquire_lease(
+        stale_id,
+        worker_id="stale-worker",
+        lease_seconds=1,
+        now=utc_now() - timedelta(seconds=10),
+    )
+    stale = client.get("/runs/stale")
+    recovered = client.post(
+        "/runs/recover-stale",
+        json={"reason": "lease expired in test"},
+    )
+
+    assert lease.status_code == 200
+    assert lease.json()["leased_by"] == "worker-a"
+    assert conflict.status_code == 409
+    assert heartbeat.status_code == 200
+    assert heartbeat.json()["heartbeat_at"] is not None
+    assert stale.status_code == 200
+    assert any(item["run_id"] == stale_id for item in stale.json())
+    assert recovered.status_code == 200
+    assert recovered.json()[0]["run_id"] == stale_id
+    assert recovered.json()[0]["status"] == "failed"
+    assert recovered.json()[0]["leased_by"] is None
+    assert store.require_run(stale_id).error_message == "lease expired in test"
+    assert any(event.status == "stale_recovered" for event in store.list_events(stale_id))
 
 
 def test_approve_continues_to_succeeded(tmp_path, monkeypatch) -> None:

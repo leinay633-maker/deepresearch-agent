@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from typing import Any, Literal
 
@@ -39,6 +40,9 @@ class AgentRun(BaseModel):
     total_tokens: int = 0
     total_cost: float = 0.0
     error_message: str | None = None
+    leased_by: str | None = None
+    heartbeat_at: datetime | None = None
+    lease_expires_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -90,6 +94,19 @@ class EditPlanRequest(BaseModel):
 
 class RejectRunRequest(BaseModel):
     reason: str = "planner output rejected"
+
+
+def _default_worker_id() -> str:
+    return f"api-{uuid.uuid4().hex[:8]}"
+
+
+class RunLeaseRequest(BaseModel):
+    worker_id: str = Field(default_factory=_default_worker_id)
+    lease_seconds: int = Field(default=120, ge=1, le=3600)
+
+
+class RecoverStaleRunsRequest(BaseModel):
+    reason: str = "run lease expired"
 
 
 class RunTrace(BaseModel):

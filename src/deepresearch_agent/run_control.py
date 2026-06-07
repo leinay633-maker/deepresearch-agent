@@ -14,7 +14,9 @@ from deepresearch_agent.run_models import (
     ApprovalPayload,
     CreateRunRequest,
     EditPlanRequest,
+    RecoverStaleRunsRequest,
     RejectRunRequest,
+    RunLeaseRequest,
     RunActionResponse,
     RunTrace,
 )
@@ -44,6 +46,7 @@ class RunController:
     ) -> None:
         self.settings = settings or load_settings()
         self.store = store or RunStore(settings=self.settings)
+        self.worker_id = f"worker-{uuid.uuid4().hex[:8]}"
 
     async def create_run(self, request: CreateRunRequest) -> AgentRun:
         run_id = uuid.uuid4().hex[:12]
@@ -81,28 +84,32 @@ class RunController:
     def reject(self, run_id: str, request: RejectRunRequest) -> AgentRun:
         self._require_status(run_id, {"waiting_approval"})
         self._event(run_id, "approval", "rejected", {"reason": request.reason})
-        return self.store.update_run(
+        self.store.update_run(
             run_id,
             status="cancelled",
             current_stage="completed",
             error_message=request.reason,
         )
+        return self.store.clear_lease(run_id)
 
     def cancel(self, run_id: str) -> AgentRun:
         run = self.store.require_run(run_id)
         if run.status in TERMINAL_STATUSES:
             return run
         self._event(run_id, "run", "cancelled", {"previous_status": run.status})
-        return self.store.update_run(
+        self.store.update_run(
             run_id,
             status="cancelled",
             current_stage="completed",
             error_message="run cancelled",
         )
+        return self.store.clear_lease(run_id)
 
     async def retry(self, run_id: str) -> AgentRun:
         run = self._require_status(run_id, {"failed"})
         self._event(run_id, "run", "retrying", {})
+        self.store.update_run(run_id, status="queued", error_message=None)
+        run = self.store.require_run(run_id)
         if run.plan_json is not None:
             return await self._continue_from_plan(run, retry_count=1)
         request = CreateRunRequest(query=run.query, require_approval=False)
@@ -116,6 +123,71 @@ class RunController:
 
     def list_runs(self, limit: int = 20) -> list[AgentRun]:
         return self.store.list_runs(limit=limit)
+
+    def acquire_lease(self, run_id: str, request: RunLeaseRequest) -> AgentRun:
+        run = self.store.acquire_lease(
+            run_id,
+            worker_id=request.worker_id,
+            lease_seconds=request.lease_seconds,
+        )
+        if run is None:
+            self.store.require_run(run_id)
+            raise ValueError(f"run {run_id} lease is held by another worker or terminal")
+        self._event(
+            run_id,
+            "lease",
+            "acquired",
+            {
+                "worker_id": request.worker_id,
+                "lease_expires_at": run.lease_expires_at.isoformat()
+                if run.lease_expires_at
+                else None,
+            },
+        )
+        return self.store.require_run(run_id)
+
+    def heartbeat_lease(self, run_id: str, request: RunLeaseRequest) -> AgentRun:
+        run = self.store.heartbeat_lease(
+            run_id,
+            worker_id=request.worker_id,
+            lease_seconds=request.lease_seconds,
+        )
+        if run is None:
+            self.store.require_run(run_id)
+            raise ValueError(f"run {run_id} lease heartbeat rejected")
+        self._event(
+            run_id,
+            "lease",
+            "heartbeat",
+            {
+                "worker_id": request.worker_id,
+                "lease_expires_at": run.lease_expires_at.isoformat()
+                if run.lease_expires_at
+                else None,
+            },
+        )
+        return self.store.require_run(run_id)
+
+    def stale_runs(self) -> list[AgentRun]:
+        return self.store.list_stale_runs()
+
+    def recover_stale_runs(self, request: RecoverStaleRunsRequest) -> list[AgentRun]:
+        recovered: list[AgentRun] = []
+        for run in self.store.list_stale_runs():
+            self._step(run.run_id, run.current_stage, "failed", error=request.reason)
+            self._event(
+                run.run_id,
+                "lease",
+                "stale_recovered",
+                {"reason": request.reason, "leased_by": run.leased_by},
+            )
+            self.store.update_run(
+                run.run_id,
+                status="failed",
+                error_message=request.reason,
+            )
+            recovered.append(self.store.clear_lease(run.run_id))
+        return recovered
 
     def steps(self, run_id: str):
         self.store.require_run(run_id)
@@ -165,6 +237,7 @@ class RunController:
         request: CreateRunRequest,
         retry_count: int = 0,
     ) -> AgentRun:
+        self._acquire_execution_lease(run_id)
         self.store.update_run(run_id, status="running", current_stage="planner")
         self._event(run_id, "planner", "started", {"query": request.query})
         started_at = time.perf_counter()
@@ -221,11 +294,12 @@ class RunController:
                 "waiting_approval",
                 self.approval_payload_data(plan_state),
             )
-            return self.store.update_run(
+            waiting = self.store.update_run(
                 run_id,
                 status="waiting_approval",
                 current_stage="approval",
             )
+            return self._release_execution_lease(waiting.run_id)
         return await self._continue_from_plan(self.store.require_run(run_id), retry_count=retry_count)
 
     async def _continue_from_plan(
@@ -233,6 +307,7 @@ class RunController:
         run: AgentRun,
         retry_count: int = 0,
     ) -> AgentRun:
+        run = self._acquire_execution_lease(run.run_id)
         if run.status == "cancelled":
             return run
         plan_state = self._plan_state(run)
@@ -327,7 +402,7 @@ class RunController:
             trace_events=trace.events,
         )
         self._event(run_id, "run", "succeeded", metrics)
-        return self.store.update_run(
+        self.store.update_run(
             run_id,
             status="succeeded",
             current_stage="completed",
@@ -336,6 +411,7 @@ class RunController:
             total_cost=total_cost.total_estimated_cost_usd,
             error_message=None,
         )
+        return self._release_execution_lease(run_id)
 
     async def _run_researcher_stage(
         self,
@@ -348,6 +424,7 @@ class RunController:
         max_researchers: int,
         retry_count: int,
     ) -> tuple[list[Finding], int, int, list[Source], list[Source]]:
+        self._heartbeat_execution_lease(run_id)
         self.store.update_run(run_id, status="running", current_stage="researcher")
         self._event(run_id, "researcher", "started", {"subquestion_count": len(plan)})
         started_at = time.perf_counter()
@@ -422,6 +499,7 @@ class RunController:
         cost: CostTracker,
         retry_count: int,
     ) -> tuple[str, list[str], CostSummary]:
+        self._heartbeat_execution_lease(run_id)
         self.store.update_run(run_id, status="running", current_stage="synthesizer")
         self._event(run_id, "synthesizer", "started", {"source_count": len(sources)})
         started_at = time.perf_counter()
@@ -457,6 +535,7 @@ class RunController:
         orchestrator: DeepResearchOrchestrator,
         retry_count: int,
     ):
+        self._heartbeat_execution_lease(run_id)
         self.store.update_run(run_id, status="running", current_stage="verifier")
         self._event(run_id, "verifier", "started", {"claim_count": len(claims)})
         started_at = time.perf_counter()
@@ -537,6 +616,29 @@ class RunController:
         if self.store.require_run(run_id).status == "cancelled":
             raise RuntimeError("run cancelled")
 
+    def _acquire_execution_lease(self, run_id: str) -> AgentRun:
+        run = self.store.acquire_lease(
+            run_id,
+            worker_id=self.worker_id,
+            lease_seconds=self.settings.run_lease_seconds,
+        )
+        if run is None:
+            raise RuntimeError(f"run {run_id} lease is unavailable")
+        return run
+
+    def _heartbeat_execution_lease(self, run_id: str) -> AgentRun:
+        run = self.store.heartbeat_lease(
+            run_id,
+            worker_id=self.worker_id,
+            lease_seconds=self.settings.run_lease_seconds,
+        )
+        if run is None:
+            raise RuntimeError(f"run {run_id} lease heartbeat rejected")
+        return run
+
+    def _release_execution_lease(self, run_id: str) -> AgentRun:
+        return self.store.release_lease(run_id, worker_id=self.worker_id)
+
     def _fail_run(
         self,
         run_id: str,
@@ -553,12 +655,13 @@ class RunController:
             retry_count=retry_count,
         )
         self._event(run_id, stage, "failed", {"error": message})
-        return self.store.update_run(
+        self.store.update_run(
             run_id,
             status="failed",
             current_stage=stage if stage in {"planner", "researcher", "synthesizer", "verifier"} else "completed",
             error_message=message,
         )
+        return self.store.clear_lease(run_id)
 
     def approval_payload_data(self, plan_state: dict[str, Any]) -> dict[str, Any]:
         return {

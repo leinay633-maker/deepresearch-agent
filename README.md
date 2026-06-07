@@ -59,6 +59,18 @@ http://127.0.0.1:8000/ui
 
 这个页面复用上面的 run control API，支持创建 mock run、查看最近 runs、编辑 planner subquestions、approve/reject/cancel，并展示 SSE events、report、sources 和 citation evidence。它是本地审核面，不包含登录权限或多人协作。
 
+手动验证 worker lease / heartbeat：
+
+```powershell
+$leaseBody = '{"worker_id":"demo-worker","lease_seconds":120}'
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/runs/$($run.run_id)/lease -ContentType "application/json" -Body $leaseBody
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/runs/$($run.run_id)/heartbeat -ContentType "application/json" -Body $leaseBody
+Invoke-RestMethod http://127.0.0.1:8000/runs/stale
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/runs/recover-stale -ContentType "application/json" -Body '{"reason":"manual stale lease recovery"}'
+```
+
+Lease 目前用于 SQLite 单机 worker ownership 和 stale run recovery，不是完整分布式任务队列。
+
 订阅持久化 run 事件，断线后可用 `Last-Event-ID` 续传：
 
 ```powershell

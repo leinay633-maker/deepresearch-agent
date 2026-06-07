@@ -17,7 +17,9 @@ from deepresearch_agent.run_models import (
     AgentStep,
     CreateRunRequest,
     EditPlanRequest,
+    RecoverStaleRunsRequest,
     RejectRunRequest,
+    RunLeaseRequest,
     RunTrace,
 )
 from deepresearch_agent.schemas import ResearchRequest, StructuredReport
@@ -83,6 +85,17 @@ async def list_runs(limit: int = 20) -> list[AgentRun]:
     return RunController().list_runs(limit=bounded_limit)
 
 
+@app.get("/runs/stale", response_model=list[AgentRun])
+async def list_stale_runs() -> list[AgentRun]:
+    return RunController().stale_runs()
+
+
+@app.post("/runs/recover-stale", response_model=list[AgentRun])
+async def recover_stale_runs(request: RecoverStaleRunsRequest | None = None) -> list[AgentRun]:
+    payload = request or RecoverStaleRunsRequest()
+    return RunController().recover_stale_runs(payload)
+
+
 @app.get("/runs/{run_id}", response_model=AgentRun)
 async def get_run(run_id: str) -> AgentRun:
     return _get_controller_run(run_id)
@@ -121,6 +134,16 @@ async def cancel_run(run_id: str) -> AgentRun:
 @app.post("/runs/{run_id}/retry", response_model=AgentRun)
 async def retry_run(run_id: str) -> AgentRun:
     return await _run_action(RunController().retry(run_id))
+
+
+@app.post("/runs/{run_id}/lease", response_model=AgentRun)
+async def acquire_run_lease(run_id: str, request: RunLeaseRequest) -> AgentRun:
+    return _sync_run_action(lambda: RunController().acquire_lease(run_id, request))
+
+
+@app.post("/runs/{run_id}/heartbeat", response_model=AgentRun)
+async def heartbeat_run_lease(run_id: str, request: RunLeaseRequest) -> AgentRun:
+    return _sync_run_action(lambda: RunController().heartbeat_lease(run_id, request))
 
 
 @app.get("/runs/{run_id}/events")
