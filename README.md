@@ -31,6 +31,27 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8000/research `
 curl.exe -N -X POST http://127.0.0.1:8000/research/stream -H "Content-Type: application/json" -d "{\"query\":\"How should agent tools fail safely?\"}"
 ```
 
+创建可审核的长任务 run，并在 planner 后 approve 继续：
+
+```powershell
+$body = '{"query":"How should agent run control reduce wasted LLM cost?","search_provider":"mock","llm_provider":"mock","max_researchers":1,"max_results_per_researcher":1,"require_approval":true}'
+$run = Invoke-RestMethod -Method Post http://127.0.0.1:8000/runs -ContentType "application/json" -Body $body
+$run.run_id
+Invoke-RestMethod http://127.0.0.1:8000/runs/$($run.run_id)
+Invoke-RestMethod http://127.0.0.1:8000/runs/$($run.run_id)/steps
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/runs/$($run.run_id)/approve
+Invoke-RestMethod http://127.0.0.1:8000/runs/$($run.run_id)/trace
+```
+
+订阅持久化 run 事件，断线后可用 `Last-Event-ID` 续传：
+
+```powershell
+curl.exe -N http://127.0.0.1:8000/runs/<run_id>/events
+curl.exe -N http://127.0.0.1:8000/runs/<run_id>/events -H "Last-Event-ID: 2"
+```
+
+Run control 默认 SQLite 文件是 `data/runs.sqlite`，可用 `RUN_STORE_PATH` 覆盖。默认路径已被 `.gitignore` 忽略。
+
 运行 benchmark：
 
 ```powershell
@@ -80,6 +101,9 @@ Local retrieval：
 src/deepresearch_agent/
   api.py              FastAPI + SSE endpoints
   orchestrator.py     End-to-end research spine
+  run_control.py      Run state machine, approval, cancel, retry
+  run_store.py        SQLite run/step/event checkpoint store
+  run_models.py       Pydantic models for run control API
   llm.py              Mock and DeepSeek structured-output model providers
   search.py           Search adapters, retry, timeout, circuit breaker, fallback
   rag.py              Local keyword/vector hybrid RAG retriever

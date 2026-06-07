@@ -384,6 +384,140 @@
 2. 用户界面怎么显示？
 3. 是否应该自动重写？
 
+# Agent Run Control Plane
+
+## Q：为什么 DeepResearch 是长任务？
+[状态: 待消化]
+标签：Run Control / Agent 后端
+检索关键词：long running agent, run control
+回答：DeepResearch 不是一次模型调用，它至少包含 planner、多个 researcher 并发检索、source dedup、synthesis、citation check。真实 provider 下每一步都可能耗时、失败、fallback 或方向跑偏，所以我给它加了 `run_id`、状态机、checkpoint 和 event stream，让它从脚本式调用变成可管理的后端长任务。
+关联模块：`run_control.py`, `run_store.py`, `api.py`
+可追问：
+1. 哪些阶段最容易失败？
+2. 为什么普通 request log 不够？
+3. 长任务如何避免重复执行？
+
+## Q：为什么需要 run_id？
+[状态: 待消化]
+标签：Run Control / 状态机
+检索关键词：run_id, agent_runs
+回答：`run_id` 是一次 Agent 任务的主键。没有它，客户端断线、服务重启、用户审核和失败重试都只能靠临时内存状态。现在 `agent_runs` 用 `run_id` 记录 status、current_stage、plan_json、result_json、token/cost 和 error，API 可以随时查 `/runs/{run_id}`、`/steps`、`/trace`。
+关联模块：`run_models.py`, `run_store.py`
+可追问：
+1. run_id 怎么生成？
+2. run 状态有哪些？
+3. result_json 什么时候写入？
+
+## Q：checkpoint 存什么？
+[状态: 待消化]
+标签：Checkpoint / 可恢复
+检索关键词：SQLite checkpoint, agent_steps
+回答：我把 checkpoint 分两层：`agent_runs.plan_json` 存 planner 稳定输出，包括 request、brief、subquestions 和 planner cost；`agent_steps` 记录每个阶段的 start/succeeded/failed、input_json、output_json、latency_ms、token_usage、cost、error、retry_count。这样失败后能看出是哪个阶段、什么输入、什么错误。
+关联模块：`run_store.py`, `run_control.py`
+可追问：
+1. 为什么 JSON 字段不用 pickle？
+2. 哪个 checkpoint 最关键？
+3. step trace 和 event 有什么区别？
+
+## Q：服务挂了怎么恢复？
+[状态: 待消化]
+标签：Durability / SQLite
+检索关键词：restart recovery, SQLite
+回答：当前不是分布式恢复，但服务重启后可以从 SQLite 读回 run、steps、events 和 planner checkpoint。比如 run 在 `waiting_approval`，重启后用户仍可以查 `/runs/{run_id}`，然后 approve/edit/reject；如果 run failed 且已有 plan_json，`/retry` 会复用 planner 输出从 researcher 阶段重跑。
+关联模块：`run_store.py`, `run_control.py`, `api.py`
+可追问：
+1. running 中途宕机怎么办？
+2. 为什么现在不做 worker lease？
+3. SQLite 文件放在哪里？
+
+## Q：cancel 和 retry 怎么设计？
+[状态: 待消化]
+标签：Run Control / Failure Recovery
+检索关键词：cancel, retry, failed run
+回答：`cancel` 会把非终态 run 标成 `cancelled`，后续 approve 会被拒绝；当前同步 mock 路径主要覆盖 waiting_approval 后取消。`retry` 只允许 failed run，优先复用 planner checkpoint，从 researcher 阶段重新跑，并在 step 里写 `retry_count=1`、event 里写 `retrying`。这不是精确恢复到某个 researcher 内部，而是可解释的稳定 checkpoint 重跑。
+关联模块：`run_control.py`, `tests/test_run_control.py`
+可追问：
+1. 为什么 retry 不重跑 planner？
+2. running 时取消有什么局限？
+3. retry 怎么避免无限循环？
+
+## Q：为什么 planner 后要 human-in-the-loop？
+[状态: 待消化]
+标签：HITL / Planner
+检索关键词：human in the loop, approval gate
+回答：planner 一旦方向错，后面的 researcher、search、synthesis 都会沿着错误方向花 token 和时间。我的 approval gate 放在 planner 后：`POST /runs` 先进入 `waiting_approval`，返回 plan/subquestions/estimated_researcher_count/risk_note，用户可以 approve、edit 或 reject。这样把人为判断放在成本放大之前。
+关联模块：`run_control.py`, `run_models.py`
+可追问：
+1. 为什么不在 synthesis 后审核？
+2. edit plan 保存在哪里？
+3. 审核会不会拖慢系统？
+
+## Q：HITL 怎么避免 token 浪费？
+[状态: 待消化]
+标签：成本控制 / HITL
+检索关键词：approval, token cost
+回答：HITL 不能让 planner 本身免费，但能阻止错误 plan 继续触发 researcher 检索和 synthesis。尤其真实 DeepSeek/Wikipedia 路径下，后续阶段才是主要延迟和成本来源。当前 `agent_runs` 会记录 total_tokens/total_cost，`agent_steps` 也记录阶段 token_usage/cost，所以能看到审核前后成本边界。
+关联模块：`run_control.py`, `cost.py`, `run_store.py`
+可追问：
+1. planner 本身成本怎么控制？
+2. 用户 edit 后是否复用 planner cost？
+3. 如何给用户展示预计成本？
+
+## Q：SSE 断线怎么续传？
+[状态: 待消化]
+标签：SSE / 可观测性
+检索关键词：Last-Event-ID, SSE replay
+回答：新 `/runs/{run_id}/events` 不是只读内存队列，而是从 `agent_events` 读取持久化 event。每个 event 有自增 `event_id`，SSE 输出里也写 `id:`。客户端断线后带 `Last-Event-ID`，服务端先补发这个 id 之后的历史事件；如果 run 还没到终态或 waiting_approval，再继续轮询新事件。
+关联模块：`api.py`, `run_store.py`
+可追问：
+1. event_id 如何保证单调？
+2. 和 `/research/stream` 有什么区别？
+3. 多客户端订阅怎么办？
+
+## Q：为什么不用 LangGraph 直接重写？
+[状态: 待消化]
+标签：架构取舍 / LangGraph
+检索关键词：LangGraph durable execution, lightweight control plane
+回答：我借鉴的是 LangGraph 的 durable execution、checkpoint、human-in-the-loop 思想，但没有把项目迁到 LangGraph。原因是现有 FastAPI + 自定义 orchestrator 已经能讲清主链路，这次目标是补 run 管理能力，而不是框架重构。轻量 SQLite control plane 更符合这个求职展示项目的范围。
+关联模块：`run_control.py`, `orchestrator.py`, `KNOWLEDGE_BASE.md`
+可追问：
+1. 什么情况下会迁移 LangGraph？
+2. 当前实现缺少 LangGraph 哪些能力？
+3. checkpoint 怎么映射成 graph node？
+
+## Q：SQLite 的局限是什么？
+[状态: 待消化]
+标签：存储 / 局限
+检索关键词：SQLite, run store limitation
+回答：SQLite 适合本地 demo、测试和单机轻量 checkpoint，但不适合高并发生产任务队列。它没有 worker lease、跨进程抢占、复杂锁调度和水平扩展。生产化我会把 `RunStore` 抽象后面换成 Postgres/Redis/队列，但当前不引入这些，是为了不把项目变成基础设施工程。
+关联模块：`run_store.py`
+可追问：
+1. SQLite 会不会锁表？
+2. schema migration 怎么做？
+3. 为什么默认文件不提交？
+
+## Q：怎么从 demo 变成生产系统？
+[状态: 待消化]
+标签：生产化 / Roadmap
+检索关键词：worker queue, lease, production
+回答：下一步不是再加 provider，而是把 run control 生产化：任务队列、worker lease/heartbeat、幂等阶段执行、Postgres 持久化、对象存储保存大结果、权限和审计、前端 approval 页面、provider 级限流。现在版本已经把状态机和 checkpoint 边界打出来，后面替换存储和调度不会影响 Agent 主链路。
+关联模块：`run_control.py`, `run_store.py`, `api.py`
+可追问：
+1. 哪一步最该先做？
+2. 如何处理重复 approve？
+3. 大 result_json 怎么存？
+
+## Q：这和普通日志有什么区别？
+[状态: 待消化]
+标签：可观测性 / Checkpoint
+检索关键词：step trace, checkpoint, audit
+回答：普通日志主要是事后排查文本；这里的 step trace 是结构化 checkpoint，能驱动 API 查询、retry、SSE replay 和审计。比如 planner step 的 output_json 可以直接作为 approval payload，failed step 的 input_json/error 可以定位重试边界，agent_events 可以按 Last-Event-ID 续传。这已经不只是日志，而是 run lifecycle 的数据模型。
+关联模块：`run_store.py`, `api.py`
+可追问：
+1. step trace 会不会太大？
+2. 哪些字段不能记录？
+3. 如何做隐私脱敏？
+
 # Cost Tracker 与可观测性
 
 ## Q：Cost Tracker 记录什么？

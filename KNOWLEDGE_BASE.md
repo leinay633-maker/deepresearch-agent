@@ -1,6 +1,6 @@
 # 0 项目一句话介绍
 
-本项目是我从空仓库开始手写的一个收窄版 DeepResearch Agent，目标不是复刻大而全的 open_deep_research，而是把「问题澄清、research brief、并发 researcher、来源去重、带引用合成、citation check、trace 和 benchmark」这条主链路做干净。它解决的是普通 RAG 一次性检索后直接回答时，难以解释检索路径、引用是否支撑论断、工具失败如何降级的问题。当前版本默认使用 mock LLM 和 mock search，保证无 API key 也能一条命令跑通；同时已经接入 DeepSeek 真实 LLM provider、Wikipedia 真实检索 adapter，以及本地关键词 + 向量 + RRF 融合的 hybrid local retrieval。这个项目体现的 Agent 后端能力主要是多阶段编排、并发工具调用、失败兜底、混合检索、可观测性、成本归因和可复现评测。
+本项目是我从空仓库开始手写的一个收窄版 DeepResearch Agent，目标不是复刻大而全的 open_deep_research，而是把「问题澄清、research brief、并发 researcher、来源去重、带引用合成、citation check、trace 和 benchmark」这条主链路做干净，并补上可管理的 run control plane。它解决的是普通 RAG 一次性检索后直接回答时，难以解释检索路径、引用是否支撑论断、工具失败如何降级的问题。当前版本默认使用 mock LLM 和 mock search，保证无 API key 也能一条命令跑通；同时已经接入 DeepSeek 真实 LLM provider、Wikipedia 真实检索 adapter、本地关键词 + 向量 + RRF 融合的 hybrid local retrieval，以及 SQLite run_id / checkpoint / HITL / SSE replay 控制平面。这个项目体现的 Agent 后端能力主要是多阶段编排、并发工具调用、失败兜底、混合检索、可观测性、成本归因、可复现评测和长任务状态管理。
 
 # 1 岗位匹配
 
@@ -10,7 +10,7 @@
 
 # 2 总体架构
 
-API 层：`src/deepresearch_agent/api.py`。输入是 `ResearchRequest`，输出是 `StructuredReport`。提供 `/research` JSON 接口、`/research/stream` SSE 接口和 `/health`。我参考 FastAPI + LangGraph 模板时只吸收了「服务层薄封装、每次请求创建编排器、接口返回结构化对象」这个思路，没有引入 JWT、数据库、Langfuse 或 Prometheus。
+API 层：`src/deepresearch_agent/api.py`。输入是 `ResearchRequest` 或 `CreateRunRequest`，输出是 `StructuredReport`、`AgentRun` 或 run trace。保留 `/research` JSON 接口、`/research/stream` SSE 接口和 `/health`；新增 `/runs`、`/runs/{run_id}/approve`、`/edit`、`/reject`、`/cancel`、`/retry`、`/steps`、`/events`、`/trace`。我参考 FastAPI + LangGraph 模板时只吸收了「服务层薄封装、每次请求创建编排器、接口返回结构化对象」这个思路，没有引入 JWT、Postgres、Redis、Langfuse 或 Prometheus。
 
 Agent 编排层：`src/deepresearch_agent/orchestrator.py`。输入是用户 query 和配置，输出是完整报告。它按 clarify/normalize、planner、并发 researcher、source dedup、synthesizer、citation check 的顺序执行。这里我没有直接用 LangGraph，是因为当前目标是可讲清楚的收窄项目，轻量 orchestrator 更便于展示每个阶段的输入输出和失败边界。
 
@@ -21,6 +21,8 @@ Agent 编排层：`src/deepresearch_agent/orchestrator.py`。输入是用户 que
 评测层：`src/deepresearch_agent/benchmark.py`、`src/deepresearch_agent/retrieval_eval.py`、`data/benchmark_cases.jsonl`、`tests/`。端到端 benchmark 固定 seed 和配置快照，记录 latency、tokens、cost、source count、citation retention、success；独立检索评测只加载 BEIR/scifact 的 corpus/query/qrels，计算 Recall@10、nDCG@10 和 MRR，不调用 LLM、Wikipedia 或 orchestrator 主链路。
 
 可观测层：`src/deepresearch_agent/tracing.py`、`src/deepresearch_agent/cost.py`。Trace 每阶段写 JSONL，Cost 按 brief_generation、planning、synthesis 归因 token 和成本；mock 路径仍是字符数近似，DeepSeek 路径使用 provider 返回的真实 usage。
+
+Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_agent/run_store.py`、`src/deepresearch_agent/run_control.py`。输入是 run create/approval/cancel/retry 请求，输出是持久化 run 状态、step trace、event stream 和最终 report checkpoint。它用 SQLite 保存 `agent_runs`、`agent_steps`、`agent_events`，默认文件是 `data/runs.sqlite`，可以用 `RUN_STORE_PATH` 覆盖；测试用临时 SQLite 文件。
 
 # 3 核心流程
 
@@ -110,6 +112,15 @@ Agent 编排层：`src/deepresearch_agent/orchestrator.py`。输入是用户 que
 代价：SciFact 是英文科学摘要任务，所以评测时 embedding 模型切到 `BAAI/bge-small-en-v1.5`，不等于中文求职知识库场景；本地 reranker 在 CPU 上明显变慢，hybrid+rerank 的平均 query latency 到 `3.4431s`。
 面试怎么答：我会说端到端 benchmark 看系统整体，BEIR/scifact 看检索模块本身；这次独立评测证明 hybrid 的 Recall@10 从 `0.6000` 到 `0.8239`。因为本次 `rerank_candidate_k=10` 且 `top_k=10`，rerank 只重排同一批 top10 候选，所以 Recall@10 与 hybrid 保持一致；它主要提升排序质量，把 nDCG@10 从 `0.6597` 提到 `0.7307`，但延迟代价也很明显。
 
+## 决策 10：为什么做轻量 Run Control Plane 而不是迁移 LangGraph
+
+背景：DeepResearch 不是一个瞬时 CRUD 请求，planner、多个 researcher、synthesis、citation check 都可能耗时、失败或方向跑偏；原来的 `/research` 更像一次性脚本调用，服务重启后只能看本地 JSONL trace，不能管理 run 生命周期。
+可选方案：直接迁移 LangGraph durable execution；引入 Redis/Postgres/队列；在现有 FastAPI + async pipeline 外包一层轻量 run control；继续只保留一次性接口。
+最终选择：不迁移 LangGraph，不重构主链路；新增自己的 `run_id + SQLite checkpoint + step trace + approval gate + SSE replay` 控制平面。
+理由：本项目已有清晰的 orchestrator 主链路，这次目标是补生产化能力而不是换框架。SQLite 足够让本地 demo 和测试在服务重启后读回 run、steps、events；planner 后 HITL 能在 researcher 和 synthesis 之前阻止错误方向继续消耗 token/search 成本；SSE replay 能让客户端断线后按 `Last-Event-ID` 补发历史事件。
+代价：它不是分布式调度系统，没有 worker queue、lease、并发抢占和跨进程取消；阶段级恢复当前以 planner checkpoint 后从 researcher 重跑为主，没有精确恢复到某个 researcher 子任务内部。
+面试怎么答：我会说我借鉴的是 LangGraph 的 durable execution、checkpoint 和 human-in-the-loop 思想，但没有为了框架迁移牺牲项目可读性；我实现的是后端控制平面最小闭环：状态机、SQLite checkpoint、approval/resume/cancel/retry、SSE replay。
+
 # 5 实现细节
 
 Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。局限是 planner 还不会根据 researcher 中间结果动态追加子问题。
@@ -137,6 +148,8 @@ Citation Checker：`src/deepresearch_agent/citation.py`。输入是 claims 和 s
 Cost Tracker：`src/deepresearch_agent/cost.py`。mock provider 仍使用字符数近似估算；DeepSeek provider 已接入 API 返回的真实 `prompt_tokens` / `completion_tokens`，并通过 `CostTracker.add_usage()` 记录到同一套 `CostSummary`。当前 `deepseek-v4-flash` 成本计算按 DeepSeek 官方 Models & Pricing 页，核对日期 `2026-06-07`：input cache hit `$0.0028/1M tokens`，input cache miss `$0.14/1M tokens`，output `$0.28/1M tokens`。legacy alias 只作为 v4-flash 兼容入口使用同一价格表；未配置价格的模型会直接报错，避免 silently 用错单价。如果响应没有 token usage，DeepSeek 路径会直接失败，不会退回字符估算伪装成真实 usage。
 
 Trace Logger：`src/deepresearch_agent/tracing.py`。每个 run 写 `logs/research-<run_id>.jsonl`，记录 stage、status、duration_ms、payload。runtime trace 默认不提交 Git，benchmark 原始记录提交。
+
+Agent Run Control Plane：`src/deepresearch_agent/run_control.py` 外包现有 DeepResearch pipeline，不替换 `/research`。`POST /runs` 会创建 `run_id`，执行 brief/planner，然后在 `require_approval=true` 时进入 `waiting_approval`；`approve` 会从 planner checkpoint 继续 researcher、synthesizer、verifier；`edit` 会保存修改后的 subquestions 再继续；`reject/cancel` 会终止 run；`retry` 对 failed run 优先复用 `plan_json` 从 researcher 阶段重跑。`run_store.py` 的 SQLite schema 是三张表：`agent_runs` 保存 run 状态、plan/result、token/cost；`agent_steps` 保存阶段输入输出、latency、token_usage、cost、error、retry_count；`agent_events` 保存可 SSE replay 的单调递增 event。
 
 # 6 遇到的问题与修复
 
@@ -228,7 +241,7 @@ Trace Logger：`src/deepresearch_agent/tracing.py`。每个 run 写 `logs/resear
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
-测试验证：`py -3.11 -m pytest`，最新结果 `23 passed, 2 warnings in 50.23s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 Chroma/OpenTelemetry 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest`，最新结果 `30 passed, 2 warnings in 56.59s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 Chroma/OpenTelemetry 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -350,6 +363,6 @@ Wikipedia 不是专业 search provider：当前问题是真实 adapter 能跑但
 
 Hybrid retrieval 还没有证明质量稳定提升：当前已经实现 keyword + vector + RRF 和可选 rerank，但 5 case 小样本里 hybrid success_rate 反而低于 keyword baseline。可行方案是扩大本地语料、补人工相关性标注、调 RRF 权重、做持久化 embedding cache，并把 rerank 纳入全量 benchmark。工程代价是索引生命周期、模型加载时间、评测集标注和更多运行成本。面试怎么讲：我会说我完成了检索结构升级，但不会把一次小样本结果包装成质量提升。
 
-没有 durable execution：当前问题是服务重启会丢 run state。可行方案是 LangGraph checkpoint、PostgreSQL 或 Redis。工程代价是部署复杂度和 schema 维护。面试怎么讲：我会说单机 MVP 先保证可测，生产化再加持久化。
+Run control 还不是分布式调度：当前已经有 SQLite run store、planner checkpoint、approval/resume/cancel/retry 和 SSE replay，但它仍是单机轻量实现。可行方案是引入 worker queue、lease/heartbeat、PostgreSQL/Redis、阶段幂等和更细粒度 checkpoint。工程代价是并发一致性、任务抢占、schema migration 和运维复杂度。面试怎么讲：我会说我先把长任务控制平面闭环做出来，生产化再升级存储和调度，不把 SQLite 版本包装成高并发任务系统。
 
 没有 OpenTelemetry/LangSmith：当前问题是 trace 只写本地 JSONL。可行方案是接 OTel exporter 或 LangSmith。工程代价是外部账号、采样、隐私和成本。面试怎么讲：我会说本地 JSONL 先保证无外部依赖，后续可以从同一 trace event 结构导出。
