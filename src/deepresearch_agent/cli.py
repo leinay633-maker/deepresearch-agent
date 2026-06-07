@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from dataclasses import replace
 
 from deepresearch_agent.config import load_settings
 from deepresearch_agent.orchestrator import DeepResearchOrchestrator
+from deepresearch_agent.report_exporter import export_report
 from deepresearch_agent.schemas import ResearchRequest
 
 
@@ -38,6 +40,12 @@ async def _run(args: argparse.Namespace) -> int:
         print("")
         print("Cost:")
         print(json.dumps(report.cost.model_dump(mode="json"), ensure_ascii=False, indent=2))
+    if args.export_dir:
+        exported = export_report(report, args.export_dir, _export_formats(args.export_formats))
+        stream = sys.stderr if args.json else sys.stdout
+        print("", file=stream)
+        print("Exports:", file=stream)
+        print(json.dumps(exported, ensure_ascii=False, indent=2), file=stream)
     return 0 if report.metrics.get("success") else 1
 
 
@@ -103,8 +111,18 @@ def main() -> None:
     parser.add_argument("--reflection-min-sources", type=int, default=4)
     parser.add_argument("--seed", type=int, default=20260606)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--export-dir", default=None)
+    parser.add_argument(
+        "--export-formats",
+        default="markdown,html,json",
+        help="Comma-separated report export formats: markdown, html, json.",
+    )
     args = parser.parse_args()
     raise SystemExit(asyncio.run(_run(args)))
+
+
+def _export_formats(raw: str) -> list[str]:
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 if __name__ == "__main__":

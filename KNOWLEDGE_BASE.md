@@ -202,6 +202,15 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 代价：当前仍只有 mock 和 DeepSeek 两类 LLM provider；没有按 source quality 自动选模型，没有动态降级策略，也没有证明不同 stage model 会提升质量或降低成本。
 面试怎么答：我会说我先做的是“模型路由接口和可观测归因”，不是宣称已经有完整 model zoo。它让面试官看到我知道多 Agent 系统里模型选择应该是按角色管理的，而不是一个全局模型名打到底。
 
+## 决策 20：为什么内容导出先做 Markdown/HTML/JSON，而不是直接做 PDF/DOCX/PPT
+
+背景：之前报告只能从 API/CLI 读结构化 JSON 或 markdown answer，不方便把一次 run 交给别人审阅，也没有稳定 artifact 文件。
+可选方案：直接生成 PDF/DOCX/PPT；先导出 Markdown/HTML/JSON；只保留 API JSON；接第三方文档服务。
+最终选择：新增 `src/deepresearch_agent/report_exporter.py`，支持把 `StructuredReport` 导出为 Markdown、静态 HTML 和完整 JSON；CLI 增加 `--export-dir` 和 `--export-formats`。PDF/DOCX/PPT 暂不做。
+理由：Markdown/HTML/JSON 不需要新增依赖，能保留 answer、sources、citation assessments、evidence quotes、metrics 和完整结构化数据，先满足可审计和可分享。后续 PDF/DOCX 可以从这层 exporter 继续扩展。
+代价：HTML 只是静态页面，不是富文本编辑器；没有分页、目录、图片、PDF 排版、DOCX 样式、PPT 或 TTS/podcast。
+面试怎么答：我会说我先把报告从“只能在 stdout/API 里看”变成“能落地成可复查 artifact”，但不会把它包装成完整办公文档生成系统。
+
 # 5 实现细节
 
 Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。`ResearchRequest.planner_model` 或 `LLM_PLANNER_MODEL` 可以覆盖 planning stage 的模型名。局限是 planner 还不会根据 researcher 中间结果做 LLM 语义级动态追加子问题。
@@ -233,6 +242,8 @@ Verifier：`src/deepresearch_agent/verifier.py`。输入是 source 列表，输�
 Synthesizer：`src/deepresearch_agent/llm.py` 的 `synthesize`。输入是 brief、plan、findings、sources，输出 answer 和 claims。默认 mock 会生成可测报告，DeepSeek provider 会用 JSON mode 生成 markdown answer 和结构化 claims。局限是 DeepSeek 输出目前只靠 prompt 约束和后置 citation checker，没有做二次 LLM judge 或强制 source quote。
 
 Citation Checker：`src/deepresearch_agent/citation.py`。输入是 claims 和 sources，输出 `CitationCheckReport`。每条 `CitationAssessment` 现在包含 citation IDs、`supported`、`support_level`、overlap score 和最多 3 条 `evidence_quotes`。checker 会从 cited source 里按句子找最接近 claim 的 quote，输出 `supported / partial / unsupported / unverifiable`。局限是证据定位仍基于 lexical overlap，还不是 NLI/LLM judge。
+
+Report Exporter：`src/deepresearch_agent/report_exporter.py`。输入是 `StructuredReport`，输出 Markdown、HTML、JSON 文件路径。Markdown/HTML 会展开 answer、sources、citation assessments 和 evidence quotes；JSON 保存完整 `model_dump(mode="json")`，方便后续二次处理。CLI 通过 `--export-dir` 和 `--export-formats` 调用它；`--json` 模式下导出路径写到 stderr，避免污染 stdout JSON。
 
 Cost Tracker：`src/deepresearch_agent/cost.py`。mock provider 仍使用字符数近似估算；DeepSeek provider 已接入 API 返回的真实 `prompt_tokens` / `completion_tokens`，并通过 `CostTracker.add_usage()` 记录到同一套 `CostSummary`。每条 `CostRecord` 现在支持单独的 `model`，所以 brief_generation、planning、synthesis 可以显示不同 stage model。当前 `deepseek-v4-flash` 成本计算按 DeepSeek 官方 Models & Pricing 页，核对日期 `2026-06-07`：input cache hit `$0.0028/1M tokens`，input cache miss `$0.14/1M tokens`，output `$0.28/1M tokens`。legacy alias 只作为 v4-flash 兼容入口使用同一价格表；未配置价格的模型会直接报错，避免 silently 用错单价。如果响应没有 token usage，DeepSeek 路径会直接失败，不会退回字符估算伪装成真实 usage。
 
@@ -396,6 +407,14 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 复盘：单元测试要隔离目标变量。多模型路由测试只该测 LLM/cost，不该顺带测向量检索模型加载。
 面试可能追问：这是不是说明默认 hybrid 有问题？回答：不是功能错误，但说明本地 embedding 冷启动会污染无关测试和 demo，需要通过显式配置或持久化索引控制。
 
+## 问题 18：报告导出阶段无阻塞 bug，但刻意没有做富文档格式
+
+现象：新增 Markdown/HTML/JSON exporter 和 CLI 参数后，单测与 CLI smoke 都通过，没有出现阻塞性 bug。
+工程风险：Markdown/HTML/JSON 解决的是 artifact 可复查，不等于 PDF/DOCX/PPT 级别的排版交付。HTML 目前只是静态转义，不支持封面、目录、分页、图片、图表或富文本编辑。
+修复：没有为了“看起来完整”去引入重依赖或编造 PDF/DOCX 能力；文档里明确 PDF、DOCX、PPT 未实现。
+复盘：导出层先做稳定数据边界更重要。后续要做 PDF/DOCX 时，可以复用 `report_to_markdown` / `report_to_html` 的结构，再接专门的文档生成依赖。
+面试可能追问：为什么不直接做 PDF？回答：PDF/DOCX 是排版工程，不是 DeepResearch 主链路的核心风险；我先交付可审计 artifact，下一步再做格式化输出。
+
 # 7 实测数据
 
 本节所有 mock benchmark 数字只用于证明 pipeline plumbing 能端到端跑通，不能当作真实性能、真实成本或真实答案质量成果。尤其不能在面试里说“我的 DeepResearch p50 是个位数毫秒”这类话，因为这个延迟测的是本机 Python 跑 deterministic mock 的速度，换机器、换进程热身状态、换依赖版本都会变。
@@ -403,7 +422,7 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
-测试验证：`py -3.11 -m pytest -q`，最新结果 `54 passed, 2 warnings in 57.65s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `57 passed, 2 warnings in 57.34s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -432,6 +451,8 @@ Worker lease smoke：`py -3.11 -m pytest tests/test_run_control.py -q` 成功，
 Persistent vector index smoke：`py -3.11 -m pytest tests/test_hybrid_retrieval.py -q` 成功，`3 passed, 1 warning in 2.77s`。新增测试用静态 embedding provider 和临时 Chroma PersistentClient 验证：第一次检索会 embed 2 个 corpus chunk 和 1 个 query，第二个 `LocalRagRetriever` 指向同一 `LOCAL_VECTOR_INDEX_PATH` 时只 embed query，不重新 embed corpus；`ChromaVectorIndex.reused_existing` 为 `True`。这只验证索引复用语义，没有做真实 BGE 冷/热启动延迟 benchmark。
 
 Stage model routing smoke：`py -3.11 -m pytest tests/test_stage_models.py -q` 成功，`2 passed in 0.35s`。测试覆盖 mock orchestrator 在 `brief_model`、`planner_model`、`synthesis_model` 不同时，`CostRecord.model` 分别记录 `mock-brief`、`mock-planner`、`mock-synthesis`；同时用不联网的 `RecordingDeepSeekProvider` 验证 DeepSeek 请求体按 stage 发送 `deepseek-chat`、`deepseek-reasoner`、`deepseek-v4-flash`，且 cost records 记录同一模型序列。CLI smoke：`py -3.11 -m deepresearch_agent.cli "How should model routing work in a research agent?" --llm-provider mock --llm-model mock-default --brief-model mock-brief --planner-model mock-planner --synthesis-model mock-synthesis --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --json` 后抽取 `cost.records[].model`，输出 `['mock-brief', 'mock-planner', 'mock-synthesis']`。这只验证路由和记录，不代表这些模型组合已做真实质量/成本对比。
+
+Report exporter smoke：`py -3.11 -m pytest tests/test_report_exporter.py -q` 成功，`3 passed in 0.33s`。测试覆盖 Markdown/HTML/JSON 三种文件写出、HTML answer 内容转义、未知格式报错。CLI smoke：`py -3.11 -m deepresearch_agent.cli "How should report export work?" --llm-provider mock --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --export-dir <temp> --export-formats markdown,html,json` 成功，在临时目录生成 `3ad3725ca515.md`、`3ad3725ca515.html`、`3ad3725ca515.json`。这只验证本地 artifact 导出，不代表 PDF/DOCX/PPT 已实现。
 
 mock benchmark 原始记录：`logs/benchmark-20260606T152954Z.jsonl`。
 当前 benchmark summary：`results/benchmark_summary.json`，已被真实 DeepSeek + Wikipedia benchmark 覆盖。
@@ -551,5 +572,7 @@ Wikipedia 不是专业 search provider：当前问题是真实 adapter 能跑但
 Hybrid retrieval 还没有证明质量稳定提升：当前已经实现 keyword + vector + RRF、可选持久化 Chroma index 和可选 rerank，但 5 case 小样本里 hybrid success_rate 反而低于 keyword baseline。可行方案是扩大本地语料、补人工相关性标注、调 RRF 权重、引入 Qdrant/Milvus 这类外部向量库，并把 rerank 纳入全量 benchmark。工程代价是索引生命周期、模型加载时间、评测集标注和更多运行成本。面试怎么讲：我会说我完成了检索结构升级，但不会把一次小样本结果包装成质量提升。
 
 Run control 还不是分布式调度：当前已经有 SQLite run store、planner checkpoint、approval/resume/cancel/retry、SSE replay 和单机 worker lease/heartbeat，但它仍是轻量实现。可行方案是引入真正的 worker queue、PostgreSQL/Redis、阶段幂等和更细粒度 checkpoint。工程代价是并发一致性、任务抢占、schema migration 和运维复杂度。面试怎么讲：我会说我先把长任务控制平面闭环和 worker ownership 语义做出来，生产化再升级存储和调度，不把 SQLite 版本包装成高并发任务系统。
+
+内容导出还不是办公文档生成：当前只支持 Markdown、HTML、JSON artifact。可行方案是基于 exporter 增加 PDF、DOCX、PPT、TTS/podcast。工程代价是版式、字体、分页、图片、图表和跨平台渲染验证。面试怎么讲：我会说我先做可审计文件导出，不把它包装成完整文档生产系统。
 
 没有 OpenTelemetry/LangSmith：当前问题是 trace 只写本地 JSONL。可行方案是接 OTel exporter 或 LangSmith。工程代价是外部账号、采样、隐私和成本。面试怎么讲：我会说本地 JSONL 先保证无外部依赖，后续可以从同一 trace event 结构导出。

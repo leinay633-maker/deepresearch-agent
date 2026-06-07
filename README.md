@@ -47,6 +47,14 @@ py -3.11 -m deepresearch_agent.cli "How should model routing work in a research 
 
 真实 DeepSeek 路径也支持同一组参数和环境变量：`LLM_BRIEF_MODEL`、`LLM_PLANNER_MODEL`、`LLM_SYNTHESIS_MODEL`。未设置时全部回落到 `--llm-model` / `DEEPSEEK_MODEL`。
 
+导出报告文件：
+
+```powershell
+py -3.11 -m deepresearch_agent.cli "How should report export work?" --llm-provider mock --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --export-dir reports --export-formats markdown,html,json
+```
+
+当前导出支持 Markdown、HTML、JSON；PDF、DOCX、PPT 还未实现。
+
 创建可审核的长任务 run，并在 planner 后 approve 继续：
 
 ```powershell
@@ -171,6 +179,7 @@ src/deepresearch_agent/
   rerankers.py        Optional local and DashScope rerank providers
   verifier.py         Source quality filtering
   citation.py         Citation faithfulness check
+  report_exporter.py  Markdown/HTML/JSON report exports
   cost.py             Token/cost attribution
   tracing.py          Structured JSONL trace events
   benchmark.py        Reproducible benchmark harness

@@ -375,8 +375,8 @@
 [状态: 待消化]
 标签：Report / Optional
 检索关键词：report exporter, optional
-回答：当前只输出 markdown 字符串和 JSON 结构，没有做 PDF/Docx 导出。原因是交付标准优先要求主链路、SSE、trace、benchmark，而多格式导出被我放到 v2 optional。
-关联模块：`schemas.py`, `cli.py`, `api.py`
+回答：现在已经有轻量 `report_exporter.py`，能把 `StructuredReport` 导出成 Markdown、HTML 和 JSON。CLI 支持 `--export-dir`、`--export-formats markdown,html,json`，导出的 Markdown/HTML 会包含 answer、sources、citation assessments 和 evidence quotes，JSON 保留完整结构化报告。PDF、DOCX、PPT 还没做，我不会把当前 exporter 包装成完整办公文档生成。
+关联模块：`report_exporter.py`, `cli.py`, `schemas.py`
 可追问：
 1. 怎么加 PDF？
 2. 导出会影响 citation 吗？
