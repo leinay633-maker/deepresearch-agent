@@ -32,6 +32,11 @@ class Settings:
     local_vector_weight: float = 1.0
     local_chunk_size_chars: int = 600
     local_chunk_overlap_chars: int = 80
+    rerank_enabled: bool = False
+    rerank_provider: str = "local"
+    local_rerank_model: str = "BAAI/bge-reranker-base"
+    dashscope_rerank_model: str = "gte-rerank-v2"
+    local_rerank_candidate_k: int = 6
 
 
 def _float_env(name: str, default: float) -> float:
@@ -52,6 +57,13 @@ def _int_env(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_settings() -> Settings:
@@ -89,4 +101,15 @@ def load_settings() -> Settings:
         local_vector_weight=_float_env("LOCAL_VECTOR_WEIGHT", 1.0),
         local_chunk_size_chars=_int_env("LOCAL_CHUNK_SIZE_CHARS", 600),
         local_chunk_overlap_chars=_int_env("LOCAL_CHUNK_OVERLAP_CHARS", 80),
+        rerank_enabled=_bool_env("RERANK_ENABLED", False),
+        rerank_provider=os.getenv("RERANK_PROVIDER", "local").strip().lower() or "local",
+        local_rerank_model=(
+            os.getenv("LOCAL_RERANK_MODEL", "BAAI/bge-reranker-base").strip()
+            or "BAAI/bge-reranker-base"
+        ),
+        dashscope_rerank_model=(
+            os.getenv("DASHSCOPE_RERANK_MODEL", "gte-rerank-v2").strip()
+            or "gte-rerank-v2"
+        ),
+        local_rerank_candidate_k=_int_env("LOCAL_RERANK_CANDIDATE_K", 6),
     )

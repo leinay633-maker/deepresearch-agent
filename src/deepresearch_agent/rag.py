@@ -9,6 +9,7 @@ from typing import Any
 
 from deepresearch_agent.config import Settings, load_settings
 from deepresearch_agent.embeddings import EmbeddingProvider, build_embedding_provider
+from deepresearch_agent.rerankers import RerankProvider, build_rerank_provider
 from deepresearch_agent.schemas import Source
 
 
@@ -38,6 +39,7 @@ class LocalRagRetriever:
         corpus_path: Path | None = None,
         settings: Settings | None = None,
         embedding_provider: EmbeddingProvider | None = None,
+        rerank_provider: RerankProvider | None = None,
     ) -> None:
         root = Path(__file__).resolve().parents[2]
         self.settings = settings or load_settings()
@@ -45,6 +47,7 @@ class LocalRagRetriever:
         self.documents = self._load()
         self.chunks = self._chunk_documents(self.documents)
         self.embedding_provider = embedding_provider
+        self.rerank_provider = rerank_provider
         self._vector_index: ChromaVectorIndex | None = None
 
     async def retrieve(self, query: str, max_results: int = 2) -> list[Source]:
@@ -59,7 +62,15 @@ class LocalRagRetriever:
         vector_top_k = max(max_results, self.settings.local_vector_top_k)
         vector_results = await self._vector_retrieve(query, top_k=vector_top_k)
         fused = self._rrf_fuse(keyword_results, vector_results)
-        return self._sources_from_fused(query, fused[:max_results])
+        candidate_count = (
+            max(max_results, self.settings.local_rerank_candidate_k)
+            if self.settings.rerank_enabled
+            else max_results
+        )
+        candidates = self._sources_from_fused(query, fused[:candidate_count])
+        if self.settings.rerank_enabled:
+            return await self._rerank_sources(query, candidates, max_results=max_results)
+        return candidates[:max_results]
 
     def _keyword_retrieve(self, query: str, top_k: int) -> list[RankedChunk]:
         query_tokens = _tokens(query)
@@ -163,6 +174,27 @@ class LocalRagRetriever:
                 )
             )
         return sources
+
+    async def _rerank_sources(
+        self, query: str, sources: list[Source], max_results: int
+    ) -> list[Source]:
+        provider = self.rerank_provider or build_rerank_provider(self.settings)
+        reranked = await provider.rerank(query, sources)
+        output = []
+        for new_rank, item in enumerate(reranked[:max_results], start=1):
+            source = sources[item.index]
+            metadata = {
+                **source.metadata,
+                "rerank_enabled": True,
+                "rerank_provider": provider.name,
+                "rerank_model": provider.model,
+                "rerank_rank": new_rank,
+                "rerank_score": item.score,
+                "pre_rerank_score": source.score,
+                "pre_rerank_rank": item.index + 1,
+            }
+            output.append(source.model_copy(update={"score": item.score, "metadata": metadata}))
+        return output
 
     def _source_from_chunk(
         self,

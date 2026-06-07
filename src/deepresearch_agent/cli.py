@@ -46,10 +46,14 @@ def _settings_from_args(args: argparse.Namespace):
         ("local_keyword_weight", "local_keyword_weight"),
         ("local_vector_weight", "local_vector_weight"),
         ("local_hybrid_rrf_k", "local_hybrid_rrf_k"),
+        ("rerank_provider", "rerank_provider"),
+        ("local_rerank_candidate_k", "local_rerank_candidate_k"),
     ]:
         value = getattr(args, argument)
         if value is not None:
             overrides[field] = value
+    if args.rerank_enabled:
+        overrides["rerank_enabled"] = True
     return replace(settings, **overrides) if overrides else settings
 
 
@@ -66,6 +70,9 @@ def main() -> None:
     parser.add_argument("--local-keyword-weight", type=float, default=None)
     parser.add_argument("--local-vector-weight", type=float, default=None)
     parser.add_argument("--local-hybrid-rrf-k", type=int, default=None)
+    parser.add_argument("--rerank-enabled", action="store_true")
+    parser.add_argument("--rerank-provider", choices=["local", "dashscope"], default=None)
+    parser.add_argument("--local-rerank-candidate-k", type=int, default=None)
     parser.add_argument("--max-researchers", type=int, default=3)
     parser.add_argument("--max-results", type=int, default=4)
     parser.add_argument("--seed", type=int, default=20260606)

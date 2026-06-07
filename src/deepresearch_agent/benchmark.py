@@ -42,6 +42,9 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         local_keyword_weight=args.local_keyword_weight,
         local_vector_weight=args.local_vector_weight,
         local_hybrid_rrf_k=args.local_hybrid_rrf_k,
+        rerank_enabled=args.rerank_enabled,
+        rerank_provider=args.rerank_provider,
+        local_rerank_candidate_k=args.local_rerank_candidate_k,
         deepseek_model=effective_llm_model
         if args.llm_provider == "deepseek"
         else settings.deepseek_model,
@@ -61,6 +64,9 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "local_keyword_weight": effective_settings.local_keyword_weight,
         "local_vector_weight": effective_settings.local_vector_weight,
         "local_hybrid_rrf_k": effective_settings.local_hybrid_rrf_k,
+        "rerank_enabled": effective_settings.rerank_enabled,
+        "rerank_provider": effective_settings.rerank_provider,
+        "local_rerank_candidate_k": effective_settings.local_rerank_candidate_k,
         "case_count": len(cases),
         "max_researchers": effective_settings.max_researchers,
         "max_results": args.max_results,
@@ -216,6 +222,9 @@ def main() -> None:
     parser.add_argument("--local-keyword-weight", type=float, default=1.0)
     parser.add_argument("--local-vector-weight", type=float, default=1.0)
     parser.add_argument("--local-hybrid-rrf-k", type=int, default=60)
+    parser.add_argument("--rerank-enabled", action="store_true")
+    parser.add_argument("--rerank-provider", choices=["local", "dashscope"], default="local")
+    parser.add_argument("--local-rerank-candidate-k", type=int, default=6)
     parser.add_argument("--seed", type=int, default=20260606)
     parser.add_argument("--max-researchers", type=int, default=3)
     parser.add_argument("--max-results", type=int, default=4)
