@@ -50,10 +50,10 @@ py -3.11 -m deepresearch_agent.cli "How should model routing work in a research 
 导出报告文件：
 
 ```powershell
-py -3.11 -m deepresearch_agent.cli "How should report export work?" --llm-provider mock --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --export-dir reports --export-formats markdown,html,json,pdf,docx
+py -3.11 -m deepresearch_agent.cli "How should report export work?" --llm-provider mock --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --export-dir reports --export-formats markdown,html,json,pdf,docx,pptx
 ```
 
-当前导出支持 Markdown、HTML、JSON、PDF、DOCX；PDF/DOCX 是文本版报告导出，保留 answer、sources、citation assessments 和 evidence quotes。PPT/TTS 还未实现。
+当前导出支持 Markdown、HTML、JSON、PDF、DOCX、PPTX；PDF/DOCX/PPTX 是文本版报告导出，保留 answer、sources、citation assessments 和 evidence quotes。TTS 还未实现。
 
 从本地 Markdown/TXT 文件夹生成私有知识库 JSONL：
 
@@ -236,7 +236,7 @@ src/deepresearch_agent/
   verifier.py         Source quality filtering
   citation.py         Citation faithfulness check
   citation_judge.py   Optional heuristic and DeepSeek citation judge providers
-  report_exporter.py  Markdown/HTML/JSON/PDF/DOCX report exports
+  report_exporter.py  Markdown/HTML/JSON/PDF/DOCX/PPTX report exports
   cost.py             Token/cost attribution
   tracing.py          Structured JSONL trace events and optional OTLP HTTP export
   benchmark.py        Reproducible benchmark harness

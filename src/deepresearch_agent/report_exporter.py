@@ -6,13 +6,14 @@ from pathlib import Path
 from typing import Iterable
 
 from docx import Document
+from pptx import Presentation
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
 from deepresearch_agent.schemas import StructuredReport
 
 
-SUPPORTED_EXPORT_FORMATS = {"markdown", "md", "html", "json", "pdf", "docx"}
+SUPPORTED_EXPORT_FORMATS = {"markdown", "md", "html", "json", "pdf", "docx", "pptx"}
 
 
 def export_report(
@@ -40,6 +41,8 @@ def export_report(
             write_report_pdf(report, path)
         elif fmt == "docx":
             write_report_docx(report, path)
+        elif fmt == "pptx":
+            write_report_pptx(report, path)
         paths[fmt] = str(path)
     return paths
 
@@ -198,6 +201,38 @@ def write_report_pdf(report: StructuredReport, path: Path) -> None:
     SimpleDocTemplate(str(path)).build(story)
 
 
+def write_report_pptx(report: StructuredReport, path: Path) -> None:
+    presentation = Presentation()
+    title_slide = presentation.slides.add_slide(presentation.slide_layouts[0])
+    title_slide.shapes.title.text = f"DeepResearch Report\n{report.query}"
+    title_slide.placeholders[1].text = (
+        f"Run ID: {report.run_id}\n"
+        f"Citation retention: {report.citation_check.retention_rate}\n"
+        f"Total tokens: {report.cost.total_tokens}\n"
+        f"Estimated cost USD: {report.cost.total_estimated_cost_usd}"
+    )
+
+    _add_pptx_bullets(
+        presentation,
+        "Answer",
+        _text_blocks(report.answer[:1600]) or [report.answer[:1600]],
+    )
+    _add_pptx_bullets(
+        presentation,
+        "Sources",
+        [f"[{source.id}] {source.title} - {source.url}" for source in report.sources[:10]],
+    )
+    assessment_lines: list[str] = []
+    for assessment in report.citation_check.assessments[:8]:
+        assessment_lines.append(
+            f"{assessment.support_level} {assessment.overlap_score}: {assessment.claim}"
+        )
+        for quote in assessment.evidence_quotes[:2]:
+            assessment_lines.append(f"Evidence [{quote.source_id}]: {quote.quote}")
+    _add_pptx_bullets(presentation, "Citation Assessments", assessment_lines)
+    presentation.save(path)
+
+
 def _normalize_format(value: str) -> str:
     fmt = value.strip().lower()
     if fmt == "md":
@@ -217,3 +252,18 @@ def _docx_paragraph(document: Document, text: str, style: str | None = None) -> 
         document.add_paragraph(text, style=style)
     else:
         document.add_paragraph(text)
+
+
+def _add_pptx_bullets(
+    presentation: Presentation,
+    title: str,
+    items: list[str],
+) -> None:
+    slide = presentation.slides.add_slide(presentation.slide_layouts[1])
+    slide.shapes.title.text = title
+    body = slide.placeholders[1].text_frame
+    body.clear()
+    for index, item in enumerate(items or ["No content."]):
+        paragraph = body.paragraphs[0] if index == 0 else body.add_paragraph()
+        paragraph.text = item[:700]
+        paragraph.level = 0
