@@ -527,6 +527,7 @@ class SearchService:
         fallback: SearchAdapter,
         settings: Settings,
         rate_limiter: SearchRateLimiter | None = None,
+        retry_sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
     ) -> None:
         self.primary = primary
         self.fallback = fallback
@@ -534,6 +535,7 @@ class SearchService:
         self.rate_limiter = rate_limiter or SearchRateLimiter(
             settings.search_rate_limit_per_second
         )
+        self.retry_sleep = retry_sleep
         self.breaker = CircuitBreaker(
             settings.circuit_breaker_failure_threshold,
             settings.circuit_breaker_cooldown_seconds,
@@ -546,7 +548,7 @@ class SearchService:
 
         last_error: str | None = None
         if self.breaker.allow():
-            for _ in range(self.settings.max_retries + 1):
+            for attempt in range(self.settings.max_retries + 1):
                 try:
                     await self.rate_limiter.wait()
                     sources = await asyncio.wait_for(
@@ -558,6 +560,8 @@ class SearchService:
                 except Exception as exc:
                     last_error = str(exc)
                     self.breaker.record_failure()
+                    if attempt < self.settings.max_retries:
+                        await self._retry_backoff(attempt)
         else:
             last_error = "circuit breaker open"
 
@@ -570,6 +574,12 @@ class SearchService:
             fallback_used=True,
             error=last_error,
         )
+
+    async def _retry_backoff(self, attempt: int) -> None:
+        base_delay = self.settings.search_retry_backoff_seconds
+        if base_delay <= 0:
+            return
+        await self.retry_sleep(base_delay * (2**attempt))
 
 
 def build_search_service(settings: Settings, provider: str | None = None) -> SearchService:

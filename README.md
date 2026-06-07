@@ -201,6 +201,7 @@ Search providers：
 Search reliability knobs：
 
 - `SEARCH_RATE_LIMIT_PER_SECOND`：默认 `0` 关闭；设置为正数后，`SearchService` 会在 primary search 调用前做进程内节流，mock fallback 不限流。
+- `SEARCH_RETRY_BACKOFF_SECONDS`：默认 `0` 关闭；设置为正数后，primary search 失败重试前按 `base * 2^attempt` 等待。
 - `MAX_RETRIES`、`REQUEST_TIMEOUT_SECONDS`、`CIRCUIT_BREAKER_FAILURE_THRESHOLD`、`CIRCUIT_BREAKER_COOLDOWN_SECONDS` 控制 retry、timeout、circuit breaker 和 fallback 行为。
 
 Crawler：

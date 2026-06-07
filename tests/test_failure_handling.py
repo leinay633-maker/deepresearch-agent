@@ -118,6 +118,29 @@ def test_search_service_applies_rate_limiter_before_primary_call() -> None:
     assert outcome.fallback_used is False
 
 
+def test_search_service_applies_exponential_retry_backoff() -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    service = SearchService(
+        primary=FailingSearchAdapter(),
+        fallback=MockSearchAdapter(),
+        settings=Settings(
+            max_retries=2,
+            search_retry_backoff_seconds=0.25,
+            circuit_breaker_failure_threshold=10,
+        ),
+        retry_sleep=fake_sleep,
+    )
+
+    outcome = asyncio.run(service.search("agent backoff", max_results=1))
+
+    assert outcome.fallback_used is True
+    assert sleeps == [0.25, 0.5]
+
+
 def test_pytest_is_available() -> None:
     assert pytest.__version__
 

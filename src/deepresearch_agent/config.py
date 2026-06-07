@@ -11,6 +11,7 @@ class Settings:
     search_provider: str = "mock"
     request_timeout_seconds: float = 4.0
     max_retries: int = 2
+    search_retry_backoff_seconds: float = 0.0
     search_rate_limit_per_second: float = 0.0
     circuit_breaker_failure_threshold: int = 2
     circuit_breaker_cooldown_seconds: float = 30.0
@@ -112,6 +113,7 @@ def load_settings() -> Settings:
         search_provider=os.getenv("SEARCH_PROVIDER", "mock").strip().lower() or "mock",
         request_timeout_seconds=_float_env("REQUEST_TIMEOUT_SECONDS", 4.0),
         max_retries=_int_env("MAX_RETRIES", 2),
+        search_retry_backoff_seconds=_float_env("SEARCH_RETRY_BACKOFF_SECONDS", 0.0),
         search_rate_limit_per_second=_float_env("SEARCH_RATE_LIMIT_PER_SECOND", 0.0),
         circuit_breaker_failure_threshold=_int_env("CIRCUIT_BREAKER_FAILURE_THRESHOLD", 2),
         circuit_breaker_cooldown_seconds=_float_env("CIRCUIT_BREAKER_COOLDOWN_SECONDS", 30.0),
