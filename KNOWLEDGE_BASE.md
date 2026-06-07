@@ -1,10 +1,10 @@
 # 0 项目一句话介绍
 
-本项目是我从空仓库开始手写的一个收窄版 DeepResearch Agent，目标不是复刻大而全的 open_deep_research，而是把「问题澄清、research brief、并发 researcher、来源去重、带引用合成、citation check、trace 和 benchmark」这条主链路做干净。它解决的是普通 RAG 一次性检索后直接回答时，难以解释检索路径、引用是否支撑论断、工具失败如何降级的问题。当前版本默认使用 mock LLM 和 mock search，保证无 API key 也能一条命令跑通；同时已经接入 DeepSeek 真实 LLM provider 和 Wikipedia 真实检索 adapter，用显式参数切换并记录真实 usage/cost。这个项目体现的 Agent 后端能力主要是多阶段编排、并发工具调用、失败兜底、可观测性、成本归因和可复现评测。
+本项目是我从空仓库开始手写的一个收窄版 DeepResearch Agent，目标不是复刻大而全的 open_deep_research，而是把「问题澄清、research brief、并发 researcher、来源去重、带引用合成、citation check、trace 和 benchmark」这条主链路做干净。它解决的是普通 RAG 一次性检索后直接回答时，难以解释检索路径、引用是否支撑论断、工具失败如何降级的问题。当前版本默认使用 mock LLM 和 mock search，保证无 API key 也能一条命令跑通；同时已经接入 DeepSeek 真实 LLM provider、Wikipedia 真实检索 adapter，以及本地关键词 + 向量 + RRF 融合的 hybrid local retrieval。这个项目体现的 Agent 后端能力主要是多阶段编排、并发工具调用、失败兜底、混合检索、可观测性、成本归因和可复现评测。
 
 # 1 岗位匹配
 
-我做这个项目时刻意对齐 Agent 后端 / LLM 应用岗，而不是做一个只会调用 LLM 的 demo。JD 里常见的 LangGraph、RAG、MCP、并发、可观测性、评测这些关键词，在本项目里对应到清晰的工程模块：`orchestrator.py` 做轻量编排，`rag.py` 做本地 keyword RAG，`search.py` 做工具 adapter、重试、超时、熔断和降级，`tracing.py` 和 `cost.py` 做观测和成本归因，`benchmark.py` 做可复现评测。
+我做这个项目时刻意对齐 Agent 后端 / LLM 应用岗，而不是做一个只会调用 LLM 的 demo。JD 里常见的 LangGraph、RAG、MCP、并发、可观测性、评测这些关键词，在本项目里对应到清晰的工程模块：`orchestrator.py` 做轻量编排，`rag.py` 做本地 keyword/vector hybrid RAG，`embeddings.py` 和 `rerankers.py` 做可切换 provider，`search.py` 做工具 adapter、重试、超时、熔断和降级，`tracing.py` 和 `cost.py` 做观测和成本归因，`benchmark.py` 做可复现评测。
 
 我在第一阶段没有强行让默认路径依赖真实 LLM provider，因为没有 API key 时会阻塞陌生人 clone 运行。最终选择是默认保留 `MockLLMProvider` 做可复现测试和 mock plumbing benchmark；当环境变量 `DEEPSEEK_API_KEY` 存在时，可以显式启用 `DeepSeekLLMProvider` 跑真实 structured output、synthesis、token usage 和 cost。OpenAI/Anthropic 等其他 provider 仍作为 v2 扩展。
 
@@ -14,7 +14,7 @@ API 层：`src/deepresearch_agent/api.py`。输入是 `ResearchRequest`，输出
 
 Agent 编排层：`src/deepresearch_agent/orchestrator.py`。输入是用户 query 和配置，输出是完整报告。它按 clarify/normalize、planner、并发 researcher、source dedup、synthesizer、citation check 的顺序执行。这里我没有直接用 LangGraph，是因为当前目标是可讲清楚的收窄项目，轻量 orchestrator 更便于展示每个阶段的输入输出和失败边界。
 
-工具 Adapter 层：`src/deepresearch_agent/search.py`、`src/deepresearch_agent/rag.py`。搜索层有 `MockSearchAdapter` 和 `WikipediaSearchAdapter`，外加 `SearchService` 负责 retry、timeout、circuit breaker 和 fallback。本地 RAG 用 `data/local_corpus.jsonl`，用于展示普通 RAG 与 agentic RAG 的区别。
+工具 Adapter 层：`src/deepresearch_agent/search.py`、`src/deepresearch_agent/rag.py`、`src/deepresearch_agent/embeddings.py`、`src/deepresearch_agent/rerankers.py`。搜索层有 `MockSearchAdapter` 和 `WikipediaSearchAdapter`，外加 `SearchService` 负责 retry、timeout、circuit breaker 和 fallback。本地 RAG 用 `data/local_corpus.jsonl`，默认走关键词 + BGE 向量 + Chroma + RRF 融合；也可以显式切回 keyword baseline，或者开启本地 / DashScope rerank。
 
 检索质量层：`src/deepresearch_agent/dedup.py`、`src/deepresearch_agent/verifier.py`。Dedup 按规范化 URL 合并重复来源，Verifier 按标题、正文长度、稳定 URL、已知 adapter、低质量模式打分过滤。
 
@@ -24,7 +24,7 @@ Agent 编排层：`src/deepresearch_agent/orchestrator.py`。输入是用户 que
 
 # 3 核心流程
 
-完整链路是：用户问题进入 `ResearchRequest` 后，配置化 LLM provider 先做 normalize 和 research brief；`plan` 生成子问题；`orchestrator` 用 `asyncio.gather` 并发启动 2 到 3 个 researcher；每个 researcher 同时拿 search 和 local RAG 的来源，做 dedup 和 verifier；全局再做一次 source dedup 并分配 `S1`、`S2` 这样的引用 ID；`synthesize` 生成带引用的报告；`CitationChecker` 对每条 claim 的 citation ID 和 source text 做词重叠校验；最后返回结构化报告，同时写 trace log 和 cost summary。默认 provider 是 mock；显式传 `--llm-provider deepseek` 时 brief、plan 和 synthesis 都由 DeepSeek JSON mode 生成。
+完整链路是：用户问题进入 `ResearchRequest` 后，配置化 LLM provider 先做 normalize 和 research brief；`plan` 生成子问题；`orchestrator` 用 `asyncio.gather` 并发启动 2 到 3 个 researcher；每个 researcher 同时拿 search 和 local RAG 的来源。local RAG 内部可以是 keyword baseline，也可以是 keyword + vector + RRF hybrid，并可选 rerank，但输出仍是统一 `Source`。之后做 dedup 和 verifier；全局再做一次 source dedup 并分配 `S1`、`S2` 这样的引用 ID；`synthesize` 生成带引用的报告；`CitationChecker` 对每条 claim 的 citation ID 和 source text 做词重叠校验；最后返回结构化报告，同时写 trace log 和 cost summary。默认 provider 是 mock；显式传 `--llm-provider deepseek` 时 brief、plan 和 synthesis 都由 DeepSeek JSON mode 生成。
 
 # 4 关键设计决策
 
@@ -39,12 +39,12 @@ Agent 编排层：`src/deepresearch_agent/orchestrator.py`。输入是用户 que
 
 ## 决策 2：RAG 怎么搭
 
-背景：普通 RAG 容易变成一次 retrieve + answer，看不出 Agent 工程深度。
-可选方案：只用 web search；只用 local RAG；web search + local RAG 混合。
-最终选择：web search adapter 和 local keyword RAG 混合，每个 researcher 都会合并两类来源。
-理由：可以展示本地知识和外部检索的统一 Source 抽象，也方便无 key 时稳定运行。
-代价：当前 local RAG 只是 keyword overlap，未实测 embedding 召回效果。
-面试怎么答：我会说当前重点不是向量数据库，而是把检索结果纳入可验证、可追踪的 Agent pipeline。
+背景：普通 RAG 容易变成一次 retrieve + answer，看不出 Agent 工程深度；早期本地 RAG 只有 keyword overlap，能跑但语义召回弱。
+可选方案：只用 web search；只用 local RAG；web search + local RAG；local RAG 内部升级为 keyword/vector hybrid。
+最终选择：web search adapter 和 hybrid local RAG 并存。local RAG 保留 keyword baseline，同时新增 BGE embedding、Chroma vector index、RRF 融合和可选 rerank；每个 researcher 仍合并 web search 与 local RAG 来源。
+理由：keyword 对精确术语稳定，vector 对语义相近问题更友好，RRF 不要求两路分数同尺度；统一 `Source` 抽象让下游 dedup、verifier、synthesizer 不需要改。
+代价：本地 embedding / Chroma / rerank 会增加依赖和延迟；最新真实 benchmark 里 local hybrid 的 citation retention 略高于 keyword baseline，但 success_rate 更低，说明混合检索不是自动变好，需要更大语料和 rerank/权重调优。
+面试怎么答：我会说我没有用向量替换关键词，而是保留两路召回再融合；实测结果不全是好看的，反而暴露了小语料场景下 hybrid 可能引入不稳定来源。
 
 ## 决策 3：工具失败怎么兜
 
@@ -92,6 +92,15 @@ Agent 编排层：`src/deepresearch_agent/orchestrator.py`。输入是用户 que
 代价：当前只代表 DeepSeek 一个 provider，不能泛化到所有模型；默认模型已从 legacy alias 迁移到显式 `deepseek-v4-flash`，legacy alias 仅为旧配置兼容保留在价格表中。当前 `estimated_cost_usd` 是根据 provider usage 和代码里的 `deepseek-v4-flash` 价格常量估算，不等同于长期稳定账单或产品级成本承诺。
 面试怎么答：我会说我没有把 mock 数字包装成真实成果，而是先用 DeepSeek 把 structured output、usage 解析、成本归因和真实搜索 benchmark 打通；迁移 v4-flash 后又重跑了 schema validation 和 5 case benchmark。但我也会主动说明它只是单 provider 小样本，下一步是 provider 抽象扩展和更强评测。
 
+## 决策 8：为什么做 hybrid retrieval，而不是直接换成向量检索
+
+背景：keyword-only local RAG 对本项目里的固定英文术语很稳，但对同义表达和中文问题不友好；直接改成 pure vector 又会丢掉精确术语匹配优势。
+可选方案：继续 keyword-only；直接 pure vector；keyword + vector 加权相加；keyword + vector 用 RRF 融合；再加 rerank。
+最终选择：默认 local hybrid：关键词召回 + BGE local embedding 向量召回 + Chroma index + RRF 融合；rerank 做成可选 provider，默认关闭。
+理由：RRF 只依赖排序名次，不要求 keyword score、cosine score 和 rerank score 同尺度；本地 BGE 默认无 API key，保证 clone 后仍能跑；DashScope embedding/rerank 作为显式 provider，只从 `DASHSCOPE_API_KEY` 读 key。
+代价：依赖变重，首次加载 embedding/rerank 模型延迟明显；本次 5 case benchmark 里 hybrid 的 retention 从 `0.8867` 到 `0.8929` 略升，但 success_rate 从 `1.0` 降到 `0.6`，p50 从 `24595.506ms` 升到 `30747.284ms`。这说明检索结构更完整，不等于短期指标一定更好。
+面试怎么答：我会说这次我做的是工程能力升级，不是调参刷分。混合检索给后续扩展语料、中文 query 和 rerank 留了接口，但当前小语料 benchmark 反而说明需要更细的评测和参数选择。
+
 # 5 实现细节
 
 Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。局限是 planner 还不会根据 researcher 中间结果动态追加子问题。
@@ -100,7 +109,13 @@ DeepSeek Planner 验证：`src/deepresearch_agent/llm.py` 里新增了 `DeepSeek
 
 DeepSeek Synthesizer 接入：步骤 2 以后，`DeepSeekLLMProvider.create_brief`、`plan`、`synthesize` 都走 DeepSeek JSON mode。CLI 和 API 可以通过 `llm_provider="deepseek"` 或 CLI 参数 `--llm-provider deepseek` 显式启用；默认仍是 mock，保证离线测试不受 API key 影响。当前 synthesis 要求模型输出 `{"answer": "...", "claims": [...]}`，并要求每条 factual claim 使用输入 sources 中已有的 `[Sx]` citation ID。
 
-Researcher：`src/deepresearch_agent/orchestrator.py` 的 `_research_one`。输入是子问题，输出是 `Finding`。它调用 `SearchService` 和 `LocalRagRetriever`，再 dedup、verify、summary。局限是 summary 仍是模板化，不是自然语言 LLM 压缩。
+Researcher：`src/deepresearch_agent/orchestrator.py` 的 `_research_one`。输入是子问题，输出是 `Finding`。它调用 `SearchService` 和 `LocalRagRetriever`，再 dedup、verify、summary。`LocalRagRetriever` 内部已经从 keyword overlap 升级为可配置的 keyword / hybrid retrieval，但 orchestrator 仍只接收 `Source` 列表。局限是 summary 仍是模板化，不是自然语言 LLM 压缩。
+
+Embedding Provider：`src/deepresearch_agent/embeddings.py`。输入文本列表，输出向量列表。默认 `LocalEmbeddingProvider` 使用 `sentence-transformers` 加载 `BAAI/bge-small-zh-v1.5`，无 API key；`DashScopeEmbeddingProvider` 调百炼 OpenAI-compatible embeddings endpoint，key 只从 `DASHSCOPE_API_KEY` 读。验证脚本是 `src/deepresearch_agent/validate_embeddings.py`，本机 local BGE 实测维度 `512`；DashScope 因未配置 key，只做了 stub endpoint 解析测试。
+
+Hybrid Local Retriever：`src/deepresearch_agent/rag.py`。输入 query 和 top-k，输出统一 `Source`。keyword 路按 token overlap 排序；vector 路先把 `data/local_corpus.jsonl` 分块，用 embedding 建 Chroma collection，再按 cosine distance 检索；融合用 RRF，metadata 记录 keyword_rank、vector_rank、fusion score 和权重。局限是当前语料很小，Chroma 每个 retriever 实例临时建内存 index，没有做持久化缓存。
+
+Rerank Provider：`src/deepresearch_agent/rerankers.py`。输入 query 和候选 source，输出重排分数。默认 provider 是本地 `BAAI/bge-reranker-base`，但 `rerank_enabled` 默认关闭；DashScope rerank provider 调 `https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank`，key 仍只读 `DASHSCOPE_API_KEY`。本地 rerank 单条 smoke 跑通过，但首次模型下载/加载使 latency 约 `279692.721ms`，所以没有把它放进默认 benchmark。
 
 Verifier：`src/deepresearch_agent/verifier.py`。输入是 source 列表，输出是过滤后的 source。关键设计是可解释 quality reasons。局限是规则打分，不能真正判断来源权威性。
 
@@ -183,8 +198,8 @@ Trace Logger：`src/deepresearch_agent/tracing.py`。每个 run 写 `logs/resear
 
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
-安装验证：`py -3.11 -m pip install --timeout 120 -e ".[dev]"` 成功。
-测试验证：`py -3.11 -m pytest -q`，最新结果 `12 passed, 1 warning in 0.88s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，未影响功能。
+安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `20 passed, 2 warnings in 38.82s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 Chroma/OpenTelemetry 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -193,6 +208,10 @@ DeepSeek 结构化输出验证：`py -3.11 -m deepresearch_agent.validate_deepse
 DeepSeek 端到端单条验证（LLM 真，search 仍是 mock）：`py -3.11 -m deepresearch_agent.cli "How should citation checking reduce hallucination in deep research agents?" --llm-provider deepseek --search-provider mock --max-researchers 2 --max-results 3 --json` 成功。模型生成的 brief 不再是模板回填，scope 是“Methods and effectiveness of citation verification in mitigating factual inaccuracies in AI-driven research agents”；planner 拆出 automated citation verification 和 human-in-the-loop 对比两个子问题；synthesis 生成了 markdown 报告和 6 条 claims。步骤 2 首次成功运行记录：latency `18987.535ms`，raw_search_result_count `6`，deduped_source_count `7`，citation_retention_rate `0.8333`，supported_claims `5/6`。其中 1 条 human-in-the-loop claim 被当前 lexical citation checker 标为 unsupported。这是接真实 usage 前的历史记录，所以当时的 cost 不能当真实成本；步骤 3 已补上 provider usage 解析。
 
 DeepSeek usage/cost 单条验证（LLM 真，search 仍是 mock）：接入真实 usage 后重跑同一条命令成功。运行记录：latency `18524.693ms`，raw_search_result_count `6`，deduped_source_count `7`，citation_retention_rate `1.0`，supported_claims `6/6`。真实 usage：input_tokens `1842`，output_tokens `1310`，total_tokens `3152`，estimated_cost_usd `0.00193834`。分阶段成本：brief_generation `118 + 140 tokens / $0.00018586`，planning `277 + 226 tokens / $0.00032339`，synthesis `1447 + 944 tokens / $0.00142909`。注意：search 仍是 mock，所以这还不是“LLM + search 全真实”的 benchmark；步骤 4 再切 Wikipedia。
+
+Embedding provider 验证：`py -3.11 -m deepresearch_agent.validate_embeddings --provider local --text "混合检索需要关键词召回和向量召回一起融合。"` 成功。本地模型 `BAAI/bge-small-zh-v1.5` 返回维度 `512`。`DASHSCOPE_API_KEY` 当前未配置，所以百炼 embedding 没有做真实 API 调用；代码层用本地 HTTP stub 测过 DashScope-compatible response parsing。
+
+Reranker smoke：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?" --search-provider mock --llm-provider mock --max-researchers 1 --max-results 2 --local-retrieval-mode hybrid --rerank-enabled --rerank-provider local` 成功。因为首次下载/加载 `BAAI/bge-reranker-base`，latency 达到 `279692.721ms`。这只证明可选 rerank provider 能接入，不作为常规性能指标。
 
 mock benchmark 原始记录：`logs/benchmark-20260606T152954Z.jsonl`。
 当前 benchmark summary：`results/benchmark_summary.json`，已被真实 DeepSeek + Wikipedia benchmark 覆盖。
@@ -211,37 +230,34 @@ benchmark 汇总：管线 plumbing 指标，mock，非真实性能。具体 late
 
 旧 legacy alias benchmark 原始记录仍保留在 `logs/benchmark-20260606T160617Z.jsonl`，只作为历史对照，不再展开旧数字作为当前主口径。
 
-真实 DeepSeek v4-flash + Wikipedia benchmark：`$env:REQUEST_TIMEOUT_SECONDS='8'; py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --llm-model deepseek-v4-flash --search-provider wikipedia --seed 20260607 --max-researchers 2 --max-results 3`。本次 LLM 是 `deepseek-v4-flash`，检索 primary 是 Wikipedia，最终 `fallback_count_total=2`，说明有 2 次 researcher 检索降级；这是实际运行结果，不做调参美化。原始记录：`logs/benchmark-20260607T045546Z.jsonl`，summary：`results/benchmark_summary.json`。
+真实 DeepSeek v4-flash + Wikipedia + local retrieval 对比 benchmark：两组都使用 `$env:REQUEST_TIMEOUT_SECONDS='8'`，`--llm-provider deepseek --llm-model deepseek-v4-flash --search-provider wikipedia --seed 20260607 --max-researchers 2 --max-results 3`。区别只在 `--local-retrieval-mode keyword` 和 `--local-retrieval-mode hybrid`。对比汇总写入 `results/retrieval_benchmark_comparison.json`；当前 `results/benchmark_summary.json` 被最后一次 local hybrid run 覆盖。
 
-| 指标 | 真实 benchmark 记录 | 怎么解释 |
-|---|---:|---|
-| case_count | 5 | 仍是小型本地 benchmark，不是公开权威评测 |
-| success_count / success_rate | 4 / 0.8 | 真实 citation checker 下有 1 条 case 未达当前 success 条件 |
-| latency p50 | 21441.242ms | 包含 DeepSeek + Wikipedia live 网络时间，不是 SLA |
-| latency p90 | 27883.52ms | 同上 |
-| latency max | 29314.445ms | 同上 |
-| total_tokens | 19523 | 来自 DeepSeek usage 字段 |
-| avg_tokens | 3904.6 | 来自 DeepSeek usage 字段 |
-| estimated_cost_usd_total | 0.00414554 | 按当前实现中的 `deepseek-v4-flash` 价格常量估算，价格核对日期：2026-06-07 |
-| citation_retention_rate_avg | 0.8767 | lexical citation checker 结果，不是语义级事实评估 |
-| fallback_count_total | 2 | 有 2 次 researcher 检索降级，如实记录 |
+| 口径 | raw log | success_rate | citation_retention_rate_avg | deduped_source_count_avg | latency p50 | latency max | total_tokens | estimated_cost_usd_total | fallback_count_total |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 纯关键词 local RAG baseline | `logs/benchmark-20260607T080835Z.jsonl` | 1.0 | 0.8867 | 8.2 | 24595.506ms | 39793.567ms | 17740 | 0.00368858 | 1 |
+| 本地 hybrid：keyword + BGE vector + Chroma + RRF，rerank 关闭 | `logs/benchmark-20260607T081104Z.jsonl` | 0.6 | 0.8929 | 7.8 | 30747.284ms | 48727.728ms | 18842 | 0.00399994 | 2 |
+| 百炼 hybrid embedding | 未实测 | 未实测 | 未实测 | 未实测 | 未实测 | 未实测 | 未实测 | 未实测 | 未实测 |
 
-逐 case 结果：case-001 成功，retention `1.0`，cost `$0.0008302`，fallback `0`；case-002 失败，retention `0.75`，cost `$0.00073738`，fallback `0`；case-003 成功，retention `0.8`，cost `$0.00075012`，fallback `2`；case-004 成功，retention `0.8333`，cost `$0.00075334`，fallback `0`；case-005 成功，retention `1.0`，cost `$0.0010745`，fallback `0`。这组数据比 mock plumbing 更有意义，因为 LLM token/cost 是 provider usage；但它仍受 Wikipedia 搜索质量、fallback、LLM 输出波动和 lexical citation checker 限制。
+这次结果不能包装成“hybrid 一定更好”。本地 hybrid 的平均 citation retention 从 `0.8867` 小幅升到 `0.8929`，但 success_rate 从 `1.0` 降到 `0.6`，fallback 从 `1` 增到 `2`，p50 latency 从 `24595.506ms` 增到 `30747.284ms`，token 和成本也上升。我的解释是：当前 local corpus 很小，向量召回引入的额外 local source 会改变 synthesis 上下文和 citation checker 的 lexical overlap 分布；在小样本、无人工相关性标注的情况下，hybrid 是能力升级，不是质量保证。
 
-未实测：真实搜索 API 高并发限流、语义级 citation faithfulness、Redis/PostgreSQL 缓存、OpenTelemetry/LangSmith tracing、真实用户流量。
+逐 case 对比：keyword baseline 5 条全成功；local hybrid 中 case-001 retention `0.7143` 失败，case-002 retention `0.75` 失败，case-003/004/005 成功。case-003 的 fallback 从 keyword 的 `1` 变成 hybrid 的 `2`，说明同样的 planner/search 条件下仍有外部检索波动，不能把差异完全归因于 local retrieval。
+
+百炼组没有跑：当前环境没有 `DASHSCOPE_API_KEY`。代码已经实现 DashScope embedding 和 rerank provider，并用 stub 测过 HTTP response parsing；真实百炼 embedding/rerank latency、费用和效果均未实测。
+
+未实测：真实搜索 API 高并发限流、语义级 citation faithfulness、Redis/PostgreSQL 缓存、OpenTelemetry/LangSmith tracing、真实用户流量、DashScope 真实 embedding/rerank、rerank 5 case 全量 benchmark。
 
 # 8 评测设计
 
 answer completeness：当前未做 LLM judge，只用 case success 间接衡量，未实测完整性。
-citation faithfulness：当前实测指标是 claim/source lexical overlap。mock plumbing run 平均 retention 是 `1.0`，只能说明 mock 引用链路没断；DeepSeek v4-flash + Wikipedia benchmark 平均 retention 是 `0.8778`，但仍有 1 条 case 未达当前 success 条件。
-source diversity：当前记录 deduped_source_count，但没有按 domain/provider 多样性打分。
+citation faithfulness：当前实测指标是 claim/source lexical overlap。mock plumbing run 平均 retention 是 `1.0`，只能说明 mock 引用链路没断；最新 DeepSeek v4-flash + Wikipedia 对比里，keyword baseline 平均 retention 是 `0.8867`，local hybrid 是 `0.8929`，但 hybrid success_rate 更低，说明不能只看均值。
+source diversity：当前记录 deduped_source_count，也记录 local retrieval metadata 里的 keyword/vector/rerank rank；但还没有按 domain/provider 多样性和人工相关性打分。
 hallucination rate：当前用 unsupported citation count 作为 proxy，不能覆盖无引用幻觉。
-latency：benchmark 记录每 case latency_ms，并计算 P50/P90/max；mock latency 只能作为 plumbing 回归信号，DeepSeek + Wikipedia latency 包含真实网络/API 时间，也不能当线上 SLA。
-cost：mock provider 成本为 0，token 用字符估算；DeepSeek provider 已接真实 usage，并按当前实现里的 v4-flash 价格常量估算成本，价格核对日期 `2026-06-07`。其他真实 LLM provider 未实测。
-工具失败恢复：有 unit test 覆盖 primary failure fallback 和 circuit breaker open；第一次 DeepSeek + Wikipedia benchmark 出现过 fallback，修复 Wikipedia 长查询压缩后 fallback 曾降到 0，但最新 v4-flash benchmark 真实出现 `fallback_count_total=2`，已在第 7 节如实记录。
+latency：benchmark 记录每 case latency_ms，并计算 P50/P90/max；mock latency 只能作为 plumbing 回归信号，DeepSeek + Wikipedia latency 包含真实网络/API 时间，也不能当线上 SLA。local hybrid 比 keyword baseline p50 多 `6151.778ms`，rerank 首次 smoke 因模型下载/加载更慢，这些都需要如实讲。
+cost：mock provider 成本为 0，token 用字符估算；DeepSeek provider 已接真实 usage，并按当前实现里的 v4-flash 价格常量估算成本，价格核对日期 `2026-06-07`。本地 embedding/rerank 不产生 API 成本，但会产生本机 CPU/GPU 时间；DashScope 成本未实测。
+工具失败恢复：有 unit test 覆盖 primary failure fallback 和 circuit breaker open；第一次 DeepSeek + Wikipedia benchmark 出现过 fallback，修复 Wikipedia 长查询压缩后 fallback 曾降到 0，但最新 keyword/hybrid 对比里仍分别出现 `fallback_count_total=1` 和 `2`，已在第 7 节如实记录。
 multi-hop 成功率：当前没有真实 multi-hop 标注集，未实测。
 
-评测集构造方式：我先放了 5 条围绕本项目核心能力的问题，覆盖 supervisor-researcher、citation faithfulness、tool failure、cost tracking、benchmark reproducibility。它不是公开标准 benchmark，目标是本地可复现 smoke benchmark；现在同时保留 mock plumbing 记录和 DeepSeek + Wikipedia 真实 provider 小样本记录。
+评测集构造方式：我先放了 5 条围绕本项目核心能力的问题，覆盖 supervisor-researcher、citation faithfulness、tool failure、cost tracking、benchmark reproducibility。它不是公开标准 benchmark，目标是本地可复现 smoke benchmark；现在同时保留 mock plumbing 记录、DeepSeek + Wikipedia keyword baseline，以及 DeepSeek + Wikipedia + local hybrid 小样本记录。
 
 # 9 与参考项目的差异
 
@@ -288,7 +304,7 @@ Citation checker 语义能力弱：当前问题是 lexical overlap 只能拦明�
 
 Wikipedia 不是专业 search provider：当前问题是真实 adapter 能跑但相关性和覆盖有限。可行方案是接 Tavily/Brave/SerpAPI 或自建 SearxNG。工程代价是 key、限流、费用和 provider schema 差异。面试怎么讲：我会强调 adapter 已经抽象好，替换 provider 不影响 orchestrator。
 
-Local RAG 只是 keyword overlap：当前问题是召回能力弱。可行方案是加 embedding、向量库和 reranker。工程代价是 embedding cost、index lifecycle、缓存和评测集。面试怎么讲：我会说当前 RAG 是为了展示接口和流程，不把数据库作为 MVP 阻塞项。
+Hybrid retrieval 还没有证明质量稳定提升：当前已经实现 keyword + vector + RRF 和可选 rerank，但 5 case 小样本里 hybrid success_rate 反而低于 keyword baseline。可行方案是扩大本地语料、补人工相关性标注、调 RRF 权重、做持久化 embedding cache，并把 rerank 纳入全量 benchmark。工程代价是索引生命周期、模型加载时间、评测集标注和更多运行成本。面试怎么讲：我会说我完成了检索结构升级，但不会把一次小样本结果包装成质量提升。
 
 没有 durable execution：当前问题是服务重启会丢 run state。可行方案是 LangGraph checkpoint、PostgreSQL 或 Redis。工程代价是部署复杂度和 schema 维护。面试怎么讲：我会说单机 MVP 先保证可测，生产化再加持久化。
 

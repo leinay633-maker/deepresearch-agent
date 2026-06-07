@@ -172,13 +172,35 @@
 ## Q：RAG 在项目里怎么实现？
 [状态: 待消化]
 标签：RAG / Retriever
-检索关键词：LocalRagRetriever, local_corpus
-回答：当前 RAG 是 `LocalRagRetriever`，读取 `data/local_corpus.jsonl`，用 keyword overlap 排序返回本地 source。它不是向量数据库版 RAG，主要用于展示本地知识和 web search 统一进入 Source 管道。
-关联模块：`rag.py`, `data/local_corpus.jsonl`
+检索关键词：LocalRagRetriever, local_corpus, hybrid retrieval
+回答：当前 RAG 是 `LocalRagRetriever`，读取 `data/local_corpus.jsonl` 后先分块。它支持两种模式：`keyword` 是旧基线，用 token overlap 排序；`hybrid` 是默认模式，用关键词召回和 BGE 向量召回两路并存，再用 RRF 融合。向量侧用 `sentence-transformers` 的 `BAAI/bge-small-zh-v1.5` 生成 embedding，用 Chroma 建本地 index。无论哪种模式，最后都返回统一的 `Source`，所以下游 dedup、verifier、synthesizer 不需要改。
+关联模块：`rag.py`, `embeddings.py`, `data/local_corpus.jsonl`
 可追问：
-1. 怎么换成向量数据库？
-2. embedding 成本怎么控制？
+1. 为什么不用向量替换关键词？
+2. embedding 成本和延迟怎么控制？
 3. 本地 RAG 和 web search 冲突怎么办？
+
+## Q：为什么要做混合检索，实测效果怎么样？
+[状态: 待消化]
+标签：RAG / Hybrid Retrieval / 评测
+检索关键词：RRF, keyword, vector, benchmark
+回答：我做混合检索不是为了说“向量一定更好”，而是因为 keyword 和 vector 解决的是不同问题。keyword 对精确术语和本项目里的固定工程词很稳，vector 对语义相近问题更友好；RRF 的好处是只融合排序名次，不要求 keyword 分数和 cosine 分数同尺度。最新 5 case benchmark 结果并不全好看：keyword baseline 的 success_rate 是 1.0，citation retention 平均 0.8867；local hybrid 的 success_rate 降到 0.6，citation retention 平均 0.8929，p50 latency 从 24595.506ms 升到 30747.284ms。所以我会把它讲成检索结构升级和可扩展性增强，不会包装成质量已经稳定提升。
+关联模块：`rag.py`, `benchmark.py`, `results/retrieval_benchmark_comparison.json`
+可追问：
+1. 为什么 hybrid 反而变差？
+2. RRF 的参数怎么选？
+3. 下一步怎么证明相关性真的提升？
+
+## Q：reranker 在项目里怎么接？
+[状态: 待消化]
+标签：RAG / Rerank
+检索关键词：rerank, CrossEncoder, DashScope
+回答：reranker 是可选后处理，不改变主链路。`LocalRagRetriever` 先拿 keyword/vector 融合候选，再在 `rerank_enabled=True` 时调用 `RerankProvider` 重排，最后仍返回 `Source`。默认 provider 是本地 `BAAI/bge-reranker-base`，不需要 API key；也实现了 DashScope rerank provider，只从 `DASHSCOPE_API_KEY` 读 key。默认关闭是因为本地 reranker 首次加载很慢，我实测单条 mock smoke 因下载/加载模型到了约 279 秒，不能默认压到所有运行路径上。
+关联模块：`rag.py`, `rerankers.py`
+可追问：
+1. rerank 为什么默认关闭？
+2. rerank 和 vector search 的区别是什么？
+3. DashScope key 怎么管理？
 
 # Verifier 与来源质量
 
@@ -311,8 +333,8 @@
 [状态: 待消化]
 标签：评测 / Citation
 检索关键词：citation_retention_rate
-回答：它是 supported_claims / total_claims。mock benchmark 的平均 retention 是 1.0，只说明 mock 引用链路没断；DeepSeek v4-flash + Wikipedia 真实 provider benchmark 的平均 retention 是 0.8778，5 条里有 1 条没有达到当前 success 条件，并且这次真实运行出现了 2 次 search fallback。这个指标仍是 lexical overlap，不等于完整语义事实校验。
-关联模块：`citation.py`, `benchmark.py`, `results/benchmark_summary.json`
+回答：它是 supported_claims / total_claims。mock benchmark 的平均 retention 是 1.0，只说明 mock 引用链路没断；最新 DeepSeek v4-flash + Wikipedia 对比里，keyword baseline 平均 retention 是 0.8867，local hybrid 是 0.8929。但 hybrid 的 success_rate 反而从 1.0 降到 0.6，所以这个指标不能单独拿来证明检索变好。它仍是 lexical overlap，不等于完整语义事实校验。
+关联模块：`citation.py`, `benchmark.py`, `results/retrieval_benchmark_comparison.json`
 可追问：
 1. 1.0 是否说明没有幻觉？
 2. 真实 LLM 下会怎样？
@@ -368,7 +390,7 @@
 [状态: 待消化]
 标签：成本控制 / 可观测性
 检索关键词：stage cost, attribution
-回答：多 Agent 系统里只知道总 token 没有太大调优价值。按阶段归因后，才能知道成本主要花在 brief、planning 还是 synthesis。DeepSeek v4-flash + Wikipedia benchmark 总 token 是 19843，总成本按当前实现价格常量估算是 0.00425096 美元。价格取自 DeepSeek 官方 Models & Pricing 页，核对日期是 2026-06-07；后续模型或价格变动时，这个成本必须重算。
+回答：多 Agent 系统里只知道总 token 没有太大调优价值。按阶段归因后，才能知道成本主要花在 brief、planning 还是 synthesis。最新 retrieval 对比里，keyword baseline 总 token 是 17740，总成本按当前实现价格常量估算是 0.00368858 美元；local hybrid 总 token 是 18842，总成本是 0.00399994 美元。本地 embedding 不产生 API 费用，但会增加本机延迟；DeepSeek 价格取自官方 Models & Pricing 页，核对日期是 2026-06-07。
 关联模块：`cost.py`, `benchmark.py`
 可追问：
 1. researcher 的搜索成本怎么计？
@@ -401,8 +423,8 @@
 [状态: 待消化]
 标签：Benchmark / 评测
 检索关键词：benchmark, latency, token, citation
-回答：`benchmark.py` 记录 seed、配置快照、case_id、query、latency_ms、total_tokens、estimated_cost_usd、deduped_source_count、raw_search_result_count、citation_retention_rate、success、fallback_count 和 output_summary。现在有两类数据：mock plumbing run 只证明离线路径和记录链路；DeepSeek v4-flash + Wikipedia run 是真实 provider 小样本，5 条 case 成功 4 条、fallback 2、total_tokens 19843、总成本按当前实现价格常量估算为 0.00425096 美元、平均 citation_retention_rate 0.8778。
-关联模块：`benchmark.py`, `results/benchmark_summary.json`
+回答：`benchmark.py` 记录 seed、配置快照、case_id、query、latency_ms、total_tokens、estimated_cost_usd、deduped_source_count、raw_search_result_count、citation_retention_rate、success、fallback_count 和 output_summary。现在有三类口径：mock plumbing run 只证明离线路径；DeepSeek + Wikipedia + keyword baseline 是当前检索基线，5 条全成功、fallback 1、p50 24595.506ms；DeepSeek + Wikipedia + local hybrid 是混合检索小样本，5 条成功 3 条、fallback 2、p50 30747.284ms。对比结果在 `results/retrieval_benchmark_comparison.json`，我不会只挑好看的数字说。
+关联模块：`benchmark.py`, `results/benchmark_summary.json`, `results/retrieval_benchmark_comparison.json`
 可追问：
 1. 为什么只 5 条 case？
 2. success 怎么定义？

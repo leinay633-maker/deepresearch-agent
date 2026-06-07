@@ -2,7 +2,7 @@
 
 一个故意收窄的 DeepResearch Agent：从用户问题出发，生成 research brief，拆分子问题，并发检索，去重和来源质量过滤后，合成带引用的结构化报告，并对引用做 faithfulness 检查。
 
-默认运行不需要 API key。默认 LLM 和 search 都走 `mock`，用于稳定演示、测试和 mock plumbing benchmark；也可以显式切到 DeepSeek 真实 LLM provider 和 Wikipedia 真实无 key search adapter。DeepSeek API key 只从环境变量 `DEEPSEEK_API_KEY` 读取。
+默认运行不需要 API key。默认 LLM 和 search 都走 `mock`，用于稳定演示、测试和 mock plumbing benchmark；local retrieval 默认使用本地 BGE embedding 做 keyword + vector hybrid，不需要 API key。也可以显式切到 DeepSeek 真实 LLM provider、Wikipedia 真实无 key search adapter，以及 DashScope embedding/rerank provider。所有 key 只从环境变量读取：DeepSeek 用 `DEEPSEEK_API_KEY`，DashScope 用 `DASHSCOPE_API_KEY`。
 
 ## Quickstart
 
@@ -47,6 +47,14 @@ py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --search-provid
 
 输出会写入 `logs/benchmark-*.jsonl` 和 `results/benchmark_summary.json`。
 
+运行 retrieval 对比 benchmark：
+
+```powershell
+$env:REQUEST_TIMEOUT_SECONDS="8"
+py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --llm-model deepseek-v4-flash --search-provider wikipedia --seed 20260607 --max-researchers 2 --max-results 3 --local-retrieval-mode keyword
+py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --llm-model deepseek-v4-flash --search-provider wikipedia --seed 20260607 --max-researchers 2 --max-results 3 --local-retrieval-mode hybrid --embedding-provider local
+```
+
 ## Providers
 
 LLM providers：
@@ -59,6 +67,13 @@ Search providers：
 - `mock`：默认 search provider，离线可复现。
 - `wikipedia`：真实网络检索 adapter，调用 Wikipedia Search API；失败、超时或熔断时自动使用 mock fallback，并在 trace/metrics 里暴露 fallback。
 
+Local retrieval：
+
+- `keyword`：旧基线，只按本地语料 token overlap 排序。
+- `hybrid`：默认本地检索模式，关键词召回 + BGE 向量召回 + Chroma index + RRF 融合，仍输出统一 `Source`。
+- embedding provider 默认 `local`，模型是 `BAAI/bge-small-zh-v1.5`；可显式切到 `dashscope`，key 从 `DASHSCOPE_API_KEY` 读。
+- rerank provider 默认 `local`，模型是 `BAAI/bge-reranker-base`，但 `--rerank-enabled` 才会启用；也可以显式切到 DashScope rerank。
+
 ## Project Layout
 
 ```text
@@ -67,7 +82,9 @@ src/deepresearch_agent/
   orchestrator.py     End-to-end research spine
   llm.py              Mock and DeepSeek structured-output model providers
   search.py           Search adapters, retry, timeout, circuit breaker, fallback
-  rag.py              Local keyword RAG retriever
+  rag.py              Local keyword/vector hybrid RAG retriever
+  embeddings.py       Local and DashScope embedding providers
+  rerankers.py        Optional local and DashScope rerank providers
   verifier.py         Source quality filtering
   citation.py         Citation faithfulness check
   cost.py             Token/cost attribution
