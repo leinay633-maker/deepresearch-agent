@@ -27,6 +27,21 @@ def test_create_run_persists_waiting_approval(tmp_path, monkeypatch) -> None:
     assert any(event.status == "waiting_approval" for event in events)
 
 
+def test_run_review_ui_and_run_list(tmp_path, monkeypatch) -> None:
+    client, _store = _client(tmp_path, monkeypatch)
+    created = client.post("/runs", json=_run_body("How should UI review work?"))
+
+    ui = client.get("/ui")
+    runs = client.get("/runs")
+
+    assert created.status_code == 200
+    assert ui.status_code == 200
+    assert "DeepResearch Run Review" in ui.text
+    assert "planEditor" in ui.text
+    assert runs.status_code == 200
+    assert runs.json()[0]["run_id"] == created.json()["run_id"]
+
+
 def test_approve_continues_to_succeeded(tmp_path, monkeypatch) -> None:
     client, store = _client(tmp_path, monkeypatch)
     run_id = client.post("/runs", json=_run_body("How should approval resume?")).json()["run_id"]

@@ -51,6 +51,14 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8000/runs/$($run.run_id)/approve
 Invoke-RestMethod http://127.0.0.1:8000/runs/$($run.run_id)/trace
 ```
 
+打开本地审核页面：
+
+```text
+http://127.0.0.1:8000/ui
+```
+
+这个页面复用上面的 run control API，支持创建 mock run、查看最近 runs、编辑 planner subquestions、approve/reject/cancel，并展示 SSE events、report、sources 和 citation evidence。它是本地审核面，不包含登录权限或多人协作。
+
 订阅持久化 run 事件，断线后可用 `Last-Event-ID` 续传：
 
 ```powershell

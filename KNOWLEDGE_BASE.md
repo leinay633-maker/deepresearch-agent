@@ -166,6 +166,15 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 代价：当前没有接真实 MCP server 做 live run，只用 fake client 和 adapter 单测验证协议边界；stdio client 是最小实现，不包含长连接复用、server capability 细分、资源订阅和复杂认证。
 面试怎么答：我会说我没有把主链路绑死在某个 MCP server 上，而是先把 MCP 的工具结果纳入统一 Source 模型。后续接 filesystem、browser、company search MCP server 时，不需要改 synthesizer 和 citation checker。
 
+## 决策 16：为什么先做 FastAPI 内置审核页，而不是单独前端工程
+
+背景：Run control plane 已经有 approval/edit/reject/cancel/SSE replay API，但没有 DeerFlow 那种可视化 plan 修改、报告编辑和 citation 查看页面。直接引入 React/Vite 会新增构建链、依赖和部署复杂度。
+可选方案：继续只用 API；新建 React 前端；用 FastAPI 返回一个内置 HTML/JS 页面；接入现成 admin UI。
+最终选择：新增 `src/deepresearch_agent/ui.py`，由 `GET /ui` 返回一个无构建链的审核页面；新增 `GET /runs` 列出最近 run。页面能创建 run、查看 run list、编辑 plan JSON、approve/reject/cancel、订阅 SSE events，并展示 report、sources、citation assessments/evidence quotes。
+理由：本项目当前更需要证明 HITL 后端闭环可用，而不是做复杂产品前端。内置页面一条 `deepresearch-api` 就能打开，适合本地 demo 和面试展示；API 仍保持独立，后续替换成 React 不影响 run control。
+代价：它不是完整产品 UI，没有登录权限、多人协作、富文本报告编辑、可视化 diff、持久草稿和前端测试截图；本机没有 Playwright 包，所以这次只做了 TestClient + HTTP probe，没有浏览器截图验证。
+面试怎么答：我会说这一步把 HITL 从“只有 API”变成“能看、能改、能 approve 的最小审核面”，但不会把它包装成 DeerFlow 级别前端。
+
 # 5 实现细节
 
 Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。局限是 planner 还不会根据 researcher 中间结果动态追加子问题。
@@ -203,6 +212,8 @@ Cost Tracker：`src/deepresearch_agent/cost.py`。mock provider 仍使用字符�
 Trace Logger：`src/deepresearch_agent/tracing.py`。每个 run 写 `logs/research-<run_id>.jsonl`，记录 stage、status、duration_ms、payload。runtime trace 默认不提交 Git，benchmark 原始记录提交。
 
 Agent Run Control Plane：`src/deepresearch_agent/run_control.py` 外包现有 DeepResearch pipeline，不替换 `/research`。`POST /runs` 会创建 `run_id`，执行 brief/planner，然后在 `require_approval=true` 时进入 `waiting_approval`；`approve` 会从 planner checkpoint 继续 researcher、synthesizer、verifier；`edit` 会保存修改后的 subquestions 再继续；`reject/cancel` 会终止 run；`retry` 对 failed run 优先复用 `plan_json` 从 researcher 阶段重跑。`run_store.py` 的 SQLite schema 是三张表：`agent_runs` 保存 run 状态、plan/result、token/cost；`agent_steps` 保存阶段输入输出、latency、token_usage、cost、error、retry_count；`agent_events` 保存可 SSE replay 的单调递增 event。
+
+Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.py`。`GET /ui` 返回内置 HTML/JS；`GET /runs` 返回最近 run list，底层是 `RunStore.list_runs()`。页面直接调用现有 `/runs/{id}/approve`、`/edit`、`/reject`、`/cancel`、`/events`，展示 planner subquestions、event stream、answer、sources 和 citation evidence quotes。局限是它只是本地审核面，没有权限、协作、前端构建/测试体系。
 
 # 6 遇到的问题与修复
 
@@ -323,6 +334,15 @@ Agent Run Control Plane：`src/deepresearch_agent/run_control.py` 外包现有 D
 复盘：本地 embedding/hybrid 默认路径会影响测试耗时。之后如果 CI 要稳定，可以在 API/spine 测试里显式设置 `LOCAL_RETRIEVAL_MODE=keyword` 或做 fixture 级缓存。
 面试可能追问：为什么不马上优化？回答：这次功能目标是 citation grounding，不做额外性能 refactor；但这个现象说明生产/CI 里需要索引缓存和测试模式隔离。
 
+## 问题 14：UI approve HTTP probe 30 秒超时但 run 最终成功
+
+现象：临时启动 `/ui` 服务后，我用 PowerShell 调 `POST /runs/{run_id}/approve` 做后端 flow 验证，30 秒命令超时；随后等待 20 秒再查 run，状态已经是 `succeeded`，result_json 正常。
+原因：临时服务没有设置 `LOCAL_RETRIEVAL_MODE=keyword`，走默认 hybrid local retrieval；首次 approve 触发本地 embedding/Chroma 冷启动，researcher 阶段耗时约 `36s`，超过这次手工 probe 的 30 秒 timeout。
+排查：查看 run metrics，`latency_ms=36307.56`，fallback 为 0，status succeeded；说明不是 UI 或 approve API 错，而是默认检索模式冷启动慢。
+修复：没有改功能代码；文档中把这次 smoke 如实记录。后续 demo 如果要快，可以在启动服务前设置 `LOCAL_RETRIEVAL_MODE=keyword`，或做 persistent vector index/cache。
+复盘：默认功能更完整和 demo 响应更快之间有取舍。hybrid 默认展示检索能力，但审核页演示需要明确环境变量或预热。
+面试可能追问：这是不是生产不可用？回答：这说明当前还没有生产级索引生命周期和 warm worker；我不会把它说成低延迟生产 UI，但 run control 能正确等待长任务完成。
+
 # 7 实测数据
 
 本节所有 mock benchmark 数字只用于证明 pipeline plumbing 能端到端跑通，不能当作真实性能、真实成本或真实答案质量成果。尤其不能在面试里说“我的 DeepResearch p50 是个位数毫秒”这类话，因为这个延迟测的是本机 Python 跑 deterministic mock 的速度，换机器、换进程热身状态、换依赖版本都会变。
@@ -330,7 +350,7 @@ Agent Run Control Plane：`src/deepresearch_agent/run_control.py` 外包现有 D
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
-测试验证：`py -3.11 -m pytest -q`，最新结果 `47 passed, 2 warnings in 54.62s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 Chroma/OpenTelemetry 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `48 passed, 2 warnings in 53.72s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 Chroma/OpenTelemetry 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -351,6 +371,8 @@ Claim-level evidence grounding smoke：`py -3.11 -m pytest tests/test_quality_an
 Reflection loop smoke：`py -3.11 -m pytest tests/test_reflection_loop.py tests/test_run_control.py -q` 成功，`9 passed, 1 warning in 4.49s`。`tests/test_reflection_loop.py` 覆盖 orchestrator 在 `reflection_enabled=True`、`max_reflection_rounds=1`、`reflection_min_sources=4` 时追加 `R1` follow-up question，并写入 `compression.round1` / `reflection.round1` trace。`tests/test_run_control.py` 也覆盖了 `/runs` approve 后 result_json 的 plan 包含 `R1`，trace_events 包含 `reflection.round1`。CLI smoke：`py -3.11 -m deepresearch_agent.cli "How should citation grounding work in a research agent?" --search-provider mock --llm-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --reflection-enabled --max-reflection-rounds 1 --reflection-min-sources 4 --json` 成功，输出可见 `id="R1"`、`compression.round1`、`reflection.round1` 和 `should_add_question=true`。
 
 MCP adapter smoke：`py -3.11 -m pytest tests/test_mcp_tools.py tests/test_web_search_providers.py tests/test_failure_handling.py -q` 成功，`14 passed in 0.37s`。覆盖 MCP result 的 `sources` array 转 `Source`、`content[type=text]` JSON 转 `Source`、`McpToolSearchAdapter` 调 fake client、`build_search_adapter(..., "mcp")` 构造 provider、以及缺少 `MCP_SEARCH_TOOL` 时 fail-fast。当前没有配置真实 MCP server，所以 stdio/http live call 未实测。
+
+Run review UI smoke：`py -3.11 -m pytest tests/test_run_control.py tests/test_api.py -q` 成功，`11 passed, 2 warnings in 45.22s`，覆盖 `/ui` 返回页面、`GET /runs` 列出刚创建的 run、原 approval/edit/cancel/retry/SSE replay 仍可用。临时启动 `py -3.11 -m deepresearch_agent.api --host 127.0.0.1 --port 8010` 后，`/health` 返回 `ok`，`/ui` HTML 包含 `DeepResearch Run Review`、`planEditor`、`EventSource`，`POST /runs` 创建 run 后 `GET /runs` 能看到它。`POST /runs/{run_id}/approve` 第一次 30s probe 超时，但 20s 后查询 run 已 `succeeded`，metrics latency 约 `36307.56ms`；原因是临时服务没有设置 `LOCAL_RETRIEVAL_MODE=keyword`，默认 hybrid 冷启动加载本地模型。Node 环境没有 `playwright` 包，所以没有做截图验证。
 
 mock benchmark 原始记录：`logs/benchmark-20260606T152954Z.jsonl`。
 当前 benchmark summary：`results/benchmark_summary.json`，已被真实 DeepSeek + Wikipedia benchmark 覆盖。

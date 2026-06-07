@@ -8,7 +8,7 @@ from typing import Any
 import uvicorn
 from fastapi import Header, HTTPException
 from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 from deepresearch_agent.orchestrator import DeepResearchOrchestrator
 from deepresearch_agent.run_control import TERMINAL_STATUSES, RunController
@@ -21,6 +21,7 @@ from deepresearch_agent.run_models import (
     RunTrace,
 )
 from deepresearch_agent.schemas import ResearchRequest, StructuredReport
+from deepresearch_agent.ui import RUN_REVIEW_HTML
 
 app = FastAPI(title="DeepResearch Agent", version="0.1.0")
 
@@ -28,6 +29,11 @@ app = FastAPI(title="DeepResearch Agent", version="0.1.0")
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/ui", response_class=HTMLResponse)
+async def run_review_ui() -> str:
+    return RUN_REVIEW_HTML
 
 
 @app.post("/research", response_model=StructuredReport)
@@ -69,6 +75,12 @@ async def research_stream(request: ResearchRequest) -> StreamingResponse:
 @app.post("/runs", response_model=AgentRun)
 async def create_run(request: CreateRunRequest) -> AgentRun:
     return await RunController().create_run(request)
+
+
+@app.get("/runs", response_model=list[AgentRun])
+async def list_runs(limit: int = 20) -> list[AgentRun]:
+    bounded_limit = min(max(limit, 1), 100)
+    return RunController().list_runs(limit=bounded_limit)
 
 
 @app.get("/runs/{run_id}", response_model=AgentRun)

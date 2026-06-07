@@ -430,6 +430,17 @@
 2. 为什么普通 request log 不够？
 3. 长任务如何避免重复执行？
 
+## Q：为什么先做一个内置审核页面？
+[状态: 待消化]
+标签：HITL / 前端审核
+检索关键词：run review UI, plan approval, HITL
+回答：之前 HITL 只有 API，能证明后端状态机，但面试时很难直观看到 planner 后审核、改 subquestions、approve/reject/cancel、SSE events 和 citation evidence。我这次没有新起 React 前端，而是在 FastAPI 里加了 `/ui`，用一个无构建链的本地页面复用现有 run control API。它解决的是“能看见和操作长任务”的展示问题；局限是没有登录、多用户协作，也没有把报告编辑持久化。
+关联模块：`ui.py`, `api.py`, `run_control.py`
+可追问：
+1. 为什么不用 React？
+2. 页面怎么复用后端 API？
+3. 当前页面有哪些生产化缺口？
+
 ## Q：为什么需要 run_id？
 [状态: 待消化]
 标签：Run Control / 状态机

@@ -71,6 +71,18 @@ class RunStore:
             ).fetchone()
         return _run_from_row(row) if row is not None else None
 
+    def list_runs(self, limit: int = 20) -> list[AgentRun]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM agent_runs
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [_run_from_row(row) for row in rows]
+
     def require_run(self, run_id: str) -> AgentRun:
         run = self.get_run(run_id)
         if run is None:

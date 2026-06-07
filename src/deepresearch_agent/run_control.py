@@ -114,6 +114,9 @@ class RunController:
     def get_run(self, run_id: str) -> AgentRun:
         return self.store.require_run(run_id)
 
+    def list_runs(self, limit: int = 20) -> list[AgentRun]:
+        return self.store.list_runs(limit=limit)
+
     def steps(self, run_id: str):
         self.store.require_run(run_id)
         return self.store.list_steps(run_id)
