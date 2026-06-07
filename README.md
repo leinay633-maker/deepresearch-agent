@@ -68,6 +68,21 @@ py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --search-provid
 
 输出会写入 `logs/benchmark-*.jsonl` 和 `results/benchmark_summary.json`。
 
+运行公开 Deep Research 端到端评测 artifact：
+
+```powershell
+py -3.11 -m deepresearch_agent.deep_research_eval --dataset livedrbench-preview --limit 1 --llm-provider mock --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1
+```
+
+运行 DeepSeek + Wikipedia 的公开评测口径：
+
+```powershell
+$env:DEEPSEEK_API_KEY="<your-key>"
+py -3.11 -m deepresearch_agent.deep_research_eval --dataset livedrbench-preview --limit 1 --llm-provider deepseek --search-provider wikipedia --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --request-timeout-seconds 8
+```
+
+输出会写入 `logs/deep-research-eval-*.jsonl`、`results/deep_research_eval_summary.json` 和 `results/livedrbench_predictions.json`。当前脚本先产可复查 artifact 和 LiveDRBench-style predictions；官方 judge/answer-quality scoring 尚未接入。
+
 运行 retrieval 对比 benchmark：
 
 ```powershell
@@ -114,6 +129,7 @@ src/deepresearch_agent/
   cost.py             Token/cost attribution
   tracing.py          Structured JSONL trace events
   benchmark.py        Reproducible benchmark harness
+  deep_research_eval.py Public end-to-end Deep Research eval artifact runner
 ```
 
 See `KNOWLEDGE_BASE.md` and `INTERVIEW_QA.md` for implementation notes and interview drill material.

@@ -568,12 +568,23 @@
 [状态: 待消化]
 标签：Benchmark / 评测
 检索关键词：benchmark, latency, token, citation
-回答：`benchmark.py` 记录 seed、配置快照、case_id、query、latency_ms、total_tokens、estimated_cost_usd、deduped_source_count、raw_search_result_count、citation_retention_rate、success、fallback_count 和 output_summary。现在有四类口径：mock plumbing run 只证明离线路径；DeepSeek + Wikipedia + keyword baseline 是端到端检索基线；DeepSeek + Wikipedia + local hybrid 是混合检索小样本；BEIR/scifact 是独立检索模块评测，只看 Recall@10、nDCG@10、MRR，不调用 LLM。对比结果分别在 `results/retrieval_benchmark_comparison.json` 和 `results/retrieval_eval_scifact.json`，我不会只挑好看的数字说。
-关联模块：`benchmark.py`, `retrieval_eval.py`, `results/benchmark_summary.json`, `results/retrieval_benchmark_comparison.json`, `results/retrieval_eval_scifact.json`
+回答：`benchmark.py` 记录 seed、配置快照、case_id、query、latency_ms、total_tokens、estimated_cost_usd、deduped_source_count、raw_search_result_count、citation_retention_rate、success、fallback_count 和 output_summary。现在有五类口径：mock plumbing run 只证明离线路径；DeepSeek + Wikipedia + keyword baseline 是端到端检索基线；DeepSeek + Wikipedia + local hybrid 是混合检索小样本；BEIR/scifact 是独立检索模块评测，只看 Recall@10、nDCG@10、MRR；LiveDRBench preview 是公开 Deep Research 端到端 artifact 评测，当前只产 answer/source/trace/cost/predictions 和本项目 citation 指标，还没有官方 judge 分数。对比结果分别在 `results/retrieval_benchmark_comparison.json`、`results/retrieval_eval_scifact.json` 和 `results/deep_research_eval_livedrbench_deepseek_wikipedia_summary.json`，我不会只挑好看的数字说。
+关联模块：`benchmark.py`, `retrieval_eval.py`, `deep_research_eval.py`, `results/benchmark_summary.json`, `results/retrieval_benchmark_comparison.json`, `results/retrieval_eval_scifact.json`
 可追问：
 1. 为什么只 5 条 case？
 2. success 怎么定义？
 3. 如何扩成公开 benchmark？
+
+## Q：公开 Deep Research 评测现在做到什么程度？
+[状态: 待消化]
+标签：Benchmark / Deep Research Eval
+检索关键词：LiveDRBench, public deep research eval, artifact, judge
+回答：我新增了 `src/deepresearch_agent/deep_research_eval.py`，它能加载本地 JSONL/JSON/CSV，也能直接从 Hugging Face 拉 `microsoft/LiveDRBench` 的 preview 或 v1-full，跑完整 orchestrator，并保存 raw JSONL、summary JSON 和 LiveDRBench-style predictions。当前我没有编官方分数，`judge_provider` 还是 `none`；最新真实样本是 1 条 LiveDRBench preview，DeepSeek v4-flash + Wikipedia 跑通但 `success_rate=0.0`、citation retention `0.5`、latency `20910.052ms`、token `3434`、成本 `$0.00072332`。这说明公开评测入口打通了，但 Wikipedia 搜索覆盖、JSON 格式任务约束和 citation 语义校验都还不够。
+关联模块：`deep_research_eval.py`, `orchestrator.py`, `results/deep_research_eval_livedrbench_deepseek_wikipedia_summary.json`
+可追问：
+1. 为什么不直接报官方分？
+2. LiveDRBench 和 BEIR/scifact 有什么区别？
+3. 下一步怎么接 judge？
 
 # 对比与岗位表达
 
@@ -625,8 +636,8 @@
 [状态: 待消化]
 标签：局限 / 诚实表达
 检索关键词：limitations, real LLM, semantic evaluation
-回答：最大短板已经不是“完全没有真实 LLM”，而是只接了 DeepSeek v4-flash 一个 provider，真实 benchmark 也只有 5 条小样本；Wikipedia 不是生产级搜索，citation checker 只是 lexical overlap，不能代表完整事实校验。我会在面试里主动说清楚：真实 provider 路径和 cost usage 已经跑通，但质量评测和生产化还没有完成。
-关联模块：`llm.py`, `citation.py`, `KNOWLEDGE_BASE.md`
+回答：最大短板已经不是“完全没有真实 LLM”，而是公开真实任务上的质量还没站住：DeepSeek v4-flash 只接了一个 provider，Wikipedia 不是生产级搜索，LiveDRBench preview 的 1 条真实样本已经跑通但 `success_rate=0.0`，而 citation checker 仍只是 lexical overlap。现在我会主动说：公开评测 artifact 入口已经有了，但官方 judge、网页 crawler、语义级 grounding 和多 provider 还没完成。
+关联模块：`llm.py`, `search.py`, `citation.py`, `deep_research_eval.py`, `KNOWLEDGE_BASE.md`
 可追问：
 1. 下一步先补哪个？
 2. 怎么接 OpenAI？

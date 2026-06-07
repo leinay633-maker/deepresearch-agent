@@ -27,6 +27,7 @@ dev = [
 deepresearch = "deepresearch_agent.cli:main"
 deepresearch-api = "deepresearch_agent.api:main"
 deepresearch-benchmark = "deepresearch_agent.benchmark:main"
+deepresearch-public-eval = "deepresearch_agent.deep_research_eval:main"
 deepresearch-retrieval-eval = "deepresearch_agent.retrieval_eval:main"
 deepresearch-validate-embeddings = "deepresearch_agent.validate_embeddings:main"
 

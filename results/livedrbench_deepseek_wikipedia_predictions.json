@@ -1,0 +1,10 @@
+[
+  {
+    "key": "55",
+    "preds": [
+      [
+        "## Report on Papers Using All Five Specified Datasets\n\n### Query\nFind academic papers that simultaneously use the American Community Survey, FEMA Harvey Flood Depths Grid, Food Access Research Atlas, Streetlight Data, and SafeGraph POI data.\n\n### Findings\nAfter reviewing the provided sources, **no paper was identified that uses all five datasets together** [S1][S2][S3]. The sources include general Wikipedia content on IMRAD structure and internal notes about research workflow, but no specific study combining these datasets.\n\n### Limitations\n- The search was limited to the three sources available; a broader literature search in academic databases (e.g., Scopus, Web of Science) might reveal relevant papers.\n- It is possible that papers exist but do not explicitly mention all datasets in the abstract or keywords, or that the datasets are used across different analyses within the same paper without being listed together.\n- The datasets are commonly used in urban and disaster research, but a combination of all five appears rare.\n\n### Conclusion\nBased on the evidence provided, no paper matching the exact criteria was found. Further investigation with a wider search scope is recommended."
+      ]
+    ]
+  }
+]

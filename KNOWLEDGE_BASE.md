@@ -1,6 +1,6 @@
 # 0 项目一句话介绍
 
-本项目是我从空仓库开始手写的一个收窄版 DeepResearch Agent，目标不是复刻大而全的 open_deep_research，而是把「问题澄清、research brief、并发 researcher、来源去重、带引用合成、citation check、trace 和 benchmark」这条主链路做干净，并补上可管理的 run control plane。它解决的是普通 RAG 一次性检索后直接回答时，难以解释检索路径、引用是否支撑论断、工具失败如何降级的问题。当前版本默认使用 mock LLM 和 mock search，保证无 API key 也能一条命令跑通；同时已经接入 DeepSeek 真实 LLM provider、Wikipedia 真实检索 adapter、本地关键词 + 向量 + RRF 融合的 hybrid local retrieval，以及 SQLite run_id / checkpoint / HITL / SSE replay 控制平面。这个项目体现的 Agent 后端能力主要是多阶段编排、并发工具调用、失败兜底、混合检索、可观测性、成本归因、可复现评测和长任务状态管理。
+本项目是我从空仓库开始手写的一个收窄版 DeepResearch Agent，目标不是复刻大而全的 open_deep_research，而是把「问题澄清、research brief、并发 researcher、来源去重、带引用合成、citation check、trace 和 benchmark」这条主链路做干净，并补上可管理的 run control plane。它解决的是普通 RAG 一次性检索后直接回答时，难以解释检索路径、引用是否支撑论断、工具失败如何降级的问题。当前版本默认使用 mock LLM 和 mock search，保证无 API key 也能一条命令跑通；同时已经接入 DeepSeek 真实 LLM provider、Wikipedia 真实检索 adapter、本地关键词 + 向量 + RRF 融合的 hybrid local retrieval、SQLite run_id / checkpoint / HITL / SSE replay 控制平面，以及 LiveDRBench 这类公开 Deep Research 任务的端到端 artifact 评测 runner。这个项目体现的 Agent 后端能力主要是多阶段编排、并发工具调用、失败兜底、混合检索、可观测性、成本归因、可复现评测和长任务状态管理。
 
 # 1 岗位匹配
 
@@ -18,7 +18,7 @@ Agent 编排层：`src/deepresearch_agent/orchestrator.py`。输入是用户 que
 
 检索质量层：`src/deepresearch_agent/dedup.py`、`src/deepresearch_agent/verifier.py`。Dedup 按规范化 URL 合并重复来源，Verifier 按标题、正文长度、稳定 URL、已知 adapter、低质量模式打分过滤。
 
-评测层：`src/deepresearch_agent/benchmark.py`、`src/deepresearch_agent/retrieval_eval.py`、`data/benchmark_cases.jsonl`、`tests/`。端到端 benchmark 固定 seed 和配置快照，记录 latency、tokens、cost、source count、citation retention、success；独立检索评测只加载 BEIR/scifact 的 corpus/query/qrels，计算 Recall@10、nDCG@10 和 MRR，不调用 LLM、Wikipedia 或 orchestrator 主链路。
+评测层：`src/deepresearch_agent/benchmark.py`、`src/deepresearch_agent/retrieval_eval.py`、`src/deepresearch_agent/deep_research_eval.py`、`data/benchmark_cases.jsonl`、`tests/`。端到端 benchmark 固定 seed 和配置快照，记录 latency、tokens、cost、source count、citation retention、success；独立检索评测只加载 BEIR/scifact 的 corpus/query/qrels，计算 Recall@10、nDCG@10 和 MRR，不调用 LLM、Wikipedia 或 orchestrator 主链路；公开 Deep Research 评测 runner 会加载 LiveDRBench 等公开任务，跑完整 orchestrator 并输出 answer、sources、trace、cost、citation check 和 predictions artifact。
 
 可观测层：`src/deepresearch_agent/tracing.py`、`src/deepresearch_agent/cost.py`。Trace 每阶段写 JSONL，Cost 按 brief_generation、planning、synthesis 归因 token 和成本；mock 路径仍是字符数近似，DeepSeek 路径使用 provider 返回的真实 usage。
 
@@ -121,6 +121,15 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 代价：它不是分布式调度系统，没有 worker queue、lease、并发抢占和跨进程取消；阶段级恢复当前以 planner checkpoint 后从 researcher 重跑为主，没有精确恢复到某个 researcher 子任务内部。
 面试怎么答：我会说我借鉴的是 LangGraph 的 durable execution、checkpoint 和 human-in-the-loop 思想，但没有为了框架迁移牺牲项目可读性；我实现的是后端控制平面最小闭环：状态机、SQLite checkpoint、approval/resume/cancel/retry、SSE replay。
 
+## 决策 11：为什么先补公开 Deep Research artifact 评测，而不是先做 judge 打分
+
+背景：之前只有 5 条本地端到端 smoke benchmark 和 BEIR/scifact 检索模块评测。它们能证明 plumbing 和 retriever，但不能回答“面对公开 Deep Research 任务，完整报告链路表现怎样”，这是和 open_deep_research 这类项目的可信度差距。
+可选方案：直接接官方 judge/LLM 评分；先手写更多本地 case；先复用 LiveDRBench/Deep Research Bench 任务格式输出 artifacts；继续只看 BEIR/scifact。
+最终选择：新增 `src/deepresearch_agent/deep_research_eval.py`，优先做公开任务加载、完整 orchestrator 运行、raw JSONL、summary JSON 和 LiveDRBench-style predictions 输出；judge provider 先保留为 `none`，不编官方分数。
+理由：没有 judge key 或官方 scoring 环境时，最重要的是先把每题的 query、配置快照、answer、claims、sources、trace、token、cost、citation check 和失败原因保存下来，保证结果可复查。这样下一步接 judge 或人工复核时不用重构评测入口。
+代价：当前 `success_rate` 仍沿用本项目 citation retention 阈值，不等于官方 Deep Research Bench 分数；LiveDRBench 任务常要求精确 JSON/论文标题，当前 synthesizer 还不是专门为该格式训练或约束的，所以真实组可以跑但质量很差。
+面试怎么答：我会说我先补的是“公开任务可跑、artifact 可审计”的评测底座，而不是假装已经有官方 leaderboard 分数。最新 1 条 LiveDRBench preview 真实口径就是失败样本：DeepSeek v4-flash + Wikipedia 跑通但 `success_rate=0.0`、citation retention `0.5`，这反而暴露了搜索覆盖和 citation 语义评测短板。
+
 # 5 实现细节
 
 Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。局限是 planner 还不会根据 researcher 中间结果动态追加子问题。
@@ -138,6 +147,8 @@ Hybrid Local Retriever：`src/deepresearch_agent/rag.py`。输入 query 和 top-
 Rerank Provider：`src/deepresearch_agent/rerankers.py`。输入 query 和候选 source，输出重排分数。默认 provider 是本地 `BAAI/bge-reranker-base`，但 `rerank_enabled` 默认关闭；DashScope rerank provider 调 `https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank`，key 仍只读 `DASHSCOPE_API_KEY`。本地 rerank 单条 smoke 跑通过，但首次模型下载/加载使 latency 约 `279692.721ms`，所以没有把它放进默认 benchmark。
 
 Retrieval Eval Harness：`src/deepresearch_agent/retrieval_eval.py`。输入是 BEIR/scifact 的 corpus、queries、qrels，输出 `results/retrieval_eval_scifact.json`。这个脚本不调用 LLM、不调用 Wikipedia、不跑 orchestrator，只把 SciFact 文档写成本项目 local corpus 格式，然后复用 `LocalRagRetriever` 跑 keyword / hybrid / hybrid+rerank。评测默认不保存每个 query 的 ranking 明细，避免结果文件过大；需要排查时可以显式加 `--include-rankings`。
+
+Public Deep Research Eval Harness：`src/deepresearch_agent/deep_research_eval.py`。输入可以是本地 JSONL/JSON/CSV，也可以直接从 Hugging Face datasets-server 拉 `microsoft/LiveDRBench` 的 `preview` 或 `v1-full` split。它会跑完整 `DeepResearchOrchestrator`，写 `logs/deep-research-eval-*.jsonl`、summary JSON 和 LiveDRBench-style `preds` 文件。当前 `judge_provider` 只有 `none`，所以它只产 artifact 和本项目已有 success/citation/cost 指标，不产官方 answer-quality 分数。
 
 Verifier：`src/deepresearch_agent/verifier.py`。输入是 source 列表，输出是过滤后的 source。关键设计是可解释 quality reasons。局限是规则打分，不能真正判断来源权威性。
 
@@ -234,6 +245,15 @@ Agent Run Control Plane：`src/deepresearch_agent/run_control.py` 外包现有 D
 复盘：rerank 的质量收益要和延迟一起讲，不能只展示 nDCG/MRR 变好；本地 CPU cross-encoder 在独立评测里可以接受，在默认端到端 benchmark 里仍不应默认开启。
 面试可能追问：这算不算为结果调参？回答：不是调参，top_k 和 candidate_k 仍是 10；我只是让评测脚本复用同一个 provider 并批量打分，避免重复加载模型造成的工程噪声。
 
+## 问题 10：公开评测 raw log 文件名并发撞名
+
+现象：第一次并发跑 `deep_research_eval` 的 mock 组和 DeepSeek/Wikipedia 真实组时，两边都生成了同一个 `logs/deep-research-eval-20260607T133055Z.jsonl` raw log 路径，summary 里的 raw_log 指向同一文件。
+原因：文件名时间戳只精确到秒；两个评测进程在同一秒启动，默认 raw log 名称完全相同。
+排查：我同时查看两组 summary，发现 `raw_log` 字段相同，但 provider 配置不同；这说明不是 orchestrator 结果问题，而是 artifact 命名问题。
+修复：把 `deep_research_eval.py` 的默认 timestamp 改成微秒级 `YYYYMMDDTHHMMSSffffffZ`，然后清掉撞名临时文件，顺序重跑 mock 和真实两组结果。
+复盘：评测 artifact 是可信度的一部分，不能只保证脚本能跑，还要保证并行/重复运行时不会覆盖证据文件。
+面试可能追问：为什么不直接用 UUID？回答：UUID 也可以；我这次选微秒时间戳是为了保留人类可读的运行时间，同时把秒级撞名风险降掉。下一步如果做 worker queue，可以再加 run_id 或 provider suffix。
+
 # 7 实测数据
 
 本节所有 mock benchmark 数字只用于证明 pipeline plumbing 能端到端跑通，不能当作真实性能、真实成本或真实答案质量成果。尤其不能在面试里说“我的 DeepResearch p50 是个位数毫秒”这类话，因为这个延迟测的是本机 Python 跑 deterministic mock 的速度，换机器、换进程热身状态、换依赖版本都会变。
@@ -241,7 +261,7 @@ Agent Run Control Plane：`src/deepresearch_agent/run_control.py` 外包现有 D
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
-测试验证：`py -3.11 -m pytest`，最新结果 `30 passed, 2 warnings in 56.59s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 Chroma/OpenTelemetry 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `34 passed, 2 warnings in 124.04s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 Chroma/OpenTelemetry 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -300,11 +320,20 @@ benchmark 汇总：管线 plumbing 指标，mock，非真实性能。具体 late
 
 这组评测不能外推成“线上问答质量提升”。SciFact 是英文科学摘要，query/qrels 来自公开 IR benchmark，和本项目求职知识库、小规模 local corpus、中文问题不是同一分布。面试里我会把它作为“检索模块结构升级的独立证据”，同时主动说它和 DeepSeek + Wikipedia 的端到端成功率、fallback、citation retention 是两套指标。
 
-未实测：真实搜索 API 高并发限流、语义级 citation faithfulness、Redis/PostgreSQL 缓存、OpenTelemetry/LangSmith tracing、真实用户流量、DashScope 真实 embedding/rerank、rerank 5 case 全量 benchmark。
+公开 Deep Research 端到端 artifact 评测（LiveDRBench preview）：这组是公开任务驱动完整 orchestrator，不是只测 retriever。脚本是 `src/deepresearch_agent/deep_research_eval.py`，默认从 Hugging Face datasets-server 拉 `microsoft/LiveDRBench` 的 `preview/test` 行，输出 summary、raw JSONL 和 LiveDRBench-style predictions。当前还没有接官方 judge，所以 `official_judge_score=not_run`；下面的 success 仍是本项目现有 citation retention 阈值口径，不是官方排行榜分数。
+
+| 口径 | summary | raw log | case_count | success_rate | citation_retention_rate_avg | deduped_source_count_avg | latency p50 | total_tokens | estimated_cost_usd_total | fallback_count_total |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| LiveDRBench preview + mock/mock plumbing | `results/deep_research_eval_livedrbench_mock_summary.json` | `logs/deep-research-eval-20260607T133222828802Z.jsonl` | 1 | 1.0 | 1.0 | 3.0 | 5.785ms | 2624 | 0.0 | 0 |
+| LiveDRBench preview + DeepSeek v4-flash + Wikipedia | `results/deep_research_eval_livedrbench_deepseek_wikipedia_summary.json` | `logs/deep-research-eval-20260607T133237936766Z.jsonl` | 1 | 0.0 | 0.5 | 3.0 | 20910.052ms | 3434 | 0.00072332 | 0 |
+
+这条公开真实 case 的 query 是让系统根据 `American Community Survey / FEMA Harvey flood depths / USDA Food Access Research Atlas / Streetlight / SafeGraph POI` 找使用全部数据集的论文，并按 JSON 返回 `paper_title`。真实组没有报错，也没有 fallback，但 success 为 0，说明当前 DeepSeek + Wikipedia + 本地 keyword RAG 没有解决这类公开精确查证任务；citation retention 只有 `0.5`，也说明 lexical citation check 已经暴露支撑不足。面试里我会把它讲成“公开评测入口已经打通，但质量短板被暴露出来”，不会把 mock 组的 `1.0` 当质量成果。
+
+未实测：LiveDRBench/Deep Research Bench 官方 judge 分数、真实搜索 API 高并发限流、语义级 citation faithfulness、Redis/PostgreSQL 缓存、OpenTelemetry/LangSmith tracing、真实用户流量、DashScope 真实 embedding/rerank、rerank 5 case 全量 benchmark。
 
 # 8 评测设计
 
-answer completeness：当前未做 LLM judge，只用 case success 间接衡量，未实测完整性。
+answer completeness：当前未做 LLM judge 或官方 Deep Research judge，只用 case success 间接衡量。LiveDRBench preview 已经能驱动完整 orchestrator 产 artifact，但 answer-quality 官方分数仍未实测。
 citation faithfulness：当前实测指标是 claim/source lexical overlap。mock plumbing run 平均 retention 是 `1.0`，只能说明 mock 引用链路没断；最新 DeepSeek v4-flash + Wikipedia 对比里，keyword baseline 平均 retention 是 `0.8867`，local hybrid 是 `0.8929`，但 hybrid success_rate 更低，说明不能只看均值。
 retrieval quality：端到端 benchmark 里的 citation_retention 会受 LLM 和 search 波动影响，所以我新增了 BEIR/scifact 独立检索评测，直接用 qrels 计算 Recall@10、nDCG@10、MRR。当前真实结果是 keyword `0.6000/0.4823/0.4548`，hybrid `0.8239/0.6597/0.6114`，hybrid+rerank `0.8239/0.7307/0.7083`。
 source diversity：当前记录 deduped_source_count，也记录 local retrieval metadata 里的 keyword/vector/rerank rank；但还没有按 domain/provider 多样性和人工相关性打分。
@@ -314,15 +343,15 @@ cost：mock provider 成本为 0，token 用字符估算；DeepSeek provider 已
 工具失败恢复：有 unit test 覆盖 primary failure fallback 和 circuit breaker open；第一次 DeepSeek + Wikipedia benchmark 出现过 fallback，修复 Wikipedia 长查询压缩后 fallback 曾降到 0，但最新 keyword/hybrid 对比里仍分别出现 `fallback_count_total=1` 和 `2`，已在第 7 节如实记录。
 multi-hop 成功率：当前没有真实 multi-hop 标注集，未实测。
 
-评测集构造方式：端到端 5 条 case 是围绕本项目核心能力手写的 smoke benchmark，覆盖 supervisor-researcher、citation faithfulness、tool failure、cost tracking、benchmark reproducibility。它不是公开标准 benchmark；公开标准口径只用于检索模块，当前采用 BEIR/scifact test qrels，且只评测 local retriever，不评测 LLM 回答质量。
+评测集构造方式：端到端 5 条 case 是围绕本项目核心能力手写的 smoke benchmark，覆盖 supervisor-researcher、citation faithfulness、tool failure、cost tracking、benchmark reproducibility。公开检索标准口径采用 BEIR/scifact test qrels，只评测 local retriever，不评测 LLM 回答质量。公开 Deep Research 端到端口径新增 LiveDRBench preview runner，会跑完整 orchestrator 并保存 answer/source/trace/cost/predictions artifacts；当前只跑了 1 条 mock 和 1 条 DeepSeek/Wikipedia 样本，官方 judge 分数尚未接入。
 
 # 9 与参考项目的差异
 
 ## open_deep_research
 
-参考了什么：我读了 README 和 CLAUDE.md，参考了它的 deep research 三段式、multi-agent / parallel researcher、模型需要 structured output + tool calling、评测和配置化思想。
+参考了什么：我读了 README 和 CLAUDE.md，参考了它的 deep research 三段式、multi-agent / parallel researcher、模型需要 structured output + tool calling、评测和配置化思想；这次还参考它把公开 deep research benchmark 当可信度证据的方向。
 没照搬什么：没有复制它的 LangGraph graph、prompt、state、配置文件或 eval 代码。
-我做了哪些改造：改成自定义轻量 orchestrator，把 citation checker、source verifier、fallback、trace/cost、benchmark 都做成直接可读的小模块。
+我做了哪些改造：改成自定义轻量 orchestrator，把 citation checker、source verifier、fallback、trace/cost、benchmark 都做成直接可读的小模块；公开评测先做成 LiveDRBench artifact runner，保留本项目自己的 summary/raw log/predictions 输出，而不是直接搬它的评测栈。
 为什么更适合求职展示：代码量小，面试时能从 API 到 citation check 一路讲清楚，不会被大框架细节淹没。
 
 ## deep_research_from_scratch
