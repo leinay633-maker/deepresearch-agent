@@ -161,8 +161,8 @@
 ## Q：真实 search adapter 是什么？
 [状态: 待消化]
 标签：Search / Adapter
-检索关键词：WikipediaSearchAdapter, SearxNG, Jina Reader, real search
-回答：现在搜索层已经不是只靠 Wikipedia。`search.py` 里有 `mock`、`wikipedia`、`searxng`、`jina` 四类 search adapter，还有 `JinaReaderCrawler` 做 URL 正文抽取。真正端到端实测最多的是 DeepSeek v4-flash + Wikipedia，最新 retrieval 对比里仍有 fallback；SearxNG 需要 `SEARXNG_BASE_URL`，当前没有自建实例，只做了 stub 单测；Jina Reader crawl `https://example.com` live 成功，但 Jina Search 在当前环境返回 401/403，CLI run 走了 fallback。所以我会说搜索/爬取边界已经拆开了，但生产级搜索质量还没完成。
+检索关键词：WikipediaSearchAdapter, SearxNG, Jina Reader, Brave, Tavily, real search
+回答：现在搜索层已经不是只靠 Wikipedia。`search.py` 里有 `mock`、`wikipedia`、`searxng`、`jina`、`brave`、`tavily`、`mcp` 这些 search adapter，还有 `JinaReaderCrawler` 做 URL 正文抽取。真正端到端实测最多的是 DeepSeek v4-flash + Wikipedia，最新 retrieval 对比里仍有 fallback；SearxNG 需要 `SEARXNG_BASE_URL`，当前没有自建实例；Jina Reader crawl `https://example.com` live 成功，但 Jina Search 在当前环境返回 401/403；Brave/Tavily 只做了请求格式和解析单测，因为没有 `BRAVE_SEARCH_API_KEY` / `TAVILY_API_KEY`。所以我会说搜索/爬取边界已经拆开了，但生产级搜索质量还没完成。
 关联模块：`search.py`, `tests/test_web_search_providers.py`
 可追问：
 1. 为什么不用 Tavily？
@@ -173,7 +173,7 @@
 [状态: 待消化]
 标签：Search / Crawler / 工具调用
 检索关键词：SearxNG, Jina Reader, crawler, web search
-回答：因为搜索 API 往往只给 title、URL 和 snippet，而 DeepResearch 真正需要的是可引用、可检查的正文证据。现在 `SearxngSearchAdapter` 负责 query 到候选 URL，`JinaReaderCrawler` 负责 URL 到 clean text，最后仍统一成 `Source`。这样以后把 SearxNG 换成 Brave/Tavily，或者把 Jina Reader 换成 trafilatura/readability，都不会改 orchestrator。
+回答：因为搜索 API 往往只给 title、URL 和 snippet，而 DeepResearch 真正需要的是可引用、可检查的正文证据。现在 `SearxngSearchAdapter`、`BraveSearchAdapter`、`TavilySearchAdapter` 负责 query 到候选 URL/snippet，`JinaReaderCrawler` 负责 URL 到 clean text，最后仍统一成 `Source`。这样以后把搜索 provider 或 crawler 换掉，都不会改 orchestrator。
 关联模块：`search.py`, `SearchService`, `Source`
 可追问：
 1. crawler 失败怎么办？

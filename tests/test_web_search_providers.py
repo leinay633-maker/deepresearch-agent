@@ -8,10 +8,12 @@ import pytest
 
 from deepresearch_agent.config import Settings
 from deepresearch_agent.search import (
+    BraveSearchAdapter,
     JinaReaderCrawler,
     JinaSearchAdapter,
     SearchError,
     SearxngSearchAdapter,
+    TavilySearchAdapter,
     build_search_adapter,
     build_search_service,
 )
@@ -129,15 +131,111 @@ def test_jina_search_adapter_parses_json_results(monkeypatch: pytest.MonkeyPatch
     assert "per-stage cost" in sources[0].content
 
 
+def test_brave_search_adapter_parses_web_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-test-key")
+    requested = {}
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        requested["url"] = request.full_url
+        requested["token"] = request.get_header("X-subscription-token")
+        return FakeResponse(
+            {
+                "web": {
+                    "results": [
+                        {
+                            "title": "Agent search result",
+                            "url": "https://example.com/agent-search",
+                            "description": "Brave web search can retrieve agent sources.",
+                        }
+                    ]
+                }
+            }
+        )
+
+    monkeypatch.setattr("deepresearch_agent.search.urlopen", fake_urlopen)
+    adapter = BraveSearchAdapter(
+        base_url="https://api.search.brave.com/res/v1/web/search",
+        max_chars=200,
+    )
+
+    sources = asyncio.run(adapter.search("agent search", max_results=1, timeout=1.0))
+
+    assert requested["url"].startswith("https://api.search.brave.com/res/v1/web/search?")
+    assert requested["token"] == "brave-test-key"
+    assert sources[0].provider == "brave"
+    assert sources[0].url == "https://example.com/agent-search"
+    assert "agent sources" in sources[0].content
+
+
+def test_brave_search_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+    adapter = BraveSearchAdapter("https://api.search.brave.com/res/v1/web/search")
+
+    with pytest.raises(SearchError, match="BRAVE_SEARCH_API_KEY"):
+        asyncio.run(adapter.search("agent search", max_results=1, timeout=1.0))
+
+
+def test_tavily_search_adapter_posts_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-test-key")
+    requested = {}
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        requested["url"] = request.full_url
+        requested["auth"] = request.get_header("Authorization")
+        requested["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse(
+            {
+                "results": [
+                    {
+                        "title": "Tavily result",
+                        "url": "https://example.com/tavily",
+                        "content": "Tavily search returns NLP content for research agents.",
+                        "score": 0.8,
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("deepresearch_agent.search.urlopen", fake_urlopen)
+    adapter = TavilySearchAdapter(
+        base_url="https://api.tavily.com/search",
+        search_depth="basic",
+        max_chars=200,
+    )
+
+    sources = asyncio.run(adapter.search("agent search", max_results=1, timeout=1.0))
+
+    assert requested["url"] == "https://api.tavily.com/search"
+    assert requested["auth"] == "Bearer " + "tavily-test-key"
+    assert requested["body"]["query"] == "agent search"
+    assert requested["body"]["search_depth"] == "basic"
+    assert sources[0].provider == "tavily"
+    assert "NLP content" in sources[0].content
+
+
+def test_tavily_search_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    adapter = TavilySearchAdapter("https://api.tavily.com/search")
+
+    with pytest.raises(SearchError, match="TAVILY_API_KEY"):
+        asyncio.run(adapter.search("agent search", max_results=1, timeout=1.0))
+
+
 def test_build_search_service_selects_new_providers() -> None:
     searxng = build_search_adapter(
         Settings(searxng_base_url="https://search.local", web_crawler_provider="jina"),
         "searxng",
     )
     jina_service = build_search_service(Settings(search_provider="jina"), None)
+    brave = build_search_adapter(Settings(), "brave")
+    tavily = build_search_adapter(Settings(), "tavily")
 
     assert isinstance(searxng, SearxngSearchAdapter)
     assert jina_service.primary.name == "jina"
+    assert isinstance(brave, BraveSearchAdapter)
+    assert isinstance(tavily, TavilySearchAdapter)
 
 
 def test_unknown_search_provider_fails_fast() -> None:

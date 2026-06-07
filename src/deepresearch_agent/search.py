@@ -247,6 +247,117 @@ class JinaSearchAdapter:
         return sources
 
 
+class BraveSearchAdapter:
+    name = "brave"
+
+    def __init__(self, base_url: str, max_chars: int = 4000) -> None:
+        self.base_url = base_url
+        self.max_chars = max_chars
+
+    async def search(self, query: str, max_results: int, timeout: float) -> list[Source]:
+        return await asyncio.to_thread(self._search_sync, query, max_results, timeout)
+
+    def _search_sync(self, query: str, max_results: int, timeout: float) -> list[Source]:
+        api_key = os.environ.get("BRAVE_SEARCH_API_KEY")
+        if not api_key:
+            raise SearchError("BRAVE_SEARCH_API_KEY is required for brave search")
+        params = urlencode({"q": query, "count": min(max(max_results, 1), 20)})
+        request = Request(
+            f"{self.base_url}?{params}",
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "identity",
+                "User-Agent": "deepresearch-agent/0.1 local interview project",
+                "X-Subscription-Token": api_key,
+            },
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:  # pragma: no cover - depends on live network
+            raise SearchError(str(exc)) from exc
+        rows = payload.get("web", {}).get("results", [])
+        if not isinstance(rows, list) or not rows:
+            raise SearchError("brave search returned no web results")
+        sources = _rows_to_sources(
+            rows[:max_results],
+            provider=self.name,
+            query=query,
+            max_results=max_results,
+            max_chars=self.max_chars,
+            metadata={"search_api": "brave"},
+        )
+        if not sources:
+            raise SearchError("brave search returned no parseable results")
+        return sources
+
+
+class TavilySearchAdapter:
+    name = "tavily"
+
+    def __init__(
+        self,
+        base_url: str,
+        search_depth: str = "basic",
+        max_chars: int = 4000,
+    ) -> None:
+        self.base_url = base_url
+        self.search_depth = search_depth
+        self.max_chars = max_chars
+
+    async def search(self, query: str, max_results: int, timeout: float) -> list[Source]:
+        return await asyncio.to_thread(self._search_sync, query, max_results, timeout)
+
+    def _search_sync(self, query: str, max_results: int, timeout: float) -> list[Source]:
+        api_key = os.environ.get("TAVILY_API_KEY")
+        if not api_key:
+            raise SearchError("TAVILY_API_KEY is required for tavily search")
+        body = json.dumps(
+            {
+                "query": query,
+                "search_depth": self.search_depth,
+                "max_results": min(max(max_results, 1), 20),
+                "include_answer": False,
+                "include_raw_content": False,
+            }
+        ).encode("utf-8")
+        request = Request(
+            self.base_url,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "deepresearch-agent/0.1 local interview project",
+            },
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:  # pragma: no cover - depends on live network
+            raise SearchError(str(exc)) from exc
+        rows = payload.get("results", [])
+        if not isinstance(rows, list) or not rows:
+            raise SearchError("tavily search returned no results")
+        normalized_rows = []
+        for row in rows[:max_results]:
+            if isinstance(row, dict):
+                normalized = dict(row)
+                normalized["content"] = row.get("raw_content") or row.get("content") or ""
+                normalized_rows.append(normalized)
+        sources = _rows_to_sources(
+            normalized_rows,
+            provider=self.name,
+            query=query,
+            max_results=max_results,
+            max_chars=self.max_chars,
+            metadata={"search_api": "tavily", "search_depth": self.search_depth},
+        )
+        if not sources:
+            raise SearchError("tavily search returned no parseable results")
+        return sources
+
+
 class SearxngSearchAdapter:
     name = "searxng"
 
@@ -423,6 +534,17 @@ def build_search_adapter(
     if selected == "jina":
         return JinaSearchAdapter(
             base_url=settings.jina_search_base_url,
+            max_chars=settings.crawler_max_chars,
+        )
+    if selected == "brave":
+        return BraveSearchAdapter(
+            base_url=settings.brave_search_base_url,
+            max_chars=settings.crawler_max_chars,
+        )
+    if selected == "tavily":
+        return TavilySearchAdapter(
+            base_url=settings.tavily_search_base_url,
+            search_depth=settings.tavily_search_depth,
             max_chars=settings.crawler_max_chars,
         )
     if selected == "mcp":

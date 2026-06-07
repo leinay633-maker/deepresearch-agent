@@ -2,7 +2,7 @@
 
 一个故意收窄的 DeepResearch Agent：从用户问题出发，生成 research brief，拆分子问题，并发检索，去重和来源质量过滤后，合成带引用的结构化报告，并对引用做 faithfulness 检查。
 
-默认运行不需要 API key。默认 LLM 和 search 都走 `mock`，用于稳定演示、测试和 mock plumbing benchmark；local retrieval 默认使用本地 BGE embedding 做 keyword + vector hybrid，不需要 API key。也可以显式切到 DeepSeek 真实 LLM provider、Wikipedia 真实无 key search adapter，以及 DashScope embedding/rerank provider。所有 key 只从环境变量读取：DeepSeek 用 `DEEPSEEK_API_KEY`，DashScope 用 `DASHSCOPE_API_KEY`。
+默认运行不需要 API key。默认 LLM 和 search 都走 `mock`，用于稳定演示、测试和 mock plumbing benchmark；local retrieval 默认使用本地 BGE embedding 做 keyword + vector hybrid，不需要 API key。也可以显式切到 DeepSeek 真实 LLM provider、Wikipedia 真实无 key search adapter、Brave/Tavily/Jina 搜索 adapter，以及 DashScope embedding/rerank provider。所有 key 只从环境变量读取：DeepSeek 用 `DEEPSEEK_API_KEY`，DashScope 用 `DASHSCOPE_API_KEY`，Brave 用 `BRAVE_SEARCH_API_KEY`，Tavily 用 `TAVILY_API_KEY`，Jina 用 `JINA_API_KEY`。
 
 ## Quickstart
 
@@ -167,6 +167,8 @@ Search providers：
 - `wikipedia`：真实网络检索 adapter，调用 Wikipedia Search API；失败、超时或熔断时自动使用 mock fallback，并在 trace/metrics 里暴露 fallback。
 - `searxng`：真实 web search adapter，读取 `SEARXNG_BASE_URL` 或 CLI `--searxng-base-url` 指向自建/可访问 SearxNG 实例；可配 `WEB_CRAWLER_PROVIDER=jina` 把搜索结果 URL 交给 Jina Reader 抽正文。
 - `jina`：Jina Search adapter，调用 `https://s.jina.ai/`；如配置 `JINA_API_KEY` 会带 Bearer token，未配置时仍会尝试公开 endpoint，失败会走 mock fallback。
+- `brave`：Brave Search API adapter，调用 `https://api.search.brave.com/res/v1/web/search`，key 从 `BRAVE_SEARCH_API_KEY` 读。
+- `tavily`：Tavily Search API adapter，调用 `https://api.tavily.com/search`，key 从 `TAVILY_API_KEY` 读；`TAVILY_SEARCH_DEPTH` 默认 `basic`。
 - `mcp`：MCP tool search adapter，支持 `MCP_TRANSPORT=stdio/http`，用 `MCP_COMMAND`/`MCP_ARGS` 或 `MCP_HTTP_URL` 连接 server，并调用 `MCP_SEARCH_TOOL`；tool result 会转换成统一 `Source`。
 
 Crawler：

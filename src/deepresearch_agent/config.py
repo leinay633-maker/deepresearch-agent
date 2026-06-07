@@ -52,6 +52,9 @@ class Settings:
     dashscope_rerank_model: str = "gte-rerank-v2"
     local_rerank_candidate_k: int = 6
     searxng_base_url: str = ""
+    brave_search_base_url: str = "https://api.search.brave.com/res/v1/web/search"
+    tavily_search_base_url: str = "https://api.tavily.com/search"
+    tavily_search_depth: str = "basic"
     web_crawler_provider: str = "none"
     jina_reader_base_url: str = "https://r.jina.ai/"
     jina_search_base_url: str = "https://s.jina.ai/"
@@ -161,6 +164,19 @@ def load_settings() -> Settings:
         ),
         local_rerank_candidate_k=_int_env("LOCAL_RERANK_CANDIDATE_K", 6),
         searxng_base_url=os.getenv("SEARXNG_BASE_URL", "").strip(),
+        brave_search_base_url=(
+            os.getenv(
+                "BRAVE_SEARCH_BASE_URL",
+                "https://api.search.brave.com/res/v1/web/search",
+            ).strip()
+            or "https://api.search.brave.com/res/v1/web/search"
+        ),
+        tavily_search_base_url=(
+            os.getenv("TAVILY_SEARCH_BASE_URL", "https://api.tavily.com/search").strip()
+            or "https://api.tavily.com/search"
+        ),
+        tavily_search_depth=os.getenv("TAVILY_SEARCH_DEPTH", "basic").strip().lower()
+        or "basic",
         web_crawler_provider=os.getenv("WEB_CRAWLER_PROVIDER", "none").strip().lower()
         or "none",
         jina_reader_base_url=os.getenv("JINA_READER_BASE_URL", "https://r.jina.ai/").strip()

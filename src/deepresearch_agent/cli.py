@@ -83,7 +83,7 @@ def main() -> None:
     parser.add_argument("query")
     parser.add_argument(
         "--search-provider",
-        choices=["mock", "wikipedia", "searxng", "jina", "mcp"],
+        choices=["mock", "wikipedia", "searxng", "jina", "brave", "tavily", "mcp"],
         default=None,
     )
     parser.add_argument("--llm-provider", choices=["mock", "deepseek"], default=None)
