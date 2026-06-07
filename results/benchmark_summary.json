@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-06-06T17:20:34.724934+00:00",
+  "generated_at": "2026-06-07T04:57:43.876108+00:00",
   "benchmark_kind": "real_llm_live_search_benchmark",
   "interpretation": "These numbers use the configured live LLM/search providers and are suitable as local benchmark evidence for this exact setup, not as a general product SLA.",
   "limitations": [
@@ -9,7 +9,7 @@
     "citation_retention_rate is checked by lexical overlap, not semantic entailment",
     "the benchmark set is small and local, so success_rate is not a broad quality score"
   ],
-  "raw_log": "D:\\Deepreserch Agent\\logs\\benchmark-20260606T171739Z.jsonl",
+  "raw_log": "D:\\Deepreserch Agent\\logs\\benchmark-20260607T045546Z.jsonl",
   "config": {
     "seed": 20260607,
     "llm_provider": "deepseek",
@@ -41,92 +41,92 @@
   "success_count": 4,
   "success_rate": 0.8,
   "latency_ms": {
-    "p50": 30235.414,
-    "p90": 48390.038,
-    "max": 54020.348
+    "p50": 21441.242,
+    "p90": 27883.52,
+    "max": 29314.445
   },
   "tokens": {
-    "avg": 3968.6,
-    "total": 19843
+    "avg": 3904.6,
+    "total": 19523
   },
-  "estimated_cost_usd_total": 0.00425096,
-  "citation_retention_rate_avg": 0.8778,
+  "estimated_cost_usd_total": 0.00414554,
+  "citation_retention_rate_avg": 0.8767,
   "fallback_count_total": 2,
   "records": [
     {
       "type": "case_result",
       "case_id": "case-001",
       "query": "How does a supervisor-researcher deep research agent differ from normal RAG?",
-      "latency_ms": 28073.548,
-      "total_tokens": 3847,
-      "estimated_cost_usd": 0.00080836,
-      "deduped_source_count": 8,
+      "latency_ms": 21441.242,
+      "total_tokens": 4017,
+      "estimated_cost_usd": 0.0008302,
+      "deduped_source_count": 9,
       "raw_search_result_count": 6,
-      "citation_retention_rate": 0.5556,
-      "success": false,
+      "citation_retention_rate": 1.0,
+      "success": true,
       "fallback_count": 0,
-      "output_summary": "# Differences Between Supervisor-Researcher Deep Research Agents and Standard RAG\n\n## Introduction\nStandard Retrieval-Augmented Generation (RAG) systems perform a single retrieval step based on the original query and generate an answer usin",
-      "run_id": "84a8caea1122"
+      "output_summary": "## Deep Research Agent vs. Normal RAG: Architectural, Process, and Outcome Differences\n\n### 1. Architecture and Process\n\nStandard Retrieval-Augmented Generation (RAG) typically performs a **single retrieval step** followed by a single gener",
+      "run_id": "b90c2603b614"
     },
     {
       "type": "case_result",
       "case_id": "case-002",
       "query": "How should citation faithfulness checks reduce hallucination in agent reports?",
-      "latency_ms": 30235.414,
-      "total_tokens": 3633,
-      "estimated_cost_usd": 0.00076818,
-      "deduped_source_count": 7,
-      "raw_search_result_count": 4,
-      "citation_retention_rate": 1.0,
-      "success": true,
+      "latency_ms": 20902.472,
+      "total_tokens": 3589,
+      "estimated_cost_usd": 0.00073738,
+      "deduped_source_count": 9,
+      "raw_search_result_count": 6,
+      "citation_retention_rate": 0.75,
+      "success": false,
       "fallback_count": 0,
-      "output_summary": "## Report: How Citation Faithfulness Checks Reduce Hallucination in Agent Reports\n\n### Overview\nCitation faithfulness checks in AI agent reports aim to ensure that generated claims are accurately supported by cited sources, thereby reducing",
-      "run_id": "2267a4f0bd97"
+      "output_summary": "## Report: How Citation Faithfulness Checks Reduce Hallucination in Agent Reports\n\n### Overview\nThis report evaluates how citation faithfulness checks can mitigate hallucination in AI agent reports, based on the provided sources. The eviden",
+      "run_id": "09ff1abf8739"
     },
     {
       "type": "case_result",
       "case_id": "case-003",
       "query": "What failure handling is needed when an agent search tool times out?",
-      "latency_ms": 54020.348,
-      "total_tokens": 4278,
-      "estimated_cost_usd": 0.00092302,
+      "latency_ms": 25737.132,
+      "total_tokens": 3581,
+      "estimated_cost_usd": 0.00075012,
       "deduped_source_count": 7,
-      "raw_search_result_count": 4,
-      "citation_retention_rate": 0.8333,
+      "raw_search_result_count": 6,
+      "citation_retention_rate": 0.8,
       "success": true,
-      "fallback_count": 1,
-      "output_summary": "## Failure Handling for Agent Search Tool Timeouts\n\nWhen an AI agent's search tool times out, the following strategies should be employed to ensure the agent remains robust and user-friendly:\n\n### Retry and Circuit Breaker Strategies\n- **Ti",
-      "run_id": "980fb0b432ee"
+      "fallback_count": 2,
+      "output_summary": "# Failure Handling for Agent Search Tool Timeouts\n\nWhen an agent's search tool times out, robust failure handling is essential to maintain research workflow continuity. The retrieved sources indicate three primary mechanisms: **retry strate",
+      "run_id": "7837543fec25"
     },
     {
       "type": "case_result",
       "case_id": "case-004",
       "query": "Why track token and cost by stage in a multi-agent research pipeline?",
-      "latency_ms": 39944.574,
-      "total_tokens": 4487,
-      "estimated_cost_usd": 0.00099176,
+      "latency_ms": 20275.064,
+      "total_tokens": 3614,
+      "estimated_cost_usd": 0.00075334,
       "deduped_source_count": 9,
       "raw_search_result_count": 6,
-      "citation_retention_rate": 1.0,
+      "citation_retention_rate": 0.8333,
       "success": true,
-      "fallback_count": 1,
-      "output_summary": "# Why Track Token and Cost by Stage in a Multi-Agent Research Pipeline?\n\nTracking token usage and cost at each stage of a multi-agent research pipeline provides critical observability for optimizing performance, managing budgets, and ensuri",
-      "run_id": "cc0b39e5bc0d"
+      "fallback_count": 0,
+      "output_summary": "Tracking token usage and cost per stage in a multi-agent research pipeline provides several benefits, though evidence is largely drawn from general principles and local implementation notes rather than dedicated multi-agent studies. \n\n- **C",
+      "run_id": "c39787cb25e6"
     },
     {
       "type": "case_result",
       "case_id": "case-005",
       "query": "How can a benchmark harness make deep research results reproducible?",
-      "latency_ms": 22923.07,
-      "total_tokens": 3598,
-      "estimated_cost_usd": 0.00075964,
+      "latency_ms": 29314.445,
+      "total_tokens": 4722,
+      "estimated_cost_usd": 0.0010745,
       "deduped_source_count": 8,
       "raw_search_result_count": 6,
       "citation_retention_rate": 1.0,
       "success": true,
       "fallback_count": 0,
-      "output_summary": "# How a Benchmark Harness Can Make Deep Research Results Reproducible\n\nBased on the available evidence, a benchmark harness can promote reproducibility through several concrete mechanisms.\n\n## Design Principles and Metrics\nThe local benchma",
-      "run_id": "8941589390db"
+      "output_summary": "# Benchmark Harnesses for Reproducible Deep Research\n\n## Introduction\nBenchmark harnesses provide a standardized framework for conducting and evaluating deep research experiments, addressing the reproducibility crisis [S2].\n\n## Design Featu",
+      "run_id": "e26d1fd58946"
     }
   ]
 }

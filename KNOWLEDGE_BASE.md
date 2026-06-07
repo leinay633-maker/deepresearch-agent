@@ -211,22 +211,22 @@ benchmark 汇总：管线 plumbing 指标，mock，非真实性能。具体 late
 
 旧 legacy alias benchmark 原始记录仍保留在 `logs/benchmark-20260606T160617Z.jsonl`，只作为历史对照，不再展开旧数字作为当前主口径。
 
-真实 DeepSeek v4-flash + Wikipedia benchmark：`$env:REQUEST_TIMEOUT_SECONDS='8'; py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --search-provider wikipedia --seed 20260607 --max-researchers 2 --max-results 3`。本次 LLM 是 `deepseek-v4-flash`，检索 primary 是 Wikipedia，最终 `fallback_count_total=2`，说明有 2 次 researcher 检索降级；这是实际运行结果，不做调参美化。原始记录：`logs/benchmark-20260606T171739Z.jsonl`，summary：`results/benchmark_summary.json`。
+真实 DeepSeek v4-flash + Wikipedia benchmark：`$env:REQUEST_TIMEOUT_SECONDS='8'; py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --llm-model deepseek-v4-flash --search-provider wikipedia --seed 20260607 --max-researchers 2 --max-results 3`。本次 LLM 是 `deepseek-v4-flash`，检索 primary 是 Wikipedia，最终 `fallback_count_total=2`，说明有 2 次 researcher 检索降级；这是实际运行结果，不做调参美化。原始记录：`logs/benchmark-20260607T045546Z.jsonl`，summary：`results/benchmark_summary.json`。
 
 | 指标 | 真实 benchmark 记录 | 怎么解释 |
 |---|---:|---|
 | case_count | 5 | 仍是小型本地 benchmark，不是公开权威评测 |
 | success_count / success_rate | 4 / 0.8 | 真实 citation checker 下有 1 条 case 未达当前 success 条件 |
-| latency p50 | 30235.414ms | 包含 DeepSeek + Wikipedia live 网络时间，不是 SLA |
-| latency p90 | 48390.038ms | 同上 |
-| latency max | 54020.348ms | 同上 |
-| total_tokens | 19843 | 来自 DeepSeek usage 字段 |
-| avg_tokens | 3968.6 | 来自 DeepSeek usage 字段 |
-| estimated_cost_usd_total | 0.00425096 | 按当前实现中的 `deepseek-v4-flash` 价格常量估算，价格核对日期：2026-06-07 |
-| citation_retention_rate_avg | 0.8778 | lexical citation checker 结果，不是语义级事实评估 |
+| latency p50 | 21441.242ms | 包含 DeepSeek + Wikipedia live 网络时间，不是 SLA |
+| latency p90 | 27883.52ms | 同上 |
+| latency max | 29314.445ms | 同上 |
+| total_tokens | 19523 | 来自 DeepSeek usage 字段 |
+| avg_tokens | 3904.6 | 来自 DeepSeek usage 字段 |
+| estimated_cost_usd_total | 0.00414554 | 按当前实现中的 `deepseek-v4-flash` 价格常量估算，价格核对日期：2026-06-07 |
+| citation_retention_rate_avg | 0.8767 | lexical citation checker 结果，不是语义级事实评估 |
 | fallback_count_total | 2 | 有 2 次 researcher 检索降级，如实记录 |
 
-逐 case 结果：case-001 失败，retention `0.5556`，cost `$0.00080836`，fallback `0`；case-002 成功，retention `1.0`，cost `$0.00076818`，fallback `0`；case-003 成功，retention `0.8333`，cost `$0.00092302`，fallback `1`；case-004 成功，retention `1.0`，cost `$0.00099176`，fallback `1`；case-005 成功，retention `1.0`，cost `$0.00075964`，fallback `0`。这组数据比 mock plumbing 更有意义，因为 LLM token/cost 是 provider usage；但它仍受 Wikipedia 搜索质量、fallback、LLM 输出波动和 lexical citation checker 限制。
+逐 case 结果：case-001 成功，retention `1.0`，cost `$0.0008302`，fallback `0`；case-002 失败，retention `0.75`，cost `$0.00073738`，fallback `0`；case-003 成功，retention `0.8`，cost `$0.00075012`，fallback `2`；case-004 成功，retention `0.8333`，cost `$0.00075334`，fallback `0`；case-005 成功，retention `1.0`，cost `$0.0010745`，fallback `0`。这组数据比 mock plumbing 更有意义，因为 LLM token/cost 是 provider usage；但它仍受 Wikipedia 搜索质量、fallback、LLM 输出波动和 lexical citation checker 限制。
 
 未实测：真实搜索 API 高并发限流、语义级 citation faithfulness、Redis/PostgreSQL 缓存、OpenTelemetry/LangSmith tracing、真实用户流量。
 
