@@ -18,6 +18,11 @@ class Settings:
     mock_input_cost_per_1m_tokens: float = 0.0
     mock_output_cost_per_1m_tokens: float = 0.0
     trace_dir: str = "logs"
+    trace_exporter: str = "jsonl"
+    otel_exporter_otlp_endpoint: str = ""
+    otel_exporter_otlp_headers: str = ""
+    otel_exporter_otlp_timeout_seconds: float = 2.0
+    otel_service_name: str = "deepresearch-agent"
     run_store_path: str = "data/runs.sqlite"
     deepseek_model: str = "deepseek-v4-flash"
     llm_brief_model: str = ""
@@ -94,6 +99,14 @@ def load_settings() -> Settings:
         circuit_breaker_cooldown_seconds=_float_env("CIRCUIT_BREAKER_COOLDOWN_SECONDS", 30.0),
         max_researchers=_int_env("MAX_RESEARCHERS", 3),
         trace_dir=os.getenv("TRACE_DIR", "logs"),
+        trace_exporter=os.getenv("TRACE_EXPORTER", "jsonl").strip().lower() or "jsonl",
+        otel_exporter_otlp_endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip(),
+        otel_exporter_otlp_headers=os.getenv("OTEL_EXPORTER_OTLP_HEADERS", "").strip(),
+        otel_exporter_otlp_timeout_seconds=_float_env(
+            "OTEL_EXPORTER_OTLP_TIMEOUT_SECONDS", 2.0
+        ),
+        otel_service_name=os.getenv("OTEL_SERVICE_NAME", "deepresearch-agent").strip()
+        or "deepresearch-agent",
         run_store_path=os.getenv("RUN_STORE_PATH", "data/runs.sqlite"),
         deepseek_model=(
             os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip()

@@ -622,9 +622,9 @@
 ## Q：Trace Logger 记录什么？
 [状态: 待消化]
 标签：可观测性 / Trace
-检索关键词：TraceLogger, JSONL trace
-回答：`TraceLogger` 每个 run 写 JSONL event，包含 run_id、stage、status、timestamp、duration_ms 和 payload。researcher 阶段会记录 provider、fallback_used、error、source_count。这样即使没有 LangSmith，也能本地排查每一步。
-关联模块：`tracing.py`, `orchestrator.py`
+检索关键词：TraceLogger, JSONL trace, OTLP HTTP
+回答：`TraceLogger` 每个 run 默认写 JSONL event，包含 run_id、stage、status、timestamp、duration_ms 和 payload。researcher 阶段会记录 provider、fallback_used、error、source_count。现在还加了可选 `TRACE_EXPORTER=otlp_http`，配置 `OTEL_EXPORTER_OTLP_ENDPOINT` 后会把同一批 event 转成 OTLP HTTP traces JSON POST 到 collector；如果 export 失败，只写本地 `trace_exporter` error event，不中断 research run。我不会把它说成完整 LangSmith/OTel 平台，因为还没有采样、batch、上下文传播和线上 collector 验证。
+关联模块：`tracing.py`, `orchestrator.py`, `run_control.py`
 可追问：
 1. 为什么用 JSONL？
 2. trace 文件是否提交？

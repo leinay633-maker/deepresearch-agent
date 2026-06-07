@@ -211,6 +211,15 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 代价：HTML 只是静态页面，不是富文本编辑器；没有分页、目录、图片、PDF 排版、DOCX 样式、PPT 或 TTS/podcast。
 面试怎么答：我会说我先把报告从“只能在 stdout/API 里看”变成“能落地成可复查 artifact”，但不会把它包装成完整办公文档生成系统。
 
+## 决策 21：为什么先做 OTLP HTTP trace export，而不是直接接 LangSmith 或完整 OpenTelemetry SDK
+
+背景：之前 trace 只写本地 JSONL，适合无依赖 demo 和排查，但和生产系统常见的 collector / APM / tracing 平台之间没有出口。
+可选方案：继续只写 JSONL；直接引入 OpenTelemetry SDK；直接接 LangSmith；先做一个可选 OTLP HTTP exporter；把 trace 写入数据库。
+最终选择：在 `src/deepresearch_agent/tracing.py` 里新增 `TraceExporter` 抽象和 `OtlpHttpTraceExporter`，配置 `TRACE_EXPORTER=otlp_http` 与 `OTEL_EXPORTER_OTLP_ENDPOINT` 时，把每条 `TraceEvent` 额外 POST 到 `<endpoint>/v1/traces`；默认仍是本地 JSONL。
+理由：这一步不新增依赖、不需要外部账号，也不影响无 API key 路径；同时给现有 trace event 一个标准化外送边界。export 失败不会打断 research run，而是写一条本地 `trace_exporter` error event，便于排查 collector 不可用。
+代价：这不是完整 OpenTelemetry instrumentation，没有上下文传播、采样、batch processor、metrics/logs pipeline、LangSmith run tree 或线上 collector 验证；当前只验证了本地 HTTP test server 收到 OTLP 风格 JSON。
+面试怎么答：我会说我先把 trace 从“只能本地看”推进到“可以接 collector 的出口”，但仍保留 JSONL 作为默认和兜底，不把它包装成完整可观测平台。
+
 # 5 实现细节
 
 Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。`ResearchRequest.planner_model` 或 `LLM_PLANNER_MODEL` 可以覆盖 planning stage 的模型名。局限是 planner 还不会根据 researcher 中间结果做 LLM 语义级动态追加子问题。
@@ -247,7 +256,7 @@ Report Exporter：`src/deepresearch_agent/report_exporter.py`。输入是 `Struc
 
 Cost Tracker：`src/deepresearch_agent/cost.py`。mock provider 仍使用字符数近似估算；DeepSeek provider 已接入 API 返回的真实 `prompt_tokens` / `completion_tokens`，并通过 `CostTracker.add_usage()` 记录到同一套 `CostSummary`。每条 `CostRecord` 现在支持单独的 `model`，所以 brief_generation、planning、synthesis 可以显示不同 stage model。当前 `deepseek-v4-flash` 成本计算按 DeepSeek 官方 Models & Pricing 页，核对日期 `2026-06-07`：input cache hit `$0.0028/1M tokens`，input cache miss `$0.14/1M tokens`，output `$0.28/1M tokens`。legacy alias 只作为 v4-flash 兼容入口使用同一价格表；未配置价格的模型会直接报错，避免 silently 用错单价。如果响应没有 token usage，DeepSeek 路径会直接失败，不会退回字符估算伪装成真实 usage。
 
-Trace Logger：`src/deepresearch_agent/tracing.py`。每个 run 写 `logs/research-<run_id>.jsonl`，记录 stage、status、duration_ms、payload。runtime trace 默认不提交 Git，benchmark 原始记录提交。
+Trace Logger：`src/deepresearch_agent/tracing.py`。每个 run 写 `logs/research-<run_id>.jsonl`，记录 stage、status、duration_ms、payload。默认 `TRACE_EXPORTER=jsonl`；配置 `TRACE_EXPORTER=otlp_http` 和 `OTEL_EXPORTER_OTLP_ENDPOINT` 后，`OtlpHttpTraceExporter` 会把每条 event 额外转成 OTLP HTTP traces JSON 并 POST 到 collector endpoint。export 失败只追加本地 `trace_exporter` error event，不中断主链路。runtime trace 默认不提交 Git，benchmark 原始记录提交。
 
 Agent Run Control Plane：`src/deepresearch_agent/run_control.py` 外包现有 DeepResearch pipeline，不替换 `/research`。`POST /runs` 会创建 `run_id`，执行 brief/planner，然后在 `require_approval=true` 时进入 `waiting_approval`；`approve` 会从 planner checkpoint 继续 researcher、synthesizer、verifier；`edit` 会保存修改后的 subquestions 再继续；`reject/cancel` 会终止 run；`retry` 对 failed run 优先复用 `plan_json` 从 researcher 阶段重跑。`run_store.py` 的 SQLite schema 是三张表：`agent_runs` 保存 run 状态、plan/result、token/cost、`leased_by`、`heartbeat_at`、`lease_expires_at`；`agent_steps` 保存阶段输入输出、latency、token_usage、cost、error、retry_count；`agent_events` 保存可 SSE replay 的单调递增 event。内部执行路径会在 planner/researcher/synthesizer/verifier 阶段 acquire/heartbeat/release lease；外部 worker 也可以用 `/runs/{run_id}/lease`、`/heartbeat`、`/runs/stale`、`/runs/recover-stale` 做 ownership 和 stale recovery 验证。
 
@@ -415,6 +424,14 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 复盘：导出层先做稳定数据边界更重要。后续要做 PDF/DOCX 时，可以复用 `report_to_markdown` / `report_to_html` 的结构，再接专门的文档生成依赖。
 面试可能追问：为什么不直接做 PDF？回答：PDF/DOCX 是排版工程，不是 DeepResearch 主链路的核心风险；我先交付可审计 artifact，下一步再做格式化输出。
 
+## 问题 19：OTLP exporter 只做出口验证，不等于生产 tracing 平台
+
+现象：新增 `OtlpHttpTraceExporter` 后，本地测试 server 能收到 `/v1/traces` POST，exporter 失败时 JSONL 里会追加 `trace_exporter` error event，没有阻塞 run。
+工程风险：这只是 trace event 外送边界，不包含采样、batch、上下文传播、metrics/logs、collector 部署、鉴权策略或 LangSmith UI。
+修复：默认仍保持 `TRACE_EXPORTER=jsonl`；`otlp_http` 只有显式配置 endpoint 才启用；失败吞掉并写本地 error event。README、知识库和 QA 都写清这是轻量 OTLP HTTP exporter。
+复盘：可观测性要先保证“不影响业务路径”。我没有为了贴 OpenTelemetry 标签引入完整 SDK，而是先把现有 trace event 做成可外送的稳定接口。
+面试可能追问：这算 OpenTelemetry 吗？回答：它是 OTLP HTTP traces 的轻量出口，不是完整 OTel SDK 接入；如果生产化，我会换成官方 SDK + batch processor + collector 配置。
+
 # 7 实测数据
 
 本节所有 mock benchmark 数字只用于证明 pipeline plumbing 能端到端跑通，不能当作真实性能、真实成本或真实答案质量成果。尤其不能在面试里说“我的 DeepResearch p50 是个位数毫秒”这类话，因为这个延迟测的是本机 Python 跑 deterministic mock 的速度，换机器、换进程热身状态、换依赖版本都会变。
@@ -422,7 +439,7 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
-测试验证：`py -3.11 -m pytest -q`，最新结果 `57 passed, 2 warnings in 57.34s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `60 passed, 2 warnings in 60.02s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -453,6 +470,8 @@ Persistent vector index smoke：`py -3.11 -m pytest tests/test_hybrid_retrieval.
 Stage model routing smoke：`py -3.11 -m pytest tests/test_stage_models.py -q` 成功，`2 passed in 0.35s`。测试覆盖 mock orchestrator 在 `brief_model`、`planner_model`、`synthesis_model` 不同时，`CostRecord.model` 分别记录 `mock-brief`、`mock-planner`、`mock-synthesis`；同时用不联网的 `RecordingDeepSeekProvider` 验证 DeepSeek 请求体按 stage 发送 `deepseek-chat`、`deepseek-reasoner`、`deepseek-v4-flash`，且 cost records 记录同一模型序列。CLI smoke：`py -3.11 -m deepresearch_agent.cli "How should model routing work in a research agent?" --llm-provider mock --llm-model mock-default --brief-model mock-brief --planner-model mock-planner --synthesis-model mock-synthesis --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --json` 后抽取 `cost.records[].model`，输出 `['mock-brief', 'mock-planner', 'mock-synthesis']`。这只验证路由和记录，不代表这些模型组合已做真实质量/成本对比。
 
 Report exporter smoke：`py -3.11 -m pytest tests/test_report_exporter.py -q` 成功，`3 passed in 0.33s`。测试覆盖 Markdown/HTML/JSON 三种文件写出、HTML answer 内容转义、未知格式报错。CLI smoke：`py -3.11 -m deepresearch_agent.cli "How should report export work?" --llm-provider mock --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --export-dir <temp> --export-formats markdown,html,json` 成功，在临时目录生成 `3ad3725ca515.md`、`3ad3725ca515.html`、`3ad3725ca515.json`。这只验证本地 artifact 导出，不代表 PDF/DOCX/PPT 已实现。
+
+Trace exporter smoke：`py -3.11 -m pytest tests/test_tracing_exporter.py -q` 成功，`3 passed in 0.90s`。测试覆盖 `OtlpHttpTraceExporter` 向本地 HTTP server 的 `/v1/traces` POST、`build_trace_exporter()` 读取 OTLP 配置、以及 exporter 抛错时 `TraceLogger` 仍写 JSONL 并追加 `trace_exporter` error event。这里没有接真实 collector、LangSmith 或线上 APM。
 
 mock benchmark 原始记录：`logs/benchmark-20260606T152954Z.jsonl`。
 当前 benchmark summary：`results/benchmark_summary.json`，已被真实 DeepSeek + Wikipedia benchmark 覆盖。
@@ -508,7 +527,7 @@ benchmark 汇总：管线 plumbing 指标，mock，非真实性能。具体 late
 
 这条公开真实 case 的 query 是让系统根据 `American Community Survey / FEMA Harvey flood depths / USDA Food Access Research Atlas / Streetlight / SafeGraph POI` 找使用全部数据集的论文，并按 JSON 返回 `paper_title`。真实组没有报错，也没有 fallback，但 success 为 0，说明当前 DeepSeek + Wikipedia + 本地 keyword RAG 没有解决这类公开精确查证任务；citation retention 只有 `0.5`，也说明 lexical citation check 已经暴露支撑不足。面试里我会把它讲成“公开评测入口已经打通，但质量短板被暴露出来”，不会把 mock 组的 `1.0` 当质量成果。
 
-未实测：LiveDRBench/Deep Research Bench 官方 judge 分数、真实搜索 API 高并发限流、语义级 citation faithfulness、Redis/PostgreSQL 缓存、OpenTelemetry/LangSmith tracing、真实用户流量、DashScope 真实 embedding/rerank、rerank 5 case 全量 benchmark。
+未实测：LiveDRBench/Deep Research Bench 官方 judge 分数、真实搜索 API 高并发限流、语义级 citation faithfulness、Redis/PostgreSQL 缓存、真实 OpenTelemetry collector / LangSmith tracing、真实用户流量、DashScope 真实 embedding/rerank、rerank 5 case 全量 benchmark。
 
 # 8 评测设计
 
@@ -575,4 +594,4 @@ Run control 还不是分布式调度：当前已经有 SQLite run store、planne
 
 内容导出还不是办公文档生成：当前只支持 Markdown、HTML、JSON artifact。可行方案是基于 exporter 增加 PDF、DOCX、PPT、TTS/podcast。工程代价是版式、字体、分页、图片、图表和跨平台渲染验证。面试怎么讲：我会说我先做可审计文件导出，不把它包装成完整文档生产系统。
 
-没有 OpenTelemetry/LangSmith：当前问题是 trace 只写本地 JSONL。可行方案是接 OTel exporter 或 LangSmith。工程代价是外部账号、采样、隐私和成本。面试怎么讲：我会说本地 JSONL 先保证无外部依赖，后续可以从同一 trace event 结构导出。
+OpenTelemetry/LangSmith 仍是轻量出口：当前已经有可选 OTLP HTTP trace export，但只验证到本地 test server，不是完整 SDK/collector/LangSmith run tree。可行方案是引入官方 OTel SDK、batch processor、collector 配置、采样策略，或增加 LangSmith exporter。工程代价是外部账号、部署、隐私、采样和成本。面试怎么讲：我会说我先做的是稳定 trace event 和可外送边界，生产化再接完整可观测平台。

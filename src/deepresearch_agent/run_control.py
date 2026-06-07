@@ -32,7 +32,7 @@ from deepresearch_agent.schemas import (
     SubQuestion,
 )
 from deepresearch_agent.search import build_search_service
-from deepresearch_agent.tracing import TraceLogger
+from deepresearch_agent.tracing import TraceLogger, build_trace_exporter
 
 
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
@@ -339,7 +339,11 @@ class RunController:
         orchestrator = DeepResearchOrchestrator(settings=self.settings)
         llm = orchestrator._build_llm_provider(request)
         cost = self._new_cost_tracker(llm)
-        trace = TraceLogger(run_id=run_id, trace_dir=self.settings.trace_dir)
+        trace = TraceLogger(
+            run_id=run_id,
+            trace_dir=self.settings.trace_dir,
+            exporter=build_trace_exporter(self.settings),
+        )
         search_service = build_search_service(self.settings, request.search_provider)
         max_researchers = min(request.max_researchers, self.settings.max_researchers)
 

@@ -55,6 +55,17 @@ py -3.11 -m deepresearch_agent.cli "How should report export work?" --llm-provid
 
 当前导出支持 Markdown、HTML、JSON；PDF、DOCX、PPT 还未实现。
 
+可选导出 OpenTelemetry OTLP HTTP trace：
+
+```powershell
+$env:TRACE_EXPORTER="otlp_http"
+$env:OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:4318"
+$env:OTEL_SERVICE_NAME="deepresearch-agent"
+py -3.11 -m deepresearch_agent.cli "How should trace export work?" --llm-provider mock --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1
+```
+
+默认 `TRACE_EXPORTER=jsonl`，只写本地 `logs/research-<run_id>.jsonl`。`otlp_http` 会把每个 trace event 额外 POST 到 `<endpoint>/v1/traces`；export 失败只写本地 `trace_exporter` error event，不中断 research run。
+
 创建可审核的长任务 run，并在 planner 后 approve 继续：
 
 ```powershell
@@ -181,7 +192,7 @@ src/deepresearch_agent/
   citation.py         Citation faithfulness check
   report_exporter.py  Markdown/HTML/JSON report exports
   cost.py             Token/cost attribution
-  tracing.py          Structured JSONL trace events
+  tracing.py          Structured JSONL trace events and optional OTLP HTTP export
   benchmark.py        Reproducible benchmark harness
   deep_research_eval.py Public end-to-end Deep Research eval artifact runner
 ```

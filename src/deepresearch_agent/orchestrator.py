@@ -21,7 +21,7 @@ from deepresearch_agent.schemas import (
     TraceEvent,
 )
 from deepresearch_agent.search import SearchOutcome, SearchService, build_search_service
-from deepresearch_agent.tracing import TraceLogger
+from deepresearch_agent.tracing import TraceLogger, build_trace_exporter
 from deepresearch_agent.verifier import SourceVerifier
 
 Emit = Callable[[dict[str, Any]], Awaitable[None]]
@@ -42,7 +42,11 @@ class DeepResearchOrchestrator:
 
     async def run(self, request: ResearchRequest, emit: Emit | None = None) -> StructuredReport:
         run_id = uuid.uuid4().hex[:12]
-        trace = TraceLogger(run_id=run_id, trace_dir=self.settings.trace_dir)
+        trace = TraceLogger(
+            run_id=run_id,
+            trace_dir=self.settings.trace_dir,
+            exporter=build_trace_exporter(self.settings),
+        )
         llm = self._build_llm_provider(request)
         cost = CostTracker(
             provider=llm.name,
