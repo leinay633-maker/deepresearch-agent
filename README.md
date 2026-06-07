@@ -104,6 +104,14 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8000/runs/worker/next
 
 `defer_execution=true` 只影响 run control 创建路径：系统会把本次请求快照存到 SQLite 的 `request_json`，worker 执行时从该快照恢复 provider、模型、并发数和检索参数。`/runs/worker/next` 是 SQLite 单机 worker-once 入口，当前不是 Redis/Celery worker pool。
 
+也可以启动本地轮询 worker：
+
+```powershell
+py -3.11 -m deepresearch_agent.run_worker --max-runs 1 --idle-exit --json
+```
+
+安装 editable package 后，也可以用 console script：`deepresearch-worker --max-runs 1 --idle-exit --json`。不传 `--max-runs` 时会持续轮询，直到手动中断。
+
 手动验证 worker lease / heartbeat：
 
 ```powershell
@@ -209,6 +217,7 @@ src/deepresearch_agent/
   run_control.py      Run state machine, approval, cancel, retry
   run_store.py        SQLite run/step/event checkpoint store
   run_models.py       Pydantic models for run control API
+  run_worker.py       Local polling worker for queued runs
   llm.py              Mock and DeepSeek structured-output model providers
   search.py           Search adapters, retry, timeout, circuit breaker, fallback
   rag.py              Local keyword/vector hybrid RAG retriever

@@ -566,7 +566,7 @@
 [状态: 待消化]
 标签：存储 / 局限
 检索关键词：SQLite, run store limitation
-回答：SQLite 适合本地 demo、测试和单机轻量 checkpoint，但不适合高并发生产任务队列。现在我补了单机 worker lease、heartbeat、stale recovery，以及 `defer_execution=true` + `/runs/worker/next` 的 worker-once 消费入口；它可以演示 queued run 被 worker claim 后执行，但还不是 Redis/Celery 那种常驻 worker pool、复杂调度和水平扩展。生产化我会把 `RunStore` 抽象后面换成 Postgres/Redis/队列，但当前不引入这些，是为了不把项目变成基础设施工程。
+回答：SQLite 适合本地 demo、测试和单机轻量 checkpoint，但不适合高并发生产任务队列。现在我补了单机 worker lease、heartbeat、stale recovery、`defer_execution=true` + `/runs/worker/next` 的 worker-once 消费入口，以及本地 polling worker CLI；它可以演示 queued run 被 worker claim 后执行，但还不是 Redis/Celery 那种多进程 worker pool、复杂调度和水平扩展。生产化我会把 `RunStore` 抽象后面换成 Postgres/Redis/队列，但当前不引入这些，是为了不把项目变成基础设施工程。
 关联模块：`run_store.py`
 可追问：
 1. SQLite 会不会锁表？
@@ -588,18 +588,29 @@
 [状态: 待消化]
 标签：Run Control / Worker Queue
 检索关键词：defer_execution, worker next, request_json
-回答：`CreateRunRequest` 现在有 `defer_execution`，默认还是 false，所以原来的 `/runs` 同步 planner 行为不变。显式设为 true 时，系统只创建 `queued/planner` 的 run，把完整请求写进 `agent_runs.request_json`，不产生 planner step。之后 `POST /runs/worker/next` 会用原子 SQL claim 最早的 queued run，写 `worker.claimed` event，再从 request_json 恢复本次 provider、模型、并发和检索参数执行。这个功能的重点是把“API 入队、worker 消费”的边界打通，不是宣称已经有生产级队列。
+回答：`CreateRunRequest` 现在有 `defer_execution`，默认还是 false，所以原来的 `/runs` 同步 planner 行为不变。显式设为 true 时，系统只创建 `queued/planner` 的 run，把完整请求写进 `agent_runs.request_json`，不产生 planner step。之后 `POST /runs/worker/next` 会用原子 SQL claim 最早的 queued run，写 `worker.claimed` event，再从 request_json 恢复本次 provider、模型、并发和检索参数执行。`run_worker.py` 和 `deepresearch-worker` 只是把这个动作做成可轮询的本地 worker loop。这个功能的重点是把“API 入队、worker 消费”的边界打通，不是宣称已经有生产级队列。
 关联模块：`run_models.py`, `run_store.py`, `run_control.py`, `api.py`
 可追问：
 1. 为什么必须存 request_json？
 2. 无 queued run 时返回什么？
 3. 为什么不直接接 Celery？
 
+## Q：本地 polling worker 和 Celery 差在哪？
+[状态: 待消化]
+标签：Run Control / Worker
+检索关键词：deepresearch-worker, polling worker, Celery
+回答：`deepresearch-worker` 是一个很薄的本地轮询进程：循环调用 `RunController.process_next_queued()`，支持 `--max-runs`、`--idle-exit`、`--poll-interval-seconds`，每个 run 仍通过 SQLite lease claim。它解决的是“queued run 不需要手动 POST 才能被消费”的演示和本地回归问题。Celery/RQ 还会提供 broker、ack、并发 worker pool、重试策略、任务可视化、死信队列和跨机器调度；这些我没有实现，也不会包装成已经有。
+关联模块：`run_worker.py`, `run_control.py`, `run_store.py`
+可追问：
+1. 为什么 worker 不放进 FastAPI lifespan？
+2. 多个 worker 同时跑会怎样？
+3. 后续怎么迁移到 Redis/Celery？
+
 ## Q：怎么从 demo 变成生产系统？
 [状态: 待消化]
 标签：生产化 / Roadmap
 检索关键词：worker queue, lease, production
-回答：下一步不是再加 provider，而是把 run control 继续生产化：真正的任务队列、常驻 worker pool、幂等阶段执行、Postgres 持久化、对象存储保存大结果、权限和审计、provider 级限流。现在版本已经把状态机、checkpoint、request_json、单机 lease/heartbeat、worker-once 消费边界打出来，后面替换存储和调度不会影响 Agent 主链路。
+回答：下一步不是再加 provider，而是把 run control 继续生产化：真正的任务队列、多进程 worker pool、幂等阶段执行、Postgres 持久化、对象存储保存大结果、权限和审计、provider 级限流。现在版本已经把状态机、checkpoint、request_json、单机 lease/heartbeat、worker-once 和本地 polling worker 边界打出来，后面替换存储和调度不会影响 Agent 主链路。
 关联模块：`run_control.py`, `run_store.py`, `api.py`
 可追问：
 1. 哪一步最该先做？
