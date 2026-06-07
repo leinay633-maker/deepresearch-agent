@@ -11,6 +11,7 @@ requires-python = ">=3.11,<3.14"
 dependencies = [
     "fastapi>=0.115.0",
     "pydantic>=2.8.0",
+    "sentence-transformers>=3.0.0",
     "uvicorn[standard]>=0.32.0",
 ]
 
@@ -24,6 +25,7 @@ dev = [
 deepresearch = "deepresearch_agent.cli:main"
 deepresearch-api = "deepresearch_agent.api:main"
 deepresearch-benchmark = "deepresearch_agent.benchmark:main"
+deepresearch-validate-embeddings = "deepresearch_agent.validate_embeddings:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

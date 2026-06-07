@@ -19,6 +19,11 @@ class Settings:
     mock_output_cost_per_1m_tokens: float = 0.0
     trace_dir: str = "logs"
     deepseek_model: str = "deepseek-v4-flash"
+    embedding_provider: str = "local"
+    local_embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    dashscope_embedding_model: str = "text-embedding-v4"
+    dashscope_embedding_dimensions: int = 1024
+    embedding_batch_size: int = 16
 
 
 def _float_env(name: str, default: float) -> float:
@@ -55,4 +60,16 @@ def load_settings() -> Settings:
             os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip()
             or "deepseek-v4-flash"
         ),
+        embedding_provider=os.getenv("EMBEDDING_PROVIDER", "local").strip().lower()
+        or "local",
+        local_embedding_model=(
+            os.getenv("LOCAL_EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5").strip()
+            or "BAAI/bge-small-zh-v1.5"
+        ),
+        dashscope_embedding_model=(
+            os.getenv("DASHSCOPE_EMBEDDING_MODEL", "text-embedding-v4").strip()
+            or "text-embedding-v4"
+        ),
+        dashscope_embedding_dimensions=_int_env("DASHSCOPE_EMBEDDING_DIMENSIONS", 1024),
+        embedding_batch_size=_int_env("EMBEDDING_BATCH_SIZE", 16),
     )
