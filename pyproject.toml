@@ -9,6 +9,7 @@ description = "A scoped, observable DeepResearch Agent for agent backend intervi
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
+    "certifi>=2024.0.0",
     "chromadb>=0.5.0,<2.0.0",
     "fastapi>=0.115.0",
     "pydantic>=2.8.0",
@@ -26,6 +27,7 @@ dev = [
 deepresearch = "deepresearch_agent.cli:main"
 deepresearch-api = "deepresearch_agent.api:main"
 deepresearch-benchmark = "deepresearch_agent.benchmark:main"
+deepresearch-retrieval-eval = "deepresearch_agent.retrieval_eval:main"
 deepresearch-validate-embeddings = "deepresearch_agent.validate_embeddings:main"
 
 [tool.setuptools.packages.find]
