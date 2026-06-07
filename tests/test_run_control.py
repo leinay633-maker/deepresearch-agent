@@ -68,6 +68,10 @@ def test_deferred_run_waits_for_worker_next(tmp_path, monkeypatch) -> None:
     assert processed.json()["run_id"] == run_id
     assert processed.json()["status"] == "succeeded"
     assert processed.json()["leased_by"] is None
+    result = store.require_run(run_id).result_json
+    assert result is not None
+    assert result["metrics"]["source_provider_count"] >= 1
+    assert result["metrics"]["source_domain_count"] >= 1
     assert {"planner", "researcher", "synthesizer", "verifier"} <= {
         step.stage for step in store.list_steps(run_id)
     }

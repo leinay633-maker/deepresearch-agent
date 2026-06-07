@@ -236,6 +236,7 @@ src/deepresearch_agent/
   embeddings.py       Local and DashScope embedding providers
   rerankers.py        Optional local and DashScope rerank providers
   verifier.py         Source quality filtering
+  source_metrics.py   Source provider/domain diversity metrics
   citation.py         Citation faithfulness check
   citation_judge.py   Optional heuristic and DeepSeek citation judge providers
   report_exporter.py  Markdown/HTML/JSON/PDF/DOCX/PPTX/WAV report exports

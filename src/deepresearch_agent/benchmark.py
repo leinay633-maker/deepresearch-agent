@@ -135,6 +135,8 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 "total_tokens": report.cost.total_tokens,
                 "estimated_cost_usd": report.cost.total_estimated_cost_usd,
                 "deduped_source_count": report.metrics["deduped_source_count"],
+                "source_provider_count": report.metrics["source_provider_count"],
+                "source_domain_count": report.metrics["source_domain_count"],
                 "raw_search_result_count": report.metrics["raw_search_result_count"],
                 "citation_retention_rate": report.metrics["citation_retention_rate"],
                 "success": report.metrics["success"],
@@ -188,6 +190,8 @@ def _summarize(
     latencies = [record["latency_ms"] for record in records]
     tokens = [record["total_tokens"] for record in records]
     retentions = [record["citation_retention_rate"] for record in records]
+    provider_counts = [record.get("source_provider_count", 0) for record in records]
+    domain_counts = [record.get("source_domain_count", 0) for record in records]
     success_count = sum(1 for record in records if record["success"])
     benchmark_kind, interpretation, limitations = _benchmark_notes(config_snapshot)
     return {
@@ -216,6 +220,12 @@ def _summarize(
         if retentions
         else 0.0,
         "fallback_count_total": sum(record["fallback_count"] for record in records),
+        "source_provider_count_avg": round(sum(provider_counts) / len(provider_counts), 3)
+        if provider_counts
+        else 0.0,
+        "source_domain_count_avg": round(sum(domain_counts) / len(domain_counts), 3)
+        if domain_counts
+        else 0.0,
         "records": records,
     }
 

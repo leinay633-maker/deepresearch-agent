@@ -18,7 +18,7 @@ Agent 编排层：`src/deepresearch_agent/orchestrator.py`。输入是用户 que
 
 检索质量层：`src/deepresearch_agent/dedup.py`、`src/deepresearch_agent/verifier.py`。Dedup 按规范化 URL 合并重复来源，Verifier 按标题、正文长度、稳定 URL、已知 adapter、低质量模式打分过滤。
 
-评测层：`src/deepresearch_agent/benchmark.py`、`src/deepresearch_agent/retrieval_eval.py`、`src/deepresearch_agent/deep_research_eval.py`、`data/benchmark_cases.jsonl`、`tests/`。端到端 benchmark 固定 seed 和配置快照，记录 latency、tokens、cost、source count、citation retention、success；独立检索评测只加载 BEIR/scifact 的 corpus/query/qrels，计算 Recall@10、nDCG@10 和 MRR，不调用 LLM、Wikipedia 或 orchestrator 主链路；公开 Deep Research 评测 runner 会加载 LiveDRBench 等公开任务，跑完整 orchestrator 并输出 answer、sources、trace、cost、citation check 和 predictions artifact。
+评测层：`src/deepresearch_agent/benchmark.py`、`src/deepresearch_agent/retrieval_eval.py`、`src/deepresearch_agent/deep_research_eval.py`、`src/deepresearch_agent/source_metrics.py`、`data/benchmark_cases.jsonl`、`tests/`。端到端 benchmark 固定 seed 和配置快照，记录 latency、tokens、cost、source count、source provider/domain diversity、citation retention、success；独立检索评测只加载 BEIR/scifact 的 corpus/query/qrels，计算 Recall@10、nDCG@10 和 MRR，不调用 LLM、Wikipedia 或 orchestrator 主链路；公开 Deep Research 评测 runner 会加载 LiveDRBench 等公开任务，跑完整 orchestrator 并输出 answer、sources、trace、cost、citation check 和 predictions artifact。
 
 可观测层：`src/deepresearch_agent/tracing.py`、`src/deepresearch_agent/cost.py`。Trace 每阶段写 JSONL，Cost 按 brief_generation、planning、synthesis 归因 token、成本和实际模型名；mock 路径仍是字符数近似，DeepSeek 路径使用 provider 返回的真实 usage。
 
@@ -315,6 +315,8 @@ Public Deep Research Eval Harness：`src/deepresearch_agent/deep_research_eval.p
 
 Verifier：`src/deepresearch_agent/verifier.py`。输入是 source 列表，输出是过滤后的 source。关键设计是可解释 quality reasons。局限是规则打分，不能真正判断来源权威性。
 
+Source Metrics：`src/deepresearch_agent/source_metrics.py`。输入是最终 dedup 后的 `Source` 列表，输出 `source_provider_count`、`source_domain_count`、`source_provider_counts` 和 `source_domain_counts`。`orchestrator.py` 和 `run_control.py` 都复用这个 helper，所以 `/research`、CLI benchmark、public eval 和 `/runs` 的 source diversity 口径一致。局限是它只看 provider/domain 分布，不判断来源相关性、权威性或证据是否独立。
+
 Synthesizer：`src/deepresearch_agent/llm.py` 的 `synthesize`。输入是 brief、plan、findings、sources，输出 answer 和 claims。默认 mock 会生成可测报告，DeepSeek provider 会用 JSON mode 生成 markdown answer 和结构化 claims。局限是 DeepSeek 输出目前只靠 prompt 约束和后置 citation checker，没有做二次 LLM judge 或强制 source quote。
 
 Citation Checker：`src/deepresearch_agent/citation.py`。输入是 claims 和 sources，输出 `CitationCheckReport`。每条 `CitationAssessment` 现在包含 citation IDs、`supported`、`support_level`、overlap score、最多 3 条 `evidence_quotes`，以及可选 judge metadata。checker 会从 cited source 里按句子找最接近 claim 的 quote，输出 `supported / partial / unsupported / unverifiable`。默认仍是 lexical grounding；启用 judge 后，judge verdict 会覆盖最终 support_level，并保留 `judge_provider`、`judge_model`、`judge_confidence`、`judge_reason`。
@@ -533,7 +535,7 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
-测试验证：`py -3.11 -m pytest -q`，最新结果 `81 passed, 2 warnings in 66.16s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `81 passed, 2 warnings in 108.11s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -633,6 +635,8 @@ benchmark 汇总：管线 plumbing 指标，mock，非真实性能。具体 late
 
 Public eval heuristic judge smoke：`py -3.11 -m pytest tests/test_deep_research_eval.py -q` 成功，最新结果 `5 passed in 0.42s`。新增测试覆盖 heuristic judge 对 ground-truth group 的命中评分，以及 public eval raw/summary 写入 `answer_judgment`。CLI smoke：`py -3.11 -m deepresearch_agent.deep_research_eval --cases <temp>/cases.jsonl --benchmark-name local-cli-smoke --llm-provider mock --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --judge-provider heuristic --raw-log <temp>/raw.jsonl --summary-output <temp>/summary.json --predictions-output <temp>/predictions.json` 成功，summary 的 `answer_judge.provider=heuristic`、`scored_count=1`、`score_avg=1.0`、`pass_rate=1.0`。这是本地字符串命中 smoke，不是官方 judge。
 
+Source diversity metrics smoke：`py -3.11 -m pytest tests/test_spine.py tests/test_run_control.py tests/test_deep_research_eval.py -q` 成功，最新结果 `20 passed, 2 warnings in 60.65s`。新增断言覆盖 `/research` 生成的 `StructuredReport.metrics` 和 `/runs/worker/next` 结果里包含 `source_provider_count`、`source_domain_count`、`source_provider_counts`、`source_domain_counts`；`benchmark.py` 和 `deep_research_eval.py` 也会把 provider/domain count 写入 case record 并汇总平均数。这里没有重跑真实 DeepSeek/Wikipedia benchmark，指标只证明 plumbing 和 schema 已接入。
+
 未实测：LiveDRBench/Deep Research Bench 官方 judge 分数、LLM answer judge 真实评测、真实搜索 API 高并发限流、Brave/Tavily live search benchmark、OpenAI-compatible LLM live endpoint、DeepSeek citation judge live benchmark、Redis/PostgreSQL 缓存、多进程 worker pool / 分布式队列、真实 OpenTelemetry collector / LangSmith tracing、真实用户流量、DashScope 真实 embedding/rerank、真实 Qdrant 服务 live benchmark、扫描件 OCR、大规模私有语料增量 reindex、rerank 5 case 全量 benchmark。
 
 # 8 评测设计
@@ -640,7 +644,7 @@ Public eval heuristic judge smoke：`py -3.11 -m pytest tests/test_deep_research
 answer completeness：当前已经有可选 heuristic answer judge，会在 case 提供 ground truth 时计算 normalized substring 命中率，并写入 `answer_judgment` / `answer_judge` summary；但这只是本地弱信号，不是 LLM judge 或官方 Deep Research judge。LiveDRBench preview 已经能驱动完整 orchestrator 产 artifact，但 answer-quality 官方分数仍未实测。
 citation faithfulness：当前提交过的 benchmark 指标仍以 claim/source lexical overlap 为基础，但已经从单一分数升级到 `support_level`、`evidence_quotes`，并新增可选 citation judge provider。mock plumbing run 平均 retention 是 `1.0`，只能说明 mock 引用链路没断；最新 DeepSeek v4-flash + Wikipedia 对比里，keyword baseline 平均 retention 是 `0.8867`，local hybrid 是 `0.8929`，但 hybrid success_rate 更低，说明不能只看均值。DeepSeek citation judge 还没有真实 benchmark，不能把它当成已验证质量提升。
 retrieval quality：端到端 benchmark 里的 citation_retention 会受 LLM 和 search 波动影响，所以我新增了 BEIR/scifact 独立检索评测，直接用 qrels 计算 Recall@10、nDCG@10、MRR。当前真实结果是 keyword `0.6000/0.4823/0.4548`，hybrid `0.8239/0.6597/0.6114`，hybrid+rerank `0.8239/0.7307/0.7083`。
-source diversity：当前记录 deduped_source_count，也记录 local retrieval metadata 里的 keyword/vector/rerank rank；但还没有按 domain/provider 多样性和人工相关性打分。
+source diversity：当前记录 deduped_source_count，也新增了 `source_provider_count`、`source_domain_count`、`source_provider_counts`、`source_domain_counts`，benchmark/public eval 会汇总 provider/domain 平均数；local retrieval metadata 仍记录 keyword/vector/rerank rank。但这还不是人工相关性或来源独立性评分，只是结构化多样性信号。
 hallucination rate：当前用 unsupported citation count 作为 proxy，不能覆盖无引用幻觉。
 latency：benchmark 记录每 case latency_ms，并计算 P50/P90/max；mock latency 只能作为 plumbing 回归信号，DeepSeek + Wikipedia latency 包含真实网络/API 时间，也不能当线上 SLA。local hybrid 比 keyword baseline p50 多 `6151.778ms`；独立检索评测里 keyword 平均每 query `0.3070s`，hybrid `0.5781s`，hybrid+rerank `3.4431s`，这些都需要如实讲。
 cost：mock provider 成本为 0，token 用字符估算；DeepSeek provider 已接真实 usage，并按当前实现里的 v4-flash 价格常量估算成本，价格核对日期 `2026-06-07`。BEIR/scifact 独立检索评测不调用 LLM，LLM token 和 API cost 都是 0；本地 embedding/rerank 不产生 API 成本，但会产生本机 CPU/GPU 时间；DashScope 成本未实测。

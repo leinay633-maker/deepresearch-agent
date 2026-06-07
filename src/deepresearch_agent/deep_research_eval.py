@@ -274,6 +274,8 @@ def _case_success_record(case: dict[str, Any], report: StructuredReport) -> dict
         "total_tokens": report.cost.total_tokens,
         "estimated_cost_usd": report.cost.total_estimated_cost_usd,
         "deduped_source_count": report.metrics["deduped_source_count"],
+        "source_provider_count": report.metrics["source_provider_count"],
+        "source_domain_count": report.metrics["source_domain_count"],
         "raw_search_result_count": report.metrics["raw_search_result_count"],
         "citation_retention_rate": report.metrics["citation_retention_rate"],
         "fallback_count": report.metrics["fallback_count"],
@@ -367,6 +369,8 @@ def _summarize(
         if record.get("citation_retention_rate") is not None
     ]
     source_counts = [record.get("deduped_source_count", 0) for record in records]
+    provider_counts = [record.get("source_provider_count", 0) for record in records]
+    domain_counts = [record.get("source_domain_count", 0) for record in records]
     answer_judgments = [
         record["answer_judgment"]
         for record in records
@@ -410,6 +414,12 @@ def _summarize(
         "deduped_source_count_avg": round(sum(source_counts) / len(source_counts), 3)
         if source_counts
         else 0.0,
+        "source_provider_count_avg": round(sum(provider_counts) / len(provider_counts), 3)
+        if provider_counts
+        else 0.0,
+        "source_domain_count_avg": round(sum(domain_counts) / len(domain_counts), 3)
+        if domain_counts
+        else 0.0,
         "fallback_count_total": sum(record.get("fallback_count", 0) for record in records),
         "answer_judge": {
             "provider": config_snapshot.get("judge_provider", "none"),
@@ -438,6 +448,8 @@ def _summarize(
                 "total_tokens": record.get("total_tokens", 0),
                 "estimated_cost_usd": record.get("estimated_cost_usd", 0.0),
                 "deduped_source_count": record.get("deduped_source_count", 0),
+                "source_provider_count": record.get("source_provider_count", 0),
+                "source_domain_count": record.get("source_domain_count", 0),
                 "citation_retention_rate": record.get("citation_retention_rate", 0.0),
                 "fallback_count": record.get("fallback_count", 0),
                 "answer_judgment": record.get("answer_judgment"),

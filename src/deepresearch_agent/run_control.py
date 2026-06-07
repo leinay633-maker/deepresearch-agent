@@ -32,6 +32,7 @@ from deepresearch_agent.schemas import (
     SubQuestion,
 )
 from deepresearch_agent.search import build_search_service
+from deepresearch_agent.source_metrics import source_diversity_metrics
 from deepresearch_agent.tracing import TraceLogger, build_trace_exporter
 
 
@@ -414,6 +415,7 @@ class RunController:
             "fallback_count": fallback_count,
             "citation_retention_rate": citation_report.retention_rate,
             "success": citation_report.retention_rate >= 0.8 and len(sources) > 0,
+            **source_diversity_metrics(sources),
         }
         report = StructuredReport(
             run_id=run_id,
