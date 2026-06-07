@@ -55,13 +55,13 @@ py -3.11 -m deepresearch_agent.cli "How should report export work?" --llm-provid
 
 当前导出支持 Markdown、HTML、JSON、PDF、DOCX、PPTX、WAV；PDF/DOCX/PPTX 是文本版报告导出，保留 answer、sources、citation assessments 和 evidence quotes。WAV 通过本机 Windows SAPI 把报告摘要转成语音，不是完整 podcast 制作系统。
 
-从本地 Markdown/TXT 文件夹生成私有知识库 JSONL：
+从本地 Markdown/TXT/PDF/DOCX 文件夹生成私有知识库 JSONL：
 
 ```powershell
 py -3.11 -m deepresearch_agent.ingest_corpus .\my_notes --output data\local_corpus.jsonl --json
 ```
 
-安装 editable package 后，也可以用 console script：`deepresearch-ingest-corpus .\my_notes --output data\local_corpus.jsonl --json`。生成的 JSONL 可被 `LocalRagRetriever` 的 keyword / hybrid 两种模式直接读取；默认会跳过 `.git`、`.obsidian`、`.claude`、`node_modules` 和 `__pycache__`。
+安装 editable package 后，也可以用 console script：`deepresearch-ingest-corpus .\my_notes --output data\local_corpus.jsonl --json`。生成的 JSONL 可被 `LocalRagRetriever` 的 keyword / hybrid 两种模式直接读取；默认会跳过 `.git`、`.obsidian`、`.claude`、`node_modules` 和 `__pycache__`。PDF 通过 `pypdf` 抽取文本，DOCX 通过 `python-docx` 抽取段落和表格文本；扫描件 OCR 不在当前范围内。
 
 可选导出 OpenTelemetry OTLP HTTP trace：
 
@@ -231,7 +231,7 @@ src/deepresearch_agent/
   llm.py              Mock and DeepSeek structured-output model providers
   search.py           Search adapters, retry, timeout, circuit breaker, fallback
   rag.py              Local keyword/vector hybrid RAG retriever, Chroma/Qdrant index adapters
-  ingest_corpus.py    Markdown/TXT to local JSONL corpus ingestion
+  ingest_corpus.py    Markdown/TXT/PDF/DOCX to local JSONL corpus ingestion
   embeddings.py       Local and DashScope embedding providers
   rerankers.py        Optional local and DashScope rerank providers
   verifier.py         Source quality filtering

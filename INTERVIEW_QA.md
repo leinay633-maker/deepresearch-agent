@@ -228,7 +228,7 @@
 [状态: 待消化]
 标签：RAG / Retriever
 检索关键词：LocalRagRetriever, local_corpus, hybrid retrieval
-回答：当前 RAG 是 `LocalRagRetriever`，读取 `data/local_corpus.jsonl` 后先分块。语料既可以手写 JSONL，也可以用 `ingest_corpus.py` 从 Markdown/TXT 文件夹生成。检索支持两种模式：`keyword` 是旧基线，用 token overlap 排序；`hybrid` 是默认模式，用关键词召回和 BGE 向量召回两路并存，再用 RRF 融合。向量侧用 `sentence-transformers` 的 `BAAI/bge-small-zh-v1.5` 生成 embedding，默认用 Chroma 建本地 index；如果设置 `LOCAL_VECTOR_INDEX_PERSIST=true`，会按 corpus 和 embedding 模型指纹复用本地 Chroma collection；如果设置 `LOCAL_VECTOR_INDEX_PROVIDER=qdrant`，会走 Qdrant HTTP vector index provider。无论哪种模式，最后都返回统一的 `Source`，所以下游 dedup、verifier、synthesizer 不需要改。
+回答：当前 RAG 是 `LocalRagRetriever`，读取 `data/local_corpus.jsonl` 后先分块。语料既可以手写 JSONL，也可以用 `ingest_corpus.py` 从 Markdown/TXT/PDF/DOCX 文件夹生成。检索支持两种模式：`keyword` 是旧基线，用 token overlap 排序；`hybrid` 是默认模式，用关键词召回和 BGE 向量召回两路并存，再用 RRF 融合。向量侧用 `sentence-transformers` 的 `BAAI/bge-small-zh-v1.5` 生成 embedding，默认用 Chroma 建本地 index；如果设置 `LOCAL_VECTOR_INDEX_PERSIST=true`，会按 corpus 和 embedding 模型指纹复用本地 Chroma collection；如果设置 `LOCAL_VECTOR_INDEX_PROVIDER=qdrant`，会走 Qdrant HTTP vector index provider。无论哪种模式，最后都返回统一的 `Source`，所以下游 dedup、verifier、synthesizer 不需要改。
 关联模块：`rag.py`, `ingest_corpus.py`, `embeddings.py`, `data/local_corpus.jsonl`
 可追问：
 1. 为什么不用向量替换关键词？
@@ -249,8 +249,8 @@
 ## Q：私有知识库怎么接入？
 [状态: 待消化]
 标签：RAG / 私有知识库
-检索关键词：ingest corpus, Markdown, local_corpus.jsonl
-回答：我没有一开始上 RAGFlow 这种完整平台，而是先做了一个离线 ingest 入口。`ingest_corpus.py` 会递归读取 Markdown/TXT，默认跳过 `.git`、`.obsidian`、`.claude`、`node_modules`、`__pycache__`，清理 YAML frontmatter，用 H1 或文件名生成 title，输出 `id/title/url/content/metadata` 的 JSONL。这个 JSONL 可以直接给 `LocalRagRetriever` 用 keyword 或 hybrid 检索，向量索引可以用默认 Chroma，也可以显式切到 Qdrant HTTP provider。局限是还不支持 PDF/DOCX、增量 manifest、权限过滤、真实 Qdrant live benchmark 和自动 reindex。
+检索关键词：ingest corpus, Markdown, PDF, DOCX, local_corpus.jsonl
+回答：我没有一开始上 RAGFlow 这种完整平台，而是先做了一个离线 ingest 入口。`ingest_corpus.py` 会递归读取 Markdown/TXT/PDF/DOCX，默认跳过 `.git`、`.obsidian`、`.claude`、`node_modules`、`__pycache__`；Markdown 会清理 YAML frontmatter，用 H1 或文件名生成 title；PDF 用 `pypdf` 抽取每页文本；DOCX 用 `python-docx` 抽取段落和表格文本；输出 `id/title/url/content/metadata` 的 JSONL。这个 JSONL 可以直接给 `LocalRagRetriever` 用 keyword 或 hybrid 检索，向量索引可以用默认 Chroma，也可以显式切到 Qdrant HTTP provider。局限是还不支持扫描件 OCR、增量 manifest、权限过滤、真实 Qdrant live benchmark 和自动 reindex。
 关联模块：`ingest_corpus.py`, `rag.py`, `tests/test_ingest_corpus.py`
 可追问：
 1. 为什么不直接接 RAGFlow？

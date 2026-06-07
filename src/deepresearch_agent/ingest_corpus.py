@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_INCLUDE_EXTENSIONS = {".md", ".markdown", ".txt"}
+DEFAULT_INCLUDE_EXTENSIONS = {".md", ".markdown", ".txt", ".pdf", ".docx"}
 DEFAULT_EXCLUDE_DIRS = {".git", ".obsidian", ".claude", "node_modules", "__pycache__"}
 
 
@@ -46,7 +46,7 @@ def ingest_directory(
     skipped_count = 0
 
     for path in _iter_document_paths(root, extensions, excluded):
-        raw = path.read_text(encoding="utf-8", errors="replace")
+        raw = _read_document_text(path)
         content = _clean_content(raw)
         if max_chars_per_document is not None:
             content = content[:max_chars_per_document].strip()
@@ -108,6 +108,37 @@ def _clean_content(raw: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _read_document_text(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".md", ".markdown", ".txt"}:
+        return path.read_text(encoding="utf-8", errors="replace")
+    if suffix == ".docx":
+        return _read_docx_text(path)
+    if suffix == ".pdf":
+        return _read_pdf_text(path)
+    raise ValueError(f"unsupported document extension: {path.suffix}")
+
+
+def _read_docx_text(path: Path) -> str:
+    from docx import Document
+
+    document = Document(str(path))
+    parts = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
+    for table in document.tables:
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+            if cells:
+                parts.append(" | ".join(cells))
+    return "\n".join(parts)
+
+
+def _read_pdf_text(path: Path) -> str:
+    from pypdf import PdfReader
+
+    reader = PdfReader(str(path))
+    return "\n".join(page.extract_text() or "" for page in reader.pages)
+
+
 def _title_from_content(content: str, path: Path) -> str:
     for line in content.splitlines():
         match = re.match(r"^#\s+(.+?)\s*$", line)
@@ -130,7 +161,9 @@ def _parse_csv_set(raw: str) -> set[str]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build a local JSONL corpus from Markdown/TXT files.")
+    parser = argparse.ArgumentParser(
+        description="Build a local JSONL corpus from Markdown/TXT/PDF/DOCX files."
+    )
     parser.add_argument("input_dir", help="Directory containing private knowledge-base files.")
     parser.add_argument(
         "--output",
@@ -139,7 +172,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--include-extensions",
-        default="md,markdown,txt",
+        default="md,markdown,txt,pdf,docx",
         help="Comma-separated file extensions to ingest.",
     )
     parser.add_argument(
