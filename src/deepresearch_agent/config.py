@@ -18,6 +18,7 @@ class Settings:
     mock_input_cost_per_1m_tokens: float = 0.0
     mock_output_cost_per_1m_tokens: float = 0.0
     trace_dir: str = "logs"
+    run_store_path: str = "data/runs.sqlite"
     deepseek_model: str = "deepseek-v4-flash"
     embedding_provider: str = "local"
     local_embedding_model: str = "BAAI/bge-small-zh-v1.5"
@@ -76,6 +77,7 @@ def load_settings() -> Settings:
         circuit_breaker_cooldown_seconds=_float_env("CIRCUIT_BREAKER_COOLDOWN_SECONDS", 30.0),
         max_researchers=_int_env("MAX_RESEARCHERS", 3),
         trace_dir=os.getenv("TRACE_DIR", "logs"),
+        run_store_path=os.getenv("RUN_STORE_PATH", "data/runs.sqlite"),
         deepseek_model=(
             os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip()
             or "deepseek-v4-flash"
