@@ -10,7 +10,21 @@ from deepresearch_agent.deep_research_eval import (
     load_eval_cases_from_file,
     run_public_deep_research_eval,
 )
-from deepresearch_agent.eval_judge import HeuristicAnswerJudgeProvider
+from deepresearch_agent.eval_judge import DeepSeekAnswerJudgeProvider, HeuristicAnswerJudgeProvider
+
+
+class _FakeResponse:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return json.dumps(self.payload).encode("utf-8")
 
 
 def test_load_eval_cases_from_jsonl_normalizes_livedrbench_shape(tmp_path: Path) -> None:
@@ -69,6 +83,70 @@ def test_heuristic_answer_judge_scores_ground_truth_groups() -> None:
     assert judgment.score == 1.0
     assert judgment.verdict == "pass"
     assert judgment.missing == []
+
+
+def test_deepseek_answer_judge_parses_json_response(monkeypatch) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
+    requested = {}
+
+    def fake_urlopen(request, timeout):
+        requested["url"] = request.full_url
+        requested["timeout"] = timeout
+        requested["authorization"] = request.get_header("Authorization")
+        requested["payload"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "score": 0.75,
+                                    "verdict": "partial",
+                                    "reason": "answer missed one expected group",
+                                    "matched": ["paper title"],
+                                    "missing": ["second fact"],
+                                }
+                            )
+                        }
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 20,
+                    "prompt_cache_hit_tokens": 10,
+                    "prompt_cache_miss_tokens": 90,
+                },
+            }
+        )
+
+    monkeypatch.setattr("deepresearch_agent.eval_judge.urlopen", fake_urlopen)
+    provider = DeepSeekAnswerJudgeProvider(model="deepseek-v4-flash", timeout_seconds=2.0)
+
+    judgment = provider.judge(
+        {
+            "query": "Find the benchmark paper.",
+            "metadata": {"ground_truths": [["paper title"], ["second fact"]]},
+        },
+        {"answer": "The answer mentions only the paper title."},
+    )
+
+    assert requested["url"] == "https://api.deepseek.com/chat/completions"
+    assert requested["timeout"] == 2.0
+    assert requested["authorization"] == "Bearer sk-test-key"
+    assert requested["payload"]["model"] == "deepseek-v4-flash"
+    assert requested["payload"]["response_format"] == {"type": "json_object"}
+    user_payload = json.loads(requested["payload"]["messages"][1]["content"])
+    assert user_payload["ground_truth_groups"] == [["paper title"], ["second fact"]]
+    assert judgment.provider == "deepseek"
+    assert judgment.model == "deepseek-v4-flash"
+    assert judgment.score == 0.75
+    assert judgment.verdict == "partial"
+    assert judgment.matched == ["paper title"]
+    assert judgment.missing == ["second fact"]
+    assert judgment.input_tokens == 100
+    assert judgment.output_tokens == 20
+    assert judgment.estimated_cost_usd > 0
 
 
 def test_run_public_eval_with_mock_writes_artifacts(tmp_path: Path) -> None:

@@ -125,10 +125,10 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 
 背景：之前只有 5 条本地端到端 smoke benchmark 和 BEIR/scifact 检索模块评测。它们能证明 plumbing 和 retriever，但不能回答“面对公开 Deep Research 任务，完整报告链路表现怎样”，这是和 open_deep_research 这类项目的可信度差距。
 可选方案：直接接官方 judge/LLM 评分；先手写更多本地 case；先复用 LiveDRBench/Deep Research Bench 任务格式输出 artifacts；继续只看 BEIR/scifact。
-最终选择：新增 `src/deepresearch_agent/deep_research_eval.py`，优先做公开任务加载、完整 orchestrator 运行、raw JSONL、summary JSON 和 LiveDRBench-style predictions 输出；之后补一个可选 `--judge-provider heuristic`，只按 case 里的 ground truth 字符串做本地命中率评分。官方 judge 仍标记为 `not_run`，不编官方分数。
-理由：没有 judge key 或官方 scoring 环境时，最重要的是先把每题的 query、配置快照、answer、claims、sources、trace、token、cost、citation check 和失败原因保存下来，保证结果可复查。heuristic answer judge 只是在有 `ground_truths/answer/expected_answer` 的 case 上给一个可复现的弱信号，下一步接官方 judge 或人工复核时不用重构评测入口。
-代价：当前 `success_rate` 仍沿用本项目 citation retention 阈值，不等于官方 Deep Research Bench 分数；heuristic answer judge 只是 normalized substring matching，不能理解语义等价、格式错误或部分正确；LiveDRBench 任务常要求精确 JSON/论文标题，当前 synthesizer 还不是专门为该格式训练或约束的，所以真实组可以跑但质量很差。
-面试怎么答：我会说我先补的是“公开任务可跑、artifact 可审计、本地弱评分可复现”的评测底座，而不是假装已经有官方 leaderboard 分数。最新 1 条 LiveDRBench preview 真实口径就是失败样本：DeepSeek v4-flash + Wikipedia 跑通但 `success_rate=0.0`、citation retention `0.5`，这反而暴露了搜索覆盖和 citation 语义评测短板。
+最终选择：新增 `src/deepresearch_agent/deep_research_eval.py`，优先做公开任务加载、完整 orchestrator 运行、raw JSONL、summary JSON 和 LiveDRBench-style predictions 输出；之后补两个可选 answer judge：`--judge-provider heuristic` 只按 case 里的 ground truth 字符串做本地命中率评分，`--judge-provider deepseek` 调 DeepSeek JSON mode 返回 `score/verdict/reason/matched/missing`。官方 judge 仍标记为 `not_run`，不编官方分数。
+理由：没有 judge key 或官方 scoring 环境时，最重要的是先把每题的 query、配置快照、answer、claims、sources、trace、token、cost、citation check 和失败原因保存下来，保证结果可复查。heuristic answer judge 给无 key 的可复现弱信号；DeepSeek answer judge 复用本项目已有 v4-flash provider 和价格常量，能把非官方 LLM 评分、judge token 和估算成本记录进 artifact，但不会冒充官方分数。
+代价：当前 `success_rate` 仍沿用本项目 citation retention 阈值，不等于官方 Deep Research Bench 分数；heuristic answer judge 只是 normalized substring matching，不能理解语义等价、格式错误或部分正确；DeepSeek answer judge 是非官方 LLM judge，受 prompt、模型版本和 ground truth 质量影响，当前只做了 stub/smoke，没有 live benchmark；LiveDRBench 任务常要求精确 JSON/论文标题，当前 synthesizer 还不是专门为该格式训练或约束的，所以真实组可以跑但质量很差。
+面试怎么答：我会说我先补的是“公开任务可跑、artifact 可审计、本地弱评分可复现、可选 LLM judge 可审计”的评测底座，而不是假装已经有官方 leaderboard 分数。最新 1 条 LiveDRBench preview 真实口径就是失败样本：DeepSeek v4-flash + Wikipedia 跑通但 `success_rate=0.0`、citation retention `0.5`，这反而暴露了搜索覆盖和 citation 语义评测短板。
 
 ## 决策 12：为什么把 web search 和 crawler 分开接
 
@@ -311,7 +311,7 @@ Rerank Provider：`src/deepresearch_agent/rerankers.py`。输入 query 和候选
 
 Retrieval Eval Harness：`src/deepresearch_agent/retrieval_eval.py`。输入是 BEIR/scifact 的 corpus、queries、qrels，输出 `results/retrieval_eval_scifact.json`。这个脚本不调用 LLM、不调用 Wikipedia、不跑 orchestrator，只把 SciFact 文档写成本项目 local corpus 格式，然后复用 `LocalRagRetriever` 跑 keyword / hybrid / hybrid+rerank。评测默认不保存每个 query 的 ranking 明细，避免结果文件过大；需要排查时可以显式加 `--include-rankings`。
 
-Public Deep Research Eval Harness：`src/deepresearch_agent/deep_research_eval.py`。输入可以是本地 JSONL/JSON/CSV，也可以直接从 Hugging Face datasets-server 拉 `microsoft/LiveDRBench` 的 `preview` 或 `v1-full` split。它会跑完整 `DeepResearchOrchestrator`，写 `logs/deep-research-eval-*.jsonl`、summary JSON 和 LiveDRBench-style `preds` 文件。`judge_provider=none` 时只产 artifact 和本项目已有 success/citation/cost 指标；`judge_provider=heuristic` 时会调用 `src/deepresearch_agent/eval_judge.py`，按 case metadata 里的 ground truth 字符串命中率写入 `answer_judgment` 和 summary 的 `answer_judge`。局限是这不是官方 answer-quality 分数。
+Public Deep Research Eval Harness：`src/deepresearch_agent/deep_research_eval.py`。输入可以是本地 JSONL/JSON/CSV，也可以直接从 Hugging Face datasets-server 拉 `microsoft/LiveDRBench` 的 `preview` 或 `v1-full` split。它会跑完整 `DeepResearchOrchestrator`，写 `logs/deep-research-eval-*.jsonl`、summary JSON 和 LiveDRBench-style `preds` 文件。`judge_provider=none` 时只产 artifact 和本项目已有 success/citation/cost 指标；`judge_provider=heuristic` 时会调用 `src/deepresearch_agent/eval_judge.py` 的本地字符串命中评分；`judge_provider=deepseek` 时会用 `DEEPSEEK_API_KEY` 调 DeepSeek JSON mode，写入 `answer_judgment`，并在 summary 的 `answer_judge` 里记录 judge model、token 和估算成本。局限是 heuristic 和 DeepSeek 都不是官方 answer-quality 分数。
 
 Verifier：`src/deepresearch_agent/verifier.py`。输入是 source 列表，输出是过滤后的 source。关键设计是可解释 quality reasons。局限是规则打分，不能真正判断来源权威性。
 
@@ -535,7 +535,7 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
-测试验证：`py -3.11 -m pytest -q`，最新结果 `81 passed, 2 warnings in 108.11s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `82 passed, 2 warnings in 65.39s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -624,7 +624,7 @@ benchmark 汇总：管线 plumbing 指标，mock，非真实性能。具体 late
 
 这组评测不能外推成“线上问答质量提升”。SciFact 是英文科学摘要，query/qrels 来自公开 IR benchmark，和本项目求职知识库、小规模 local corpus、中文问题不是同一分布。面试里我会把它作为“检索模块结构升级的独立证据”，同时主动说它和 DeepSeek + Wikipedia 的端到端成功率、fallback、citation retention 是两套指标。
 
-公开 Deep Research 端到端 artifact 评测（LiveDRBench preview）：这组是公开任务驱动完整 orchestrator，不是只测 retriever。脚本是 `src/deepresearch_agent/deep_research_eval.py`，默认从 Hugging Face datasets-server 拉 `microsoft/LiveDRBench` 的 `preview/test` 行，输出 summary、raw JSONL 和 LiveDRBench-style predictions。当前还没有接官方 judge，所以 `official_judge_score=not_run`；下面的 success 仍是本项目现有 citation retention 阈值口径，不是官方排行榜分数。新增的 `--judge-provider heuristic` 只在 case 带 ground truth 时做 normalized substring 命中评分。
+公开 Deep Research 端到端 artifact 评测（LiveDRBench preview）：这组是公开任务驱动完整 orchestrator，不是只测 retriever。脚本是 `src/deepresearch_agent/deep_research_eval.py`，默认从 Hugging Face datasets-server 拉 `microsoft/LiveDRBench` 的 `preview/test` 行，输出 summary、raw JSONL 和 LiveDRBench-style predictions。当前还没有接官方 judge，所以 `official_judge_score=not_run`；下面的 success 仍是本项目现有 citation retention 阈值口径，不是官方排行榜分数。`--judge-provider heuristic` 只在 case 带 ground truth 时做 normalized substring 命中评分；`--judge-provider deepseek` 是可选非官方 LLM answer judge，会记录 judge token/cost，但这次没有 live benchmark。
 
 | 口径 | summary | raw log | case_count | success_rate | citation_retention_rate_avg | deduped_source_count_avg | latency p50 | total_tokens | estimated_cost_usd_total | fallback_count_total |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -633,15 +633,15 @@ benchmark 汇总：管线 plumbing 指标，mock，非真实性能。具体 late
 
 这条公开真实 case 的 query 是让系统根据 `American Community Survey / FEMA Harvey flood depths / USDA Food Access Research Atlas / Streetlight / SafeGraph POI` 找使用全部数据集的论文，并按 JSON 返回 `paper_title`。真实组没有报错，也没有 fallback，但 success 为 0，说明当前 DeepSeek + Wikipedia + 本地 keyword RAG 没有解决这类公开精确查证任务；citation retention 只有 `0.5`，也说明 lexical citation check 已经暴露支撑不足。面试里我会把它讲成“公开评测入口已经打通，但质量短板被暴露出来”，不会把 mock 组的 `1.0` 当质量成果。
 
-Public eval heuristic judge smoke：`py -3.11 -m pytest tests/test_deep_research_eval.py -q` 成功，最新结果 `5 passed in 0.42s`。新增测试覆盖 heuristic judge 对 ground-truth group 的命中评分，以及 public eval raw/summary 写入 `answer_judgment`。CLI smoke：`py -3.11 -m deepresearch_agent.deep_research_eval --cases <temp>/cases.jsonl --benchmark-name local-cli-smoke --llm-provider mock --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --judge-provider heuristic --raw-log <temp>/raw.jsonl --summary-output <temp>/summary.json --predictions-output <temp>/predictions.json` 成功，summary 的 `answer_judge.provider=heuristic`、`scored_count=1`、`score_avg=1.0`、`pass_rate=1.0`。这是本地字符串命中 smoke，不是官方 judge。
+Public eval answer judge smoke：`py -3.11 -m pytest tests/test_deep_research_eval.py -q` 成功，最新结果 `6 passed in 0.55s`。测试覆盖 heuristic judge 对 ground-truth group 的命中评分、public eval raw/summary 写入 `answer_judgment`、以及 DeepSeek answer judge 的 stubbed HTTP 请求：`DEEPSEEK_API_KEY` 只从环境变量读，请求使用 `response_format={"type":"json_object"}`，模型为 `deepseek-v4-flash`，并能解析 `score=0.75 / verdict=partial / matched / missing / usage`，把 judge token 和估算成本写入 `AnswerJudgment`。CLI help 已显示 `--judge-provider {none,heuristic,deepseek}` 和 `--judge-model`；本地 CLI smoke：`py -3.11 -m deepresearch_agent.deep_research_eval --cases <temp>/cases.jsonl --benchmark-name local-cli-smoke --llm-provider mock --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --judge-provider heuristic --raw-log <temp>/raw.jsonl --summary-output <temp>/summary.json --predictions-output <temp>/predictions.json` 成功，summary 的 `answer_judge.provider=heuristic`、`scored_count=1`、`score_avg=1.0`、`tokens_total=0`。这是本地字符串命中和 DeepSeek stub 单测，不是官方 judge，也不是 DeepSeek live judge benchmark。
 
 Source diversity metrics smoke：`py -3.11 -m pytest tests/test_spine.py tests/test_run_control.py tests/test_deep_research_eval.py -q` 成功，最新结果 `20 passed, 2 warnings in 60.65s`。新增断言覆盖 `/research` 生成的 `StructuredReport.metrics` 和 `/runs/worker/next` 结果里包含 `source_provider_count`、`source_domain_count`、`source_provider_counts`、`source_domain_counts`；`benchmark.py` 和 `deep_research_eval.py` 也会把 provider/domain count 写入 case record 并汇总平均数。这里没有重跑真实 DeepSeek/Wikipedia benchmark，指标只证明 plumbing 和 schema 已接入。
 
-未实测：LiveDRBench/Deep Research Bench 官方 judge 分数、LLM answer judge 真实评测、真实搜索 API 高并发限流、Brave/Tavily live search benchmark、OpenAI-compatible LLM live endpoint、DeepSeek citation judge live benchmark、Redis/PostgreSQL 缓存、多进程 worker pool / 分布式队列、真实 OpenTelemetry collector / LangSmith tracing、真实用户流量、DashScope 真实 embedding/rerank、真实 Qdrant 服务 live benchmark、扫描件 OCR、大规模私有语料增量 reindex、rerank 5 case 全量 benchmark。
+未实测：LiveDRBench/Deep Research Bench 官方 judge 分数、DeepSeek answer judge live benchmark、真实搜索 API 高并发限流、Brave/Tavily live search benchmark、OpenAI-compatible LLM live endpoint、DeepSeek citation judge live benchmark、Redis/PostgreSQL 缓存、多进程 worker pool / 分布式队列、真实 OpenTelemetry collector / LangSmith tracing、真实用户流量、DashScope 真实 embedding/rerank、真实 Qdrant 服务 live benchmark、扫描件 OCR、大规模私有语料增量 reindex、rerank 5 case 全量 benchmark。
 
 # 8 评测设计
 
-answer completeness：当前已经有可选 heuristic answer judge，会在 case 提供 ground truth 时计算 normalized substring 命中率，并写入 `answer_judgment` / `answer_judge` summary；但这只是本地弱信号，不是 LLM judge 或官方 Deep Research judge。LiveDRBench preview 已经能驱动完整 orchestrator 产 artifact，但 answer-quality 官方分数仍未实测。
+answer completeness：当前已经有可选 answer judge，会在 case 提供 ground truth 时写入 `answer_judgment` / `answer_judge` summary。`heuristic` 是本地 normalized substring 弱信号；`deepseek` 是非官方 DeepSeek JSON mode LLM judge，会记录 judge model、token 和估算成本。LiveDRBench preview 已经能驱动完整 orchestrator 产 artifact，但官方 answer-quality 分数和 DeepSeek answer judge live benchmark 仍未实测。
 citation faithfulness：当前提交过的 benchmark 指标仍以 claim/source lexical overlap 为基础，但已经从单一分数升级到 `support_level`、`evidence_quotes`，并新增可选 citation judge provider。mock plumbing run 平均 retention 是 `1.0`，只能说明 mock 引用链路没断；最新 DeepSeek v4-flash + Wikipedia 对比里，keyword baseline 平均 retention 是 `0.8867`，local hybrid 是 `0.8929`，但 hybrid success_rate 更低，说明不能只看均值。DeepSeek citation judge 还没有真实 benchmark，不能把它当成已验证质量提升。
 retrieval quality：端到端 benchmark 里的 citation_retention 会受 LLM 和 search 波动影响，所以我新增了 BEIR/scifact 独立检索评测，直接用 qrels 计算 Recall@10、nDCG@10、MRR。当前真实结果是 keyword `0.6000/0.4823/0.4548`，hybrid `0.8239/0.6597/0.6114`，hybrid+rerank `0.8239/0.7307/0.7083`。
 source diversity：当前记录 deduped_source_count，也新增了 `source_provider_count`、`source_domain_count`、`source_provider_counts`、`source_domain_counts`，benchmark/public eval 会汇总 provider/domain 平均数；local retrieval metadata 仍记录 keyword/vector/rerank rank。但这还不是人工相关性或来源独立性评分，只是结构化多样性信号。
@@ -651,7 +651,7 @@ cost：mock provider 成本为 0，token 用字符估算；DeepSeek provider 已
 工具失败恢复：有 unit test 覆盖 primary failure fallback 和 circuit breaker open；第一次 DeepSeek + Wikipedia benchmark 出现过 fallback，修复 Wikipedia 长查询压缩后 fallback 曾降到 0，但最新 keyword/hybrid 对比里仍分别出现 `fallback_count_total=1` 和 `2`，已在第 7 节如实记录。
 multi-hop / reflection 成功率：当前没有真实 multi-hop 标注集，未实测质量提升；但 reflection loop 的控制流已用 mock/keyword smoke 验证，会在证据不足启发式触发时追加 `R<N>` follow-up question，并把 compression/reflection payload 写入 trace。下一步需要公开多跳任务或人工标注集来评估是否真的提升答案质量。
 
-评测集构造方式：端到端 5 条 case 是围绕本项目核心能力手写的 smoke benchmark，覆盖 supervisor-researcher、citation faithfulness、tool failure、cost tracking、benchmark reproducibility。公开检索标准口径采用 BEIR/scifact test qrels，只评测 local retriever，不评测 LLM 回答质量。公开 Deep Research 端到端口径新增 LiveDRBench preview runner，会跑完整 orchestrator 并保存 answer/source/trace/cost/predictions artifacts；有 ground truth 的本地/公开 case 可以额外开 heuristic answer judge；当前只跑了 1 条 mock 和 1 条 DeepSeek/Wikipedia 样本，官方 judge 分数尚未接入。
+评测集构造方式：端到端 5 条 case 是围绕本项目核心能力手写的 smoke benchmark，覆盖 supervisor-researcher、citation faithfulness、tool failure、cost tracking、benchmark reproducibility。公开检索标准口径采用 BEIR/scifact test qrels，只评测 local retriever，不评测 LLM 回答质量。公开 Deep Research 端到端口径新增 LiveDRBench preview runner，会跑完整 orchestrator 并保存 answer/source/trace/cost/predictions artifacts；有 ground truth 的本地/公开 case 可以额外开 heuristic 或 DeepSeek answer judge；当前只跑了 1 条 mock 和 1 条 DeepSeek/Wikipedia 样本，官方 judge 分数和 DeepSeek answer judge live 口径尚未接入。
 
 # 9 与参考项目的差异
 

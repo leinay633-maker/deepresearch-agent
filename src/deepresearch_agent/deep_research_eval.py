@@ -49,7 +49,6 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     predictions_path.parent.mkdir(parents=True, exist_ok=True)
-    answer_judge = build_eval_judge_provider(getattr(args, "judge_provider", "none"))
 
     settings = load_settings()
     effective_llm_model = _effective_llm_model(args, settings)
@@ -88,6 +87,17 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
         citation_judge_model=getattr(args, "citation_judge_model", None)
         or settings.citation_judge_model,
     )
+    judge_provider = (getattr(args, "judge_provider", "none") or "none").strip().lower()
+    effective_judge_model = (
+        getattr(args, "judge_model", None) or effective_settings.deepseek_model
+        if judge_provider == "deepseek"
+        else None
+    )
+    answer_judge = build_eval_judge_provider(
+        judge_provider,
+        model=effective_judge_model,
+        timeout_seconds=effective_settings.request_timeout_seconds,
+    )
     config_snapshot = {
         "benchmark_name": args.benchmark_name,
         "dataset": args.dataset,
@@ -113,7 +123,8 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
         "reflection_min_sources": reflection_min_sources,
         "citation_judge_provider": effective_settings.citation_judge_provider,
         "citation_judge_model": effective_settings.citation_judge_model,
-        "judge_provider": getattr(args, "judge_provider", "none"),
+        "judge_provider": judge_provider,
+        "judge_model": effective_judge_model,
         "official_judge_score": "not_run",
         "settings": {
             **asdict(effective_settings),
@@ -423,6 +434,7 @@ def _summarize(
         "fallback_count_total": sum(record.get("fallback_count", 0) for record in records),
         "answer_judge": {
             "provider": config_snapshot.get("judge_provider", "none"),
+            "model": config_snapshot.get("judge_model"),
             "scored_count": len(answer_judgments),
             "score_avg": round(
                 sum(item["score"] for item in answer_judgments) / len(answer_judgments),
@@ -437,6 +449,14 @@ def _summarize(
             )
             if answer_judgments
             else None,
+            "tokens_total": sum(
+                item.get("input_tokens", 0) + item.get("output_tokens", 0)
+                for item in answer_judgments
+            ),
+            "estimated_cost_usd_total": round(
+                sum(item.get("estimated_cost_usd", 0.0) for item in answer_judgments),
+                8,
+            ),
             "official_judge_score": "not_run",
         },
         "records": [
@@ -556,13 +576,15 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260607)
     parser.add_argument(
         "--judge-provider",
-        choices=["none", "heuristic"],
+        choices=["none", "heuristic", "deepseek"],
         default="none",
         help=(
             "Optional answer scoring provider. 'heuristic' checks normalized "
-            "ground-truth strings in the generated answer; official scoring is not run."
+            "ground-truth strings in the generated answer; 'deepseek' calls DeepSeek "
+            "JSON mode with DEEPSEEK_API_KEY. Official scoring is not run."
         ),
     )
+    parser.add_argument("--judge-model", default=None)
     parser.add_argument("--raw-log", default=None)
     parser.add_argument("--summary-output", default=None)
     parser.add_argument("--predictions-output", default=None)

@@ -170,7 +170,7 @@ $env:DEEPSEEK_API_KEY="<your-key>"
 py -3.11 -m deepresearch_agent.deep_research_eval --dataset livedrbench-preview --limit 1 --llm-provider deepseek --search-provider wikipedia --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --request-timeout-seconds 8
 ```
 
-输出会写入 `logs/deep-research-eval-*.jsonl`、`results/deep_research_eval_summary.json` 和 `results/livedrbench_predictions.json`。当前脚本先产可复查 artifact 和 LiveDRBench-style predictions；可选 `--judge-provider heuristic` 会按 case 里的 `ground_truths` / `answer` / `expected_answer` 做本地字符串命中评分。官方 judge/answer-quality scoring 尚未接入。
+输出会写入 `logs/deep-research-eval-*.jsonl`、`results/deep_research_eval_summary.json` 和 `results/livedrbench_predictions.json`。当前脚本先产可复查 artifact 和 LiveDRBench-style predictions；可选 `--judge-provider heuristic` 会按 case 里的 `ground_truths` / `answer` / `expected_answer` 做本地字符串命中评分；可选 `--judge-provider deepseek --judge-model deepseek-v4-flash` 会用 `DEEPSEEK_API_KEY` 调 DeepSeek JSON mode 打分，并在 `answer_judgment` / `answer_judge` 里记录 judge model、token 和估算成本。官方 judge/answer-quality scoring 尚未接入。
 
 运行 retrieval 对比 benchmark：
 
@@ -219,6 +219,12 @@ Citation judge：
 - `heuristic`：本地无 key judge，基于 evidence quote overlap 给出 supported / partial / unsupported / unverifiable。
 - `deepseek`：可选 LLM citation judge，默认模型 `deepseek-v4-flash`，可用 `CITATION_JUDGE_MODEL` 或 CLI `--citation-judge-model` 覆盖；需要 `DEEPSEEK_API_KEY`。
 
+Answer judge：
+
+- `none`：默认，public eval 只产 artifacts，不做 answer-quality scoring。
+- `heuristic`：本地无 key answer judge，只检查 ground-truth 字符串是否出现在答案里。
+- `deepseek`：可选 LLM answer judge，使用 DeepSeek JSON mode，默认沿用生效的 DeepSeek 模型，也可用 CLI `--judge-model` 覆盖；需要 `DEEPSEEK_API_KEY`。这不是官方 LiveDRBench/Deep Research Bench judge。
+
 ## Project Layout
 
 ```text
@@ -245,7 +251,7 @@ src/deepresearch_agent/
   tracing.py          Structured JSONL trace events and optional OTLP HTTP export
   benchmark.py        Reproducible benchmark harness
   deep_research_eval.py Public end-to-end Deep Research eval artifact runner
-  eval_judge.py       Optional heuristic answer judge for public eval cases
+  eval_judge.py       Optional heuristic and DeepSeek answer judges for public eval cases
 ```
 
 See `KNOWLEDGE_BASE.md` and `INTERVIEW_QA.md` for implementation notes and interview drill material.
