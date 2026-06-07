@@ -7,6 +7,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from typing import Any, Protocol
 from urllib.parse import quote_plus, urlencode
 from urllib.request import Request, urlopen
@@ -196,6 +197,33 @@ class JinaReaderCrawler:
         except Exception as exc:  # pragma: no cover - depends on live network
             raise SearchError(str(exc)) from exc
         return _normalize_content(text, self.max_chars)
+
+
+class HtmlTextCrawler:
+    name = "html"
+
+    def __init__(self, max_chars: int = 4000) -> None:
+        self.max_chars = max_chars
+
+    async def crawl(self, url: str, timeout: float) -> str:
+        return await asyncio.to_thread(self._crawl_sync, url, timeout)
+
+    def _crawl_sync(self, url: str, timeout: float) -> str:
+        request = Request(
+            url,
+            headers={"User-Agent": "deepresearch-agent/0.1 local interview project"},
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                charset = None
+                if getattr(response, "headers", None) is not None:
+                    charset = response.headers.get_content_charset()
+                raw = response.read().decode(charset or "utf-8", errors="replace")
+        except Exception as exc:  # pragma: no cover - depends on live network
+            raise SearchError(str(exc)) from exc
+        parser = _HtmlTextParser()
+        parser.feed(raw)
+        return _normalize_content(parser.text(), self.max_chars)
 
 
 class JinaSearchAdapter:
@@ -574,6 +602,8 @@ def build_crawler(settings: Settings) -> WebCrawler | None:
             base_url=settings.jina_reader_base_url,
             max_chars=settings.crawler_max_chars,
         )
+    if provider in {"html", "basic_html", "local_html"}:
+        return HtmlTextCrawler(max_chars=settings.crawler_max_chars)
     raise ValueError(f"unknown web crawler provider: {provider}")
 
 
@@ -660,6 +690,29 @@ def _rows_to_sources(
             )
         )
     return sources
+
+
+class _HtmlTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._skip_depth = 0
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        if tag.lower() in {"script", "style", "noscript", "svg"}:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"script", "style", "noscript", "svg"} and self._skip_depth:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip_depth and data.strip():
+            self._parts.append(data.strip())
+
+    def text(self) -> str:
+        return " ".join(self._parts)
 
 
 WIKIPEDIA_STOPWORDS = {

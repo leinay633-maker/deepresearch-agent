@@ -202,6 +202,7 @@ Crawler：
 
 - `none`：默认，不抽网页正文，只使用 search snippet。
 - `jina` / `jina_reader`：调用 `https://r.jina.ai/<url>` 抽取 URL 的 LLM-friendly 文本；可用 `JINA_READER_BASE_URL`、`JINA_API_KEY`、`CRAWLER_MAX_CHARS` 配置。
+- `html`：本地无 key HTML 正文抽取，直接抓 URL，用标准库 HTMLParser 去掉 script/style/noscript/svg 后抽取可读文本；适合无 Jina key 的 smoke，不是完整浏览器渲染 crawler。
 
 Local retrieval：
 

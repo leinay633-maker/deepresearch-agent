@@ -9,6 +9,7 @@ import pytest
 from deepresearch_agent.config import Settings
 from deepresearch_agent.search import (
     BraveSearchAdapter,
+    HtmlTextCrawler,
     JinaReaderCrawler,
     JinaSearchAdapter,
     SearchError,
@@ -101,6 +102,39 @@ def test_jina_reader_crawler_prefixes_target_url(monkeypatch: pytest.MonkeyPatch
 
     assert requested_urls == ["https://r.jina.ai/https://example.com/page"]
     assert content == "Title: Example Clean markdown body about agents."
+
+
+def test_html_text_crawler_strips_script_and_style(monkeypatch: pytest.MonkeyPatch) -> None:
+    requested_urls: list[str] = []
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        requested_urls.append(request.full_url)
+        return FakeResponse(
+            """
+            <html>
+              <head>
+                <style>.hidden{display:none}</style>
+                <script>window.secret = "ignore";</script>
+              </head>
+              <body>
+                <h1>Agent Evidence</h1>
+                <p>HTML crawler extracts readable source text.</p>
+              </body>
+            </html>
+            """
+        )
+
+    monkeypatch.setattr("deepresearch_agent.search.urlopen", fake_urlopen)
+    crawler = HtmlTextCrawler(max_chars=200)
+
+    content = asyncio.run(crawler.crawl("https://example.com/page", timeout=1.0))
+
+    assert requested_urls == ["https://example.com/page"]
+    assert "Agent Evidence" in content
+    assert "readable source text" in content
+    assert "window.secret" not in content
+    assert "display:none" not in content
 
 
 def test_jina_search_adapter_parses_json_results(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -228,11 +262,18 @@ def test_build_search_service_selects_new_providers() -> None:
         Settings(searxng_base_url="https://search.local", web_crawler_provider="jina"),
         "searxng",
     )
+    searxng_html = build_search_adapter(
+        Settings(searxng_base_url="https://search.local", web_crawler_provider="html"),
+        "searxng",
+    )
     jina_service = build_search_service(Settings(search_provider="jina"), None)
     brave = build_search_adapter(Settings(), "brave")
     tavily = build_search_adapter(Settings(), "tavily")
 
     assert isinstance(searxng, SearxngSearchAdapter)
+    assert isinstance(searxng_html, SearxngSearchAdapter)
+    assert searxng_html.crawler is not None
+    assert searxng_html.crawler.name == "html"
     assert jina_service.primary.name == "jina"
     assert isinstance(brave, BraveSearchAdapter)
     assert isinstance(tavily, TavilySearchAdapter)

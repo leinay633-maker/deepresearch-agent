@@ -134,9 +134,9 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 
 背景：Wikipedia adapter 太窄，公开 Deep Research 任务需要真正的 web search 和网页正文抽取；如果 search adapter 只返回 title/snippet，synthesizer 很容易在证据不足时失败。
 可选方案：继续强化 Wikipedia；直接接 Tavily/Brave 这种一体化 API；先接 SearxNG 搜索和 Jina Reader crawler；把 crawler 混在每个 search provider 里。
-最终选择：在 `search.py` 里新增 provider registry，保留 `mock/wikipedia`，再加 `SearxngSearchAdapter`、`JinaSearchAdapter`、`BraveSearchAdapter`、`TavilySearchAdapter` 和独立 `JinaReaderCrawler`。SearxNG/Brave/Tavily/Jina 负责搜索候选 URL 或 snippet，crawler 负责把 URL 转成正文；`SearchService` 的 retry、timeout、circuit breaker、fallback 仍复用。
-理由：search 和 crawler 的失败模式不同，分开后可以替换任一层：Jina Reader 可以换 trafilatura/readability/Firecrawl，而 orchestrator 仍只看统一 `Source`。默认仍是 mock，不破坏无 key 路径；SearxNG 用 `SEARXNG_BASE_URL`，Jina/Brave/Tavily key 都只从环境变量读。
-代价：当前没有自建 SearxNG 实例，所以 SearxNG 只做了 stub 单测；Jina Reader live crawl `https://example.com` 成功，但 Jina Search live smoke 在当前网络下返回 `401/403`；Brave/Tavily 因没有 key 也只做了 stub 单测。它是 provider 结构升级，还不是“真实搜索质量已经解决”。
+最终选择：在 `search.py` 里新增 provider registry，保留 `mock/wikipedia`，再加 `SearxngSearchAdapter`、`JinaSearchAdapter`、`BraveSearchAdapter`、`TavilySearchAdapter` 和独立 crawler provider。crawler 目前有 `JinaReaderCrawler` 和本地无 key 的 `HtmlTextCrawler`；SearxNG/Brave/Tavily/Jina 负责搜索候选 URL 或 snippet，crawler 负责把 URL 转成正文；`SearchService` 的 retry、timeout、circuit breaker、fallback 仍复用。
+理由：search 和 crawler 的失败模式不同，分开后可以替换任一层：有 Jina 时走 LLM-friendly Reader，没有 key 时也可以用标准库 HTMLParser 做基础正文抽取，而 orchestrator 仍只看统一 `Source`。默认仍是 mock，不破坏无 key 路径；SearxNG 用 `SEARXNG_BASE_URL`，Jina/Brave/Tavily key 都只从环境变量读。
+代价：当前没有自建 SearxNG 实例，所以 SearxNG 只做了 stub 单测；Jina Reader live crawl `https://example.com` 成功，但 Jina Search live smoke 在当前网络下返回 `401/403`；Brave/Tavily 因没有 key 也只做了 stub 单测；本地 HTML crawler 不执行 JavaScript、不处理登录、反爬、正文主内容识别或 robots。它是 provider 结构升级，还不是“真实搜索质量已经解决”。
 面试怎么答：我会说这一步补的是工具层边界，不是刷 benchmark。真实网页搜索要分成 query→URL 和 URL→content 两层，否则后面 citation grounding 没法定位证据片段。
 
 ## 决策 13：为什么先做 claim-level evidence quote，而不是直接上 LLM judge
@@ -297,7 +297,7 @@ Researcher：`src/deepresearch_agent/orchestrator.py` 的 `_research_one`。输�
 
 Reflection / Compression Loop：`src/deepresearch_agent/orchestrator.py` 的 `_run_reflection_rounds`、`_compress_findings`、`_reflect_on_evidence`。输入是初始 plan 和 researcher results，输出是可能扩展后的 plan/results。开启 `reflection_enabled` 后，每轮先把 findings 压成短文本写入 `compression.roundN` trace，再根据 fallback_count 和每个 finding 的唯一 source 数是否低于 `reflection_min_sources` 来决定是否追加 `R<N>` 子问题。`run_control.py` 的 researcher 阶段也调用同一个 helper，所以 `/research` 和 `/runs` 语义一致。局限是当前 policy 是启发式，不是 LLM reflection。
 
-Web Search / Crawler Provider：`src/deepresearch_agent/search.py`。`build_search_adapter()` 现在按 provider name 构造 `mock`、`wikipedia`、`searxng`、`jina`、`brave`、`tavily` 或 `mcp`，`build_crawler()` 按配置构造 `JinaReaderCrawler`。`SearxngSearchAdapter` 调 `SEARXNG_BASE_URL/search?format=json`，解析 title/url/snippet，再可选调用 crawler 抽正文；`JinaReaderCrawler` 用 `https://r.jina.ai/<url>` 抽 LLM-friendly text；`JinaSearchAdapter` 用 `https://s.jina.ai/<query>`。`BraveSearchAdapter` 读 `BRAVE_SEARCH_API_KEY`，调用 Brave Web Search API；`TavilySearchAdapter` 读 `TAVILY_API_KEY`，调用 Tavily Search API，`TAVILY_SEARCH_DEPTH` 默认 `basic`。这些 key 都不进入 Settings 快照。
+Web Search / Crawler Provider：`src/deepresearch_agent/search.py`。`build_search_adapter()` 现在按 provider name 构造 `mock`、`wikipedia`、`searxng`、`jina`、`brave`、`tavily` 或 `mcp`，`build_crawler()` 按配置构造 `JinaReaderCrawler` 或 `HtmlTextCrawler`。`SearxngSearchAdapter` 调 `SEARXNG_BASE_URL/search?format=json`，解析 title/url/snippet，再可选调用 crawler 抽正文；`JinaReaderCrawler` 用 `https://r.jina.ai/<url>` 抽 LLM-friendly text；`HtmlTextCrawler` 直接抓 URL，用标准库 `HTMLParser` 去掉 script/style/noscript/svg 后抽正文；`JinaSearchAdapter` 用 `https://s.jina.ai/<query>`。`BraveSearchAdapter` 读 `BRAVE_SEARCH_API_KEY`，调用 Brave Web Search API；`TavilySearchAdapter` 读 `TAVILY_API_KEY`，调用 Tavily Search API，`TAVILY_SEARCH_DEPTH` 默认 `basic`。这些 key 都不进入 Settings 快照。
 
 MCP Tool Adapter：`src/deepresearch_agent/mcp_tools.py`。`McpToolSearchAdapter` 用 `McpClient.call_tool()` 调配置好的 search tool，把 MCP result 里的 `sources` 或 `content[type=text]` 解析成统一 `Source`。`HttpMcpClient` 用 JSON-RPC HTTP POST，`StdioMcpClient` 用 MCP 的 `Content-Length` framing 和子进程 stdin/stdout。当前实现只覆盖 `tools/list`、`tools/call` 和 search-like result 转换，不做资源订阅或长连接池。
 
@@ -533,7 +533,7 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
-测试验证：`py -3.11 -m pytest -q`，最新结果 `80 passed, 2 warnings in 108.81s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `81 passed, 2 warnings in 66.16s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -547,7 +547,7 @@ Embedding provider 验证：`py -3.11 -m deepresearch_agent.validate_embeddings 
 
 Reranker smoke：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?" --search-provider mock --llm-provider mock --max-researchers 1 --max-results 2 --local-retrieval-mode hybrid --rerank-enabled --rerank-provider local` 成功。因为首次下载/加载 `BAAI/bge-reranker-base`，latency 达到 `279692.721ms`。这只证明可选 rerank provider 能接入，不作为常规性能指标。
 
-Web search / crawler provider smoke：`py -3.11 -m pytest tests/test_web_search_providers.py tests/test_failure_handling.py -q` 成功，`10 passed in 0.36s`，覆盖 SearxNG JSON parsing、crawler 内容替换、Jina Reader URL prefix、Jina Search JSON parsing、provider registry 和 unknown provider fail-fast。真实外网 smoke：`https://r.jina.ai/https://example.com` 返回 `200` 和 clean text，说明 Jina Reader crawler 这层能 live 访问；`--search-provider jina` 的 CLI run 成功但触发 fallback，trace error 是 `HTTP Error 401: Unauthorized`，所以 Jina Search 真实检索在当前环境未通过。SearxNG 需要 `SEARXNG_BASE_URL`，当前没有自建实例，未做 live search。
+Web search / crawler provider smoke：`py -3.11 -m pytest tests/test_web_search_providers.py tests/test_failure_handling.py -q` 成功，最新结果 `15 passed in 0.39s`，覆盖 SearxNG JSON parsing、crawler 内容替换、Jina Reader URL prefix、本地 HTML crawler 去掉 script/style 并抽正文、Jina Search JSON parsing、Brave/Tavily stub parsing、provider registry、unknown provider fail-fast、primary failure fallback 和 circuit breaker open。真实外网 smoke：`https://r.jina.ai/https://example.com` 返回 `200` 和 clean text，说明 Jina Reader crawler 这层能 live 访问；`--search-provider jina` 的 CLI run 成功但触发 fallback，trace error 是 `HTTP Error 401: Unauthorized`，所以 Jina Search 真实检索在当前环境未通过。SearxNG 需要 `SEARXNG_BASE_URL`，当前没有自建实例，未做 live search；本地 HTML crawler 只做 stub 单测，没有 live 大规模网页抽取评测。
 
 Brave/Tavily provider smoke：`py -3.11 -m pytest tests/test_web_search_providers.py tests/test_failure_handling.py -q` 成功，最新相关结果 `14 passed in 0.41s`。新增覆盖 Brave Search 的 `X-Subscription-Token` header、`web.results` 解析、缺 `BRAVE_SEARCH_API_KEY` fail-fast；Tavily Search 的 Bearer auth、JSON body `query/search_depth/max_results`、`results` 解析、缺 `TAVILY_API_KEY` fail-fast；provider registry 可构造 `brave` 和 `tavily`。当前没有真实 Brave/Tavily key，所以没有 live API 调用、延迟、成本或质量数字。
 
@@ -692,7 +692,7 @@ multi-hop / reflection 成功率：当前没有真实 multi-hop 标注集，未�
 
 Citation checker 语义能力仍需实测：当前已经有可选 heuristic / DeepSeek citation judge provider，但默认 benchmark 仍是 lexical overlap，DeepSeek judge 没有 live 跑完整评测。可行方案是用公开/人工标注 claim-evidence 集测 judge agreement，再接 NLI 模型或 sentence embedding entailment。工程代价是成本、延迟、标注和 judge 可靠性评估。面试怎么讲：我会说现在是“lexical baseline + optional judge 接口”，不是最终事实评审。
 
-搜索质量仍需 live 验证：Wikipedia 能跑但相关性和覆盖有限；SearxNG 需要自建实例；Jina Search 在当前环境返回过 401/403；Brave/Tavily 已接 adapter 但没有 key 跑 live benchmark。可行方案是配置真实 Brave/Tavily/SerpAPI/自建 SearxNG，并做页面正文抽取与相关性评测。工程代价是 key、限流、费用和 provider schema 差异。面试怎么讲：我会强调 adapter 已经抽象好，替换 provider 不影响 orchestrator，但不会把未 live 的 provider 包装成生产搜索。
+搜索质量仍需 live 验证：Wikipedia 能跑但相关性和覆盖有限；SearxNG 需要自建实例；Jina Search 在当前环境返回过 401/403；Brave/Tavily 已接 adapter 但没有 key 跑 live benchmark；本地 HTML crawler 能做基础正文抽取，但不执行 JavaScript、不做正文主内容识别、反爬或 robots。可行方案是配置真实 Brave/Tavily/SerpAPI/自建 SearxNG，并做页面正文抽取与相关性评测。工程代价是 key、限流、费用、网页解析质量和 provider schema 差异。面试怎么讲：我会强调 adapter 已经抽象好，替换 provider/crawler 不影响 orchestrator，但不会把未 live 的 provider 包装成生产搜索。
 
 Hybrid retrieval / private corpus 还没有证明质量稳定提升：当前已经实现 keyword + vector + RRF、Markdown/TXT/PDF/DOCX 到 JSONL ingest、可选持久化 Chroma index、可选 Qdrant HTTP vector index provider 和可选 rerank，但 5 case 小样本里 hybrid success_rate 反而低于 keyword baseline，Qdrant 也只做了 stub HTTP 单测。可行方案是扩大本地语料、补人工相关性标注、调 RRF 权重、做增量 manifest/embedding cache、OCR 扫描件、启动真实 Qdrant/Milvus 做索引生命周期和延迟评测，并把 rerank 纳入全量 benchmark。工程代价是索引生命周期、模型加载时间、评测集标注、外部服务运维和更多运行成本。面试怎么讲：我会说我完成了检索结构、私有文档入口和向量库 provider 边界升级，但不会把一次小样本结果或 stub Qdrant 测试包装成质量提升，也不会把基础文件 ingest 说成完整 RAGFlow。
 

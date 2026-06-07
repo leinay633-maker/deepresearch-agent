@@ -173,7 +173,7 @@
 [状态: 待消化]
 标签：Search / Adapter
 检索关键词：WikipediaSearchAdapter, SearxNG, Jina Reader, Brave, Tavily, real search
-回答：现在搜索层已经不是只靠 Wikipedia。`search.py` 里有 `mock`、`wikipedia`、`searxng`、`jina`、`brave`、`tavily`、`mcp` 这些 search adapter，还有 `JinaReaderCrawler` 做 URL 正文抽取。真正端到端实测最多的是 DeepSeek v4-flash + Wikipedia，最新 retrieval 对比里仍有 fallback；SearxNG 需要 `SEARXNG_BASE_URL`，当前没有自建实例；Jina Reader crawl `https://example.com` live 成功，但 Jina Search 在当前环境返回 401/403；Brave/Tavily 只做了请求格式和解析单测，因为没有 `BRAVE_SEARCH_API_KEY` / `TAVILY_API_KEY`。所以我会说搜索/爬取边界已经拆开了，但生产级搜索质量还没完成。
+回答：现在搜索层已经不是只靠 Wikipedia。`search.py` 里有 `mock`、`wikipedia`、`searxng`、`jina`、`brave`、`tavily`、`mcp` 这些 search adapter，还有 `JinaReaderCrawler` 和本地 `HtmlTextCrawler` 做 URL 正文抽取。真正端到端实测最多的是 DeepSeek v4-flash + Wikipedia，最新 retrieval 对比里仍有 fallback；SearXNG 需要 `SEARXNG_BASE_URL`，当前没有自建实例；Jina Reader crawl `https://example.com` live 成功，但 Jina Search 在当前环境返回 401/403；Brave/Tavily 只做了请求格式和解析单测，因为没有 `BRAVE_SEARCH_API_KEY` / `TAVILY_API_KEY`；本地 HTML crawler 只做了 stub 单测，还没做大规模网页质量评测。所以我会说搜索/爬取边界已经拆开了，但生产级搜索质量还没完成。
 关联模块：`search.py`, `tests/test_web_search_providers.py`
 可追问：
 1. 为什么不用 Tavily？
@@ -184,7 +184,7 @@
 [状态: 待消化]
 标签：Search / Crawler / 工具调用
 检索关键词：SearxNG, Jina Reader, crawler, web search
-回答：因为搜索 API 往往只给 title、URL 和 snippet，而 DeepResearch 真正需要的是可引用、可检查的正文证据。现在 `SearxngSearchAdapter`、`BraveSearchAdapter`、`TavilySearchAdapter` 负责 query 到候选 URL/snippet，`JinaReaderCrawler` 负责 URL 到 clean text，最后仍统一成 `Source`。这样以后把搜索 provider 或 crawler 换掉，都不会改 orchestrator。
+回答：因为搜索 API 往往只给 title、URL 和 snippet，而 DeepResearch 真正需要的是可引用、可检查的正文证据。现在 `SearxngSearchAdapter`、`BraveSearchAdapter`、`TavilySearchAdapter` 负责 query 到候选 URL/snippet，`JinaReaderCrawler` 或本地 `HtmlTextCrawler` 负责 URL 到 clean text，最后仍统一成 `Source`。这样以后把搜索 provider 或 crawler 换掉，都不会改 orchestrator。我要主动说明：HTML crawler 不执行 JS、不处理登录/反爬，只是无 key 的基础正文抽取。
 关联模块：`search.py`, `SearchService`, `Source`
 可追问：
 1. crawler 失败怎么办？
@@ -768,7 +768,7 @@
 [状态: 待消化]
 标签：局限 / 诚实表达
 检索关键词：limitations, real LLM, semantic evaluation
-回答：最大短板已经不是“完全没有真实 LLM”，而是公开真实任务上的质量还没站住：DeepSeek v4-flash 只接了一个 provider，Wikipedia 不是生产级搜索，LiveDRBench preview 的 1 条真实样本已经跑通但 `success_rate=0.0`。citation 现在有 lexical baseline 和可选 DeepSeek judge provider，但 judge 还没有真实 benchmark。现在我会主动说：公开评测 artifact 入口已经有了，但官方 judge、网页 crawler、语义级 grounding 评测和多 provider 还没完成。
+回答：最大短板已经不是“完全没有真实 LLM”，而是公开真实任务上的质量还没站住：DeepSeek v4-flash 只接了一个 provider，Wikipedia 不是生产级搜索，LiveDRBench preview 的 1 条真实样本已经跑通但 `success_rate=0.0`。citation 现在有 lexical baseline 和可选 DeepSeek judge provider，但 judge 还没有真实 benchmark。现在我会主动说：公开评测 artifact 入口已经有了，也有 Jina/HTML crawler 边界，但官方 judge、真实搜索质量、语义级 grounding 评测和多 provider 还没完成。
 关联模块：`llm.py`, `search.py`, `citation.py`, `citation_judge.py`, `deep_research_eval.py`, `KNOWLEDGE_BASE.md`
 可追问：
 1. 下一步先补哪个？

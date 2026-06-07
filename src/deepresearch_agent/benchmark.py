@@ -292,7 +292,11 @@ def main() -> None:
     parser.add_argument("--rerank-provider", choices=["local", "dashscope"], default="local")
     parser.add_argument("--local-rerank-candidate-k", type=int, default=6)
     parser.add_argument("--searxng-base-url", default=None)
-    parser.add_argument("--web-crawler-provider", choices=["none", "jina", "jina_reader"], default=None)
+    parser.add_argument(
+        "--web-crawler-provider",
+        choices=["none", "jina", "jina_reader", "html"],
+        default=None,
+    )
     parser.add_argument("--jina-reader-base-url", default=None)
     parser.add_argument("--jina-search-base-url", default=None)
     parser.add_argument("--crawler-max-chars", type=int, default=None)
