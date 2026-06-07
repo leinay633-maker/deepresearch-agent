@@ -35,6 +35,13 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         llm_provider=args.llm_provider,
         search_provider=args.search_provider,
         max_researchers=args.max_researchers,
+        embedding_provider=args.embedding_provider,
+        local_retrieval_mode=args.local_retrieval_mode,
+        local_keyword_top_k=args.local_keyword_top_k,
+        local_vector_top_k=args.local_vector_top_k,
+        local_keyword_weight=args.local_keyword_weight,
+        local_vector_weight=args.local_vector_weight,
+        local_hybrid_rrf_k=args.local_hybrid_rrf_k,
         deepseek_model=effective_llm_model
         if args.llm_provider == "deepseek"
         else settings.deepseek_model,
@@ -47,6 +54,13 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "llm_provider": effective_settings.llm_provider,
         "llm_model": effective_llm_model,
         "search_provider": effective_settings.search_provider,
+        "embedding_provider": effective_settings.embedding_provider,
+        "local_retrieval_mode": effective_settings.local_retrieval_mode,
+        "local_keyword_top_k": effective_settings.local_keyword_top_k,
+        "local_vector_top_k": effective_settings.local_vector_top_k,
+        "local_keyword_weight": effective_settings.local_keyword_weight,
+        "local_vector_weight": effective_settings.local_vector_weight,
+        "local_hybrid_rrf_k": effective_settings.local_hybrid_rrf_k,
         "case_count": len(cases),
         "max_researchers": effective_settings.max_researchers,
         "max_results": args.max_results,
@@ -195,6 +209,13 @@ def main() -> None:
     parser.add_argument("--search-provider", choices=["mock", "wikipedia"], default="mock")
     parser.add_argument("--llm-provider", choices=["mock", "deepseek"], default="mock")
     parser.add_argument("--llm-model", default=None)
+    parser.add_argument("--embedding-provider", choices=["local", "dashscope"], default="local")
+    parser.add_argument("--local-retrieval-mode", choices=["keyword", "hybrid"], default="hybrid")
+    parser.add_argument("--local-keyword-top-k", type=int, default=4)
+    parser.add_argument("--local-vector-top-k", type=int, default=4)
+    parser.add_argument("--local-keyword-weight", type=float, default=1.0)
+    parser.add_argument("--local-vector-weight", type=float, default=1.0)
+    parser.add_argument("--local-hybrid-rrf-k", type=int, default=60)
     parser.add_argument("--seed", type=int, default=20260606)
     parser.add_argument("--max-researchers", type=int, default=3)
     parser.add_argument("--max-results", type=int, default=4)

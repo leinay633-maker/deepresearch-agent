@@ -3,12 +3,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from dataclasses import replace
 
+from deepresearch_agent.config import load_settings
 from deepresearch_agent.orchestrator import DeepResearchOrchestrator
 from deepresearch_agent.schemas import ResearchRequest
 
 
 async def _run(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
     request = ResearchRequest(
         query=args.query,
         max_researchers=args.max_researchers,
@@ -18,7 +21,7 @@ async def _run(args: argparse.Namespace) -> int:
         search_provider=args.search_provider,
         seed=args.seed,
     )
-    report = await DeepResearchOrchestrator().run(request)
+    report = await DeepResearchOrchestrator(settings=settings).run(request)
     if args.json:
         print(json.dumps(report.model_dump(mode="json"), ensure_ascii=False, indent=2))
     else:
@@ -32,12 +35,37 @@ async def _run(args: argparse.Namespace) -> int:
     return 0 if report.metrics.get("success") else 1
 
 
+def _settings_from_args(args: argparse.Namespace):
+    settings = load_settings()
+    overrides = {}
+    for argument, field in [
+        ("embedding_provider", "embedding_provider"),
+        ("local_retrieval_mode", "local_retrieval_mode"),
+        ("local_keyword_top_k", "local_keyword_top_k"),
+        ("local_vector_top_k", "local_vector_top_k"),
+        ("local_keyword_weight", "local_keyword_weight"),
+        ("local_vector_weight", "local_vector_weight"),
+        ("local_hybrid_rrf_k", "local_hybrid_rrf_k"),
+    ]:
+        value = getattr(args, argument)
+        if value is not None:
+            overrides[field] = value
+    return replace(settings, **overrides) if overrides else settings
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a local DeepResearch Agent query.")
     parser.add_argument("query")
     parser.add_argument("--search-provider", choices=["mock", "wikipedia"], default=None)
     parser.add_argument("--llm-provider", choices=["mock", "deepseek"], default=None)
     parser.add_argument("--llm-model", default=None)
+    parser.add_argument("--embedding-provider", choices=["local", "dashscope"], default=None)
+    parser.add_argument("--local-retrieval-mode", choices=["keyword", "hybrid"], default=None)
+    parser.add_argument("--local-keyword-top-k", type=int, default=None)
+    parser.add_argument("--local-vector-top-k", type=int, default=None)
+    parser.add_argument("--local-keyword-weight", type=float, default=None)
+    parser.add_argument("--local-vector-weight", type=float, default=None)
+    parser.add_argument("--local-hybrid-rrf-k", type=int, default=None)
     parser.add_argument("--max-researchers", type=int, default=3)
     parser.add_argument("--max-results", type=int, default=4)
     parser.add_argument("--seed", type=int, default=20260606)

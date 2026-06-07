@@ -24,6 +24,14 @@ class Settings:
     dashscope_embedding_model: str = "text-embedding-v4"
     dashscope_embedding_dimensions: int = 1024
     embedding_batch_size: int = 16
+    local_retrieval_mode: str = "hybrid"
+    local_keyword_top_k: int = 4
+    local_vector_top_k: int = 4
+    local_hybrid_rrf_k: int = 60
+    local_keyword_weight: float = 1.0
+    local_vector_weight: float = 1.0
+    local_chunk_size_chars: int = 600
+    local_chunk_overlap_chars: int = 80
 
 
 def _float_env(name: str, default: float) -> float:
@@ -72,4 +80,13 @@ def load_settings() -> Settings:
         ),
         dashscope_embedding_dimensions=_int_env("DASHSCOPE_EMBEDDING_DIMENSIONS", 1024),
         embedding_batch_size=_int_env("EMBEDDING_BATCH_SIZE", 16),
+        local_retrieval_mode=os.getenv("LOCAL_RETRIEVAL_MODE", "hybrid").strip().lower()
+        or "hybrid",
+        local_keyword_top_k=_int_env("LOCAL_KEYWORD_TOP_K", 4),
+        local_vector_top_k=_int_env("LOCAL_VECTOR_TOP_K", 4),
+        local_hybrid_rrf_k=_int_env("LOCAL_HYBRID_RRF_K", 60),
+        local_keyword_weight=_float_env("LOCAL_KEYWORD_WEIGHT", 1.0),
+        local_vector_weight=_float_env("LOCAL_VECTOR_WEIGHT", 1.0),
+        local_chunk_size_chars=_int_env("LOCAL_CHUNK_SIZE_CHARS", 600),
+        local_chunk_overlap_chars=_int_env("LOCAL_CHUNK_OVERLAP_CHARS", 80),
     )

@@ -28,7 +28,7 @@ class DeepResearchOrchestrator:
     ) -> None:
         self.settings = settings or load_settings()
         self.search_service = search_service
-        self.rag = LocalRagRetriever()
+        self.rag = LocalRagRetriever(settings=self.settings)
         self.deduper = SourceDeduplicator()
         self.verifier = SourceVerifier()
         self.citation_checker = CitationChecker()

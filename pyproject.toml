@@ -9,6 +9,7 @@ description = "A scoped, observable DeepResearch Agent for agent backend intervi
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
+    "chromadb>=0.5.0,<2.0.0",
     "fastapi>=0.115.0",
     "pydantic>=2.8.0",
     "sentence-transformers>=3.0.0",
