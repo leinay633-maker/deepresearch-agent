@@ -30,6 +30,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
     settings = load_settings()
     effective_llm_model = _effective_llm_model(args, settings)
+    stage_models = _effective_stage_models(args, settings)
     reflection_enabled = getattr(args, "reflection_enabled", False)
     max_reflection_rounds = getattr(args, "max_reflection_rounds", 1)
     reflection_min_sources = getattr(args, "reflection_min_sources", 4)
@@ -59,14 +60,19 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         deepseek_model=effective_llm_model
         if args.llm_provider == "deepseek"
         else settings.deepseek_model,
+        llm_brief_model=stage_models["brief_generation"] or settings.llm_brief_model,
+        llm_planner_model=stage_models["planning"] or settings.llm_planner_model,
+        llm_synthesis_model=stage_models["synthesis"] or settings.llm_synthesis_model,
     )
     settings_snapshot = asdict(effective_settings)
     settings_snapshot["llm_model"] = effective_llm_model
+    settings_snapshot["stage_models"] = stage_models
     settings_snapshot["max_results"] = args.max_results
     config_snapshot = {
         "seed": args.seed,
         "llm_provider": effective_settings.llm_provider,
         "llm_model": effective_llm_model,
+        "stage_models": stage_models,
         "search_provider": effective_settings.search_provider,
         "embedding_provider": effective_settings.embedding_provider,
         "local_retrieval_mode": effective_settings.local_retrieval_mode,
@@ -99,6 +105,9 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 max_results_per_researcher=args.max_results,
                 llm_provider=effective_settings.llm_provider,
                 llm_model=effective_llm_model,
+                brief_model=stage_models["brief_generation"] or None,
+                planner_model=stage_models["planning"] or None,
+                synthesis_model=stage_models["synthesis"] or None,
                 search_provider=effective_settings.search_provider,
                 seed=args.seed,
                 reflection_enabled=reflection_enabled,
@@ -135,6 +144,14 @@ def _effective_llm_model(args: argparse.Namespace, settings: Any) -> str:
     if args.llm_provider == "deepseek":
         return settings.deepseek_model
     return settings.mock_model_name
+
+
+def _effective_stage_models(args: argparse.Namespace, settings: Any) -> dict[str, str]:
+    return {
+        "brief_generation": getattr(args, "brief_model", None) or settings.llm_brief_model,
+        "planning": getattr(args, "planner_model", None) or settings.llm_planner_model,
+        "synthesis": getattr(args, "synthesis_model", None) or settings.llm_synthesis_model,
+    }
 
 
 def _load_cases(path: Path) -> list[dict[str, str]]:
@@ -238,6 +255,9 @@ def main() -> None:
     )
     parser.add_argument("--llm-provider", choices=["mock", "deepseek"], default="mock")
     parser.add_argument("--llm-model", default=None)
+    parser.add_argument("--brief-model", default=None)
+    parser.add_argument("--planner-model", default=None)
+    parser.add_argument("--synthesis-model", default=None)
     parser.add_argument("--embedding-provider", choices=["local", "dashscope"], default="local")
     parser.add_argument("--local-retrieval-mode", choices=["keyword", "hybrid"], default="hybrid")
     parser.add_argument("--local-keyword-top-k", type=int, default=4)

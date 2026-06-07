@@ -20,6 +20,7 @@ class LLMJsonResult:
     parsed: dict
     content: str
     usage: dict
+    model: str
 
 
 class LLMProvider(Protocol):
@@ -52,8 +53,13 @@ class MockLLMProvider:
     supports_structured_output = True
     supports_tool_calling = True
 
-    def __init__(self, model: str = "mock-structured-tool-model") -> None:
+    def __init__(
+        self,
+        model: str = "mock-structured-tool-model",
+        stage_models: dict[str, str] | None = None,
+    ) -> None:
         self.model = model
+        self.stage_models = stage_models or {}
 
     async def create_brief(self, request: ResearchRequest, cost: CostTracker) -> ResearchBrief:
         normalized = _normalize_query(request.query)
@@ -74,7 +80,12 @@ class MockLLMProvider:
                 "Mock model output is deterministic and designed for repeatable local tests.",
             ],
         )
-        cost.add("brief_generation", request.query, brief.model_dump_json())
+        cost.add(
+            "brief_generation",
+            request.query,
+            brief.model_dump_json(),
+            model=self._model_for_stage("brief_generation"),
+        )
         return brief
 
     async def plan(
@@ -112,7 +123,12 @@ class MockLLMProvider:
             SubQuestion(id=f"Q{i + 1}", question=text.format(topic=topic), rationale=rationale)
             for i, (_, text, rationale) in enumerate(templates[:max_researchers])
         ]
-        cost.add("planning", brief.model_dump_json(), json.dumps([q.model_dump() for q in questions]))
+        cost.add(
+            "planning",
+            brief.model_dump_json(),
+            json.dumps([q.model_dump() for q in questions]),
+            model=self._model_for_stage("planning"),
+        )
         return questions
 
     async def synthesize(
@@ -145,8 +161,12 @@ class MockLLMProvider:
             "synthesis",
             json.dumps([finding.model_dump() for finding in findings]),
             answer,
+            model=self._model_for_stage("synthesis"),
         )
         return answer, claims
+
+    def _model_for_stage(self, stage: str) -> str:
+        return self.stage_models.get(stage) or self.model
 
 
 class DeepSeekLLMProvider:
@@ -160,11 +180,13 @@ class DeepSeekLLMProvider:
         base_url: str = "https://api.deepseek.com",
         timeout_seconds: float = 60.0,
         max_retries: int = 2,
+        stage_models: dict[str, str] | None = None,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
+        self.stage_models = stage_models or {}
 
     async def create_brief(self, request: ResearchRequest, cost: CostTracker) -> ResearchBrief:
         result = await self._chat_json_result(
@@ -343,7 +365,12 @@ class DeepSeekLLMProvider:
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                payload = self._post_chat_completions(messages, max_tokens=max_tokens)
+                model = self._model_for_stage(stage)
+                payload = self._post_chat_completions(
+                    messages,
+                    max_tokens=max_tokens,
+                    model=model,
+                )
                 content = _extract_content(payload)
                 if not content.strip():
                     raise ValueError("DeepSeek returned empty content")
@@ -351,6 +378,7 @@ class DeepSeekLLMProvider:
                     parsed=_parse_json_object(content),
                     content=content,
                     usage=payload.get("usage") or {},
+                    model=model,
                 )
             except Exception as exc:
                 last_error = exc
@@ -359,13 +387,18 @@ class DeepSeekLLMProvider:
                 time.sleep(0.8 * (attempt + 1))
         raise RuntimeError(f"DeepSeek {stage} JSON validation failed: {last_error}") from last_error
 
-    def _post_chat_completions(self, messages: list[dict[str, str]], max_tokens: int) -> dict:
+    def _post_chat_completions(
+        self,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+        model: str,
+    ) -> dict:
         api_key = os.environ.get("DEEPSEEK_API_KEY")
         if not api_key:
             raise RuntimeError("DEEPSEEK_API_KEY environment variable is required")
         body = json.dumps(
             {
-                "model": self.model,
+                "model": model,
                 "messages": messages,
                 "response_format": {"type": "json_object"},
                 "temperature": 0.2,
@@ -393,17 +426,21 @@ class DeepSeekLLMProvider:
         _extract_content(payload)
         return payload
 
+    def _model_for_stage(self, stage: str) -> str:
+        return self.stage_models.get(stage) or self.model
+
     def _add_usage_cost(
         self, cost: CostTracker, stage: str, result: LLMJsonResult
     ):
         input_tokens, output_tokens, estimated_cost = deepseek_usage_cost_usd(
-            self.model, result.usage
+            result.model, result.usage
         )
         return cost.add_usage(
             stage=stage,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             estimated_cost_usd=estimated_cost,
+            model=result.model,
         )
 
 

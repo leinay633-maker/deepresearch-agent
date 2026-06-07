@@ -19,6 +19,9 @@ async def _run(args: argparse.Namespace) -> int:
         llm_provider=args.llm_provider,
         llm_model=args.llm_model,
         search_provider=args.search_provider,
+        brief_model=args.brief_model,
+        planner_model=args.planner_model,
+        synthesis_model=args.synthesis_model,
         seed=args.seed,
         reflection_enabled=args.reflection_enabled,
         max_reflection_rounds=args.max_reflection_rounds,
@@ -75,6 +78,9 @@ def main() -> None:
     )
     parser.add_argument("--llm-provider", choices=["mock", "deepseek"], default=None)
     parser.add_argument("--llm-model", default=None)
+    parser.add_argument("--brief-model", default=None)
+    parser.add_argument("--planner-model", default=None)
+    parser.add_argument("--synthesis-model", default=None)
     parser.add_argument("--embedding-provider", choices=["local", "dashscope"], default=None)
     parser.add_argument("--local-retrieval-mode", choices=["keyword", "hybrid"], default=None)
     parser.add_argument("--local-keyword-top-k", type=int, default=None)

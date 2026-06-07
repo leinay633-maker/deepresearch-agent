@@ -16,6 +16,9 @@ class ResearchRequest(BaseModel):
     max_results_per_researcher: int = Field(default=4, ge=1, le=10)
     llm_provider: str | None = None
     llm_model: str | None = None
+    brief_model: str | None = None
+    planner_model: str | None = None
+    synthesis_model: str | None = None
     search_provider: str | None = None
     seed: int = 20260606
     reflection_enabled: bool = False

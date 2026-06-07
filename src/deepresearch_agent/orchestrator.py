@@ -166,9 +166,24 @@ class DeepResearchOrchestrator:
 
     def _build_llm_provider(self, request: ResearchRequest):
         provider = (request.llm_provider or self.settings.llm_provider).strip().lower()
+        stage_models = self._stage_models(request)
         if provider == "deepseek":
-            return DeepSeekLLMProvider(model=request.llm_model or self.settings.deepseek_model)
-        return MockLLMProvider(self.settings.mock_model_name)
+            return DeepSeekLLMProvider(
+                model=request.llm_model or self.settings.deepseek_model,
+                stage_models=stage_models,
+            )
+        return MockLLMProvider(
+            request.llm_model or self.settings.mock_model_name,
+            stage_models=stage_models,
+        )
+
+    def _stage_models(self, request: ResearchRequest) -> dict[str, str]:
+        candidates = {
+            "brief_generation": request.brief_model or self.settings.llm_brief_model,
+            "planning": request.planner_model or self.settings.llm_planner_model,
+            "synthesis": request.synthesis_model or self.settings.llm_synthesis_model,
+        }
+        return {stage: model for stage, model in candidates.items() if model}
 
     async def _research_one(
         self,

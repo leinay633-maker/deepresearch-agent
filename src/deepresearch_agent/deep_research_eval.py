@@ -51,6 +51,7 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
 
     settings = load_settings()
     effective_llm_model = _effective_llm_model(args, settings)
+    stage_models = _effective_stage_models(args, settings)
     reflection_enabled = getattr(args, "reflection_enabled", False)
     max_reflection_rounds = getattr(args, "max_reflection_rounds", 1)
     reflection_min_sources = getattr(args, "reflection_min_sources", 4)
@@ -73,6 +74,9 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
         deepseek_model=effective_llm_model
         if args.llm_provider == "deepseek"
         else settings.deepseek_model,
+        llm_brief_model=stage_models["brief_generation"] or settings.llm_brief_model,
+        llm_planner_model=stage_models["planning"] or settings.llm_planner_model,
+        llm_synthesis_model=stage_models["synthesis"] or settings.llm_synthesis_model,
     )
     config_snapshot = {
         "benchmark_name": args.benchmark_name,
@@ -85,6 +89,7 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
         "seed": args.seed,
         "llm_provider": effective_settings.llm_provider,
         "llm_model": effective_llm_model,
+        "stage_models": stage_models,
         "search_provider": effective_settings.search_provider,
         "embedding_provider": effective_settings.embedding_provider,
         "local_retrieval_mode": effective_settings.local_retrieval_mode,
@@ -101,6 +106,7 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
         "settings": {
             **asdict(effective_settings),
             "llm_model": effective_llm_model,
+            "stage_models": stage_models,
             "max_results": args.max_results,
         },
     }
@@ -110,7 +116,13 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
     with raw_path.open("w", encoding="utf-8") as file:
         file.write(json.dumps({"type": "config", "config": config_snapshot}, ensure_ascii=False) + "\n")
         for case in cases:
-            record = await _run_case(case, args, effective_settings, effective_llm_model)
+            record = await _run_case(
+                case,
+                args,
+                effective_settings,
+                effective_llm_model,
+                stage_models,
+            )
             records.append(record)
             predictions.append(
                 {
@@ -192,6 +204,7 @@ async def _run_case(
     args: argparse.Namespace,
     settings: Any,
     llm_model: str,
+    stage_models: dict[str, str],
 ) -> dict[str, Any]:
     started = time.perf_counter()
     request = ResearchRequest(
@@ -200,6 +213,9 @@ async def _run_case(
         max_results_per_researcher=args.max_results,
         llm_provider=settings.llm_provider,
         llm_model=llm_model,
+        brief_model=stage_models["brief_generation"] or None,
+        planner_model=stage_models["planning"] or None,
+        synthesis_model=stage_models["synthesis"] or None,
         search_provider=settings.search_provider,
         seed=args.seed,
         reflection_enabled=getattr(args, "reflection_enabled", False),
@@ -401,6 +417,14 @@ def _effective_llm_model(args: argparse.Namespace, settings: Any) -> str:
     return settings.mock_model_name
 
 
+def _effective_stage_models(args: argparse.Namespace, settings: Any) -> dict[str, str]:
+    return {
+        "brief_generation": getattr(args, "brief_model", None) or settings.llm_brief_model,
+        "planning": getattr(args, "planner_model", None) or settings.llm_planner_model,
+        "synthesis": getattr(args, "synthesis_model", None) or settings.llm_synthesis_model,
+    }
+
+
 def _dataset_config_name(args: argparse.Namespace) -> str | None:
     if args.cases:
         return None
@@ -440,6 +464,9 @@ def main() -> None:
     )
     parser.add_argument("--llm-provider", choices=["mock", "deepseek"], default="mock")
     parser.add_argument("--llm-model", default=None)
+    parser.add_argument("--brief-model", default=None)
+    parser.add_argument("--planner-model", default=None)
+    parser.add_argument("--synthesis-model", default=None)
     parser.add_argument("--embedding-provider", choices=["local", "dashscope"], default="local")
     parser.add_argument("--local-retrieval-mode", choices=["keyword", "hybrid"], default="keyword")
     parser.add_argument("--max-researchers", type=int, default=2)

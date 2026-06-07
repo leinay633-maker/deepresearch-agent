@@ -20,6 +20,9 @@ class Settings:
     trace_dir: str = "logs"
     run_store_path: str = "data/runs.sqlite"
     deepseek_model: str = "deepseek-v4-flash"
+    llm_brief_model: str = ""
+    llm_planner_model: str = ""
+    llm_synthesis_model: str = ""
     embedding_provider: str = "local"
     local_embedding_model: str = "BAAI/bge-small-zh-v1.5"
     dashscope_embedding_model: str = "text-embedding-v4"
@@ -96,6 +99,9 @@ def load_settings() -> Settings:
             os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip()
             or "deepseek-v4-flash"
         ),
+        llm_brief_model=os.getenv("LLM_BRIEF_MODEL", "").strip(),
+        llm_planner_model=os.getenv("LLM_PLANNER_MODEL", "").strip(),
+        llm_synthesis_model=os.getenv("LLM_SYNTHESIS_MODEL", "").strip(),
         embedding_provider=os.getenv("EMBEDDING_PROVIDER", "local").strip().lower()
         or "local",
         local_embedding_model=(

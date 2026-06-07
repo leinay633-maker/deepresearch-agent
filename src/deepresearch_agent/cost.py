@@ -62,7 +62,13 @@ class CostTracker:
         self.output_cost_per_1m = output_cost_per_1m
         self.records: list[CostRecord] = []
 
-    def add(self, stage: str, input_text: str, output_text: str) -> CostRecord:
+    def add(
+        self,
+        stage: str,
+        input_text: str,
+        output_text: str,
+        model: str | None = None,
+    ) -> CostRecord:
         input_tokens = estimate_tokens(input_text)
         output_tokens = estimate_tokens(output_text)
         cost = (
@@ -72,7 +78,7 @@ class CostTracker:
         record = CostRecord(
             stage=stage,
             provider=self.provider,
-            model=self.model,
+            model=model or self.model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             estimated_cost_usd=round(cost, 8),
@@ -86,11 +92,12 @@ class CostTracker:
         input_tokens: int,
         output_tokens: int,
         estimated_cost_usd: float,
+        model: str | None = None,
     ) -> CostRecord:
         record = CostRecord(
             stage=stage,
             provider=self.provider,
-            model=self.model,
+            model=model or self.model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             estimated_cost_usd=round(estimated_cost_usd, 8),

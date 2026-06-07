@@ -39,6 +39,14 @@ py -3.11 -m deepresearch_agent.cli "How should citation grounding work in a rese
 
 默认不开启 reflection；开启后系统会先压缩已有 findings，再按启发式判断是否追加 1 个 follow-up subquestion，相关 `compression.roundN` 和 `reflection.roundN` 会进入 trace。
 
+按阶段覆盖模型名：
+
+```powershell
+py -3.11 -m deepresearch_agent.cli "How should model routing work in a research agent?" --llm-provider mock --llm-model mock-default --brief-model mock-brief --planner-model mock-planner --synthesis-model mock-synthesis --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --json
+```
+
+真实 DeepSeek 路径也支持同一组参数和环境变量：`LLM_BRIEF_MODEL`、`LLM_PLANNER_MODEL`、`LLM_SYNTHESIS_MODEL`。未设置时全部回落到 `--llm-model` / `DEEPSEEK_MODEL`。
+
 创建可审核的长任务 run，并在 planner 后 approve 继续：
 
 ```powershell
@@ -124,7 +132,7 @@ py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --llm-model dee
 LLM providers：
 
 - `mock`：默认 LLM provider，离线可复现，用于测试和 mock plumbing benchmark。
-- `deepseek`：真实 OpenAI-compatible LLM provider，默认模型 `deepseek-v4-flash`，使用 DeepSeek JSON mode 生成 brief、plan 和 cited synthesis；需要 `DEEPSEEK_API_KEY`，可用 `DEEPSEEK_MODEL` 覆盖默认模型。
+- `deepseek`：真实 OpenAI-compatible LLM provider，默认模型 `deepseek-v4-flash`，使用 DeepSeek JSON mode 生成 brief、plan 和 cited synthesis；需要 `DEEPSEEK_API_KEY`，可用 `DEEPSEEK_MODEL` 覆盖默认模型，也可用 `LLM_BRIEF_MODEL` / `LLM_PLANNER_MODEL` / `LLM_SYNTHESIS_MODEL` 做阶段模型覆盖。
 
 Search providers：
 

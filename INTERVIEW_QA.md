@@ -66,6 +66,17 @@
 2. tool calling 用了吗？
 3. 模型价格变化怎么办？
 
+## Q：多模型策略现在做到什么程度？
+[状态: 待消化]
+标签：LLM Provider / 多模型策略
+检索关键词：stage model, planner model, synthesis model
+回答：现在不是完整 model zoo，但已经把阶段模型路由打通了。`ResearchRequest` 支持 `brief_model`、`planner_model`、`synthesis_model`，环境变量也有 `LLM_BRIEF_MODEL`、`LLM_PLANNER_MODEL`、`LLM_SYNTHESIS_MODEL`。DeepSeek provider 发请求时会按 stage 写不同 `model`，`CostTracker` 每条记录也会保留实际 stage model。默认不配时仍回落到 `llm_model` / `DEEPSEEK_MODEL`，所以旧运行不受影响。
+关联模块：`schemas.py`, `orchestrator.py`, `llm.py`, `cost.py`
+可追问：
+1. 为什么不直接接 OpenAI/Anthropic？
+2. 阶段模型怎么影响成本归因？
+3. 什么时候需要动态模型选择？
+
 # Planner 模块
 
 ## Q：Planner 在项目里做什么？
@@ -590,7 +601,7 @@
 [状态: 待消化]
 标签：成本控制 / Token
 检索关键词：CostTracker, token accounting
-回答：`CostTracker` 按阶段记录 input_tokens、output_tokens 和 estimated_cost_usd。当前阶段包括 brief_generation、planning、synthesis。mock provider 成本是 0，token 用字符数近似估算；DeepSeek provider 会读取 API 返回的 `prompt_tokens` / `completion_tokens`，并按当前实现里的价格常量估算成本。模型或价格页变化时，这个常量要同步更新。
+回答：`CostTracker` 按阶段记录 input_tokens、output_tokens、estimated_cost_usd 和实际 model。当前阶段包括 brief_generation、planning、synthesis。mock provider 成本是 0，token 用字符数近似估算；DeepSeek provider 会读取 API 返回的 `prompt_tokens` / `completion_tokens`，并按当前实现里的价格常量估算成本。现在如果 brief/planner/synthesis 配了不同模型，cost record 会分别写对应 stage model；模型或价格页变化时，常量要同步更新。
 关联模块：`cost.py`, `llm.py`
 可追问：
 1. 真实 provider 的 usage 怎么接？

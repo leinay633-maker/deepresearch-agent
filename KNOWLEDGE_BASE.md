@@ -1,6 +1,6 @@
 # 0 项目一句话介绍
 
-本项目是我从空仓库开始手写的一个收窄版 DeepResearch Agent，目标不是复刻大而全的 open_deep_research，而是把「问题澄清、research brief、并发 researcher、来源去重、带引用合成、citation check、trace 和 benchmark」这条主链路做干净，并补上可管理的 run control plane。它解决的是普通 RAG 一次性检索后直接回答时，难以解释检索路径、引用是否支撑论断、工具失败如何降级的问题。当前版本默认使用 mock LLM 和 mock search，保证无 API key 也能一条命令跑通；同时已经接入 DeepSeek 真实 LLM provider、Wikipedia 真实检索 adapter、本地关键词 + 向量 + RRF 融合的 hybrid local retrieval、SQLite run_id / checkpoint / HITL / SSE replay 控制平面，以及 LiveDRBench 这类公开 Deep Research 任务的端到端 artifact 评测 runner。这个项目体现的 Agent 后端能力主要是多阶段编排、并发工具调用、失败兜底、混合检索、可观测性、成本归因、可复现评测和长任务状态管理。
+本项目是我从空仓库开始手写的一个收窄版 DeepResearch Agent，目标不是复刻大而全的 open_deep_research，而是把「问题澄清、research brief、并发 researcher、来源去重、带引用合成、citation check、trace 和 benchmark」这条主链路做干净，并补上可管理的 run control plane。它解决的是普通 RAG 一次性检索后直接回答时，难以解释检索路径、引用是否支撑论断、工具失败如何降级的问题。当前版本默认使用 mock LLM 和 mock search，保证无 API key 也能一条命令跑通；同时已经接入 DeepSeek 真实 LLM provider、阶段级模型覆盖、Wikipedia 真实检索 adapter、本地关键词 + 向量 + RRF 融合的 hybrid local retrieval、SQLite run_id / checkpoint / HITL / SSE replay 控制平面，以及 LiveDRBench 这类公开 Deep Research 任务的端到端 artifact 评测 runner。这个项目体现的 Agent 后端能力主要是多阶段编排、并发工具调用、失败兜底、混合检索、可观测性、成本归因、可复现评测和长任务状态管理。
 
 # 1 岗位匹配
 
@@ -20,7 +20,7 @@ Agent 编排层：`src/deepresearch_agent/orchestrator.py`。输入是用户 que
 
 评测层：`src/deepresearch_agent/benchmark.py`、`src/deepresearch_agent/retrieval_eval.py`、`src/deepresearch_agent/deep_research_eval.py`、`data/benchmark_cases.jsonl`、`tests/`。端到端 benchmark 固定 seed 和配置快照，记录 latency、tokens、cost、source count、citation retention、success；独立检索评测只加载 BEIR/scifact 的 corpus/query/qrels，计算 Recall@10、nDCG@10 和 MRR，不调用 LLM、Wikipedia 或 orchestrator 主链路；公开 Deep Research 评测 runner 会加载 LiveDRBench 等公开任务，跑完整 orchestrator 并输出 answer、sources、trace、cost、citation check 和 predictions artifact。
 
-可观测层：`src/deepresearch_agent/tracing.py`、`src/deepresearch_agent/cost.py`。Trace 每阶段写 JSONL，Cost 按 brief_generation、planning、synthesis 归因 token 和成本；mock 路径仍是字符数近似，DeepSeek 路径使用 provider 返回的真实 usage。
+可观测层：`src/deepresearch_agent/tracing.py`、`src/deepresearch_agent/cost.py`。Trace 每阶段写 JSONL，Cost 按 brief_generation、planning、synthesis 归因 token、成本和实际模型名；mock 路径仍是字符数近似，DeepSeek 路径使用 provider 返回的真实 usage。
 
 Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_agent/run_store.py`、`src/deepresearch_agent/run_control.py`。输入是 run create/approval/cancel/retry 请求，输出是持久化 run 状态、step trace、event stream 和最终 report checkpoint。它用 SQLite 保存 `agent_runs`、`agent_steps`、`agent_events`，默认文件是 `data/runs.sqlite`，可以用 `RUN_STORE_PATH` 覆盖；测试用临时 SQLite 文件。
 
@@ -193,13 +193,22 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 代价：Chroma 本地持久化仍是单机文件索引，不是生产级向量数据库；当前复用判断主要靠 fingerprint collection name 和 count，没有后台 reindex 任务、版本迁移、TTL、压缩、并发写控制或跨机器共享。
 面试怎么答：我会说我先把私有知识库从“每次临时建索引”推进到“可复用的本地持久化索引”，但不会把它说成 Qdrant/Milvus 级别的生产向量库。
 
+## 决策 19：为什么先做阶段模型覆盖，而不是一次性接多家模型 provider
+
+背景：open_deep_research / DeerFlow 这类系统通常会按 planner、research、synthesis、compression 等角色选择不同模型。本项目之前只有一个 `llm_model`，所有 LLM stage 共用同一个模型名，无法展示“便宜模型规划、强模型合成”这类策略。
+可选方案：直接接 OpenAI/Anthropic/OpenRouter/Ollama；只保留单模型；先做阶段模型路由，再扩展 provider；把模型选择硬编码在 provider 内。
+最终选择：保留默认 `deepseek-v4-flash` 和 mock provider，新增 `brief_model`、`planner_model`、`synthesis_model` 请求字段，以及 `LLM_BRIEF_MODEL`、`LLM_PLANNER_MODEL`、`LLM_SYNTHESIS_MODEL` 环境变量。DeepSeek 请求体会按 stage 使用对应模型，`CostTracker` 每条 record 也记录真实 stage model。
+理由：这一步不引入新的 API key 和 provider 复杂度，但先把多模型策略最关键的控制面打出来。后续接 OpenAI/Anthropic 时，可以复用同一套 stage model 字段和成本归因。
+代价：当前仍只有 mock 和 DeepSeek 两类 LLM provider；没有按 source quality 自动选模型，没有动态降级策略，也没有证明不同 stage model 会提升质量或降低成本。
+面试怎么答：我会说我先做的是“模型路由接口和可观测归因”，不是宣称已经有完整 model zoo。它让面试官看到我知道多 Agent 系统里模型选择应该是按角色管理的，而不是一个全局模型名打到底。
+
 # 5 实现细节
 
-Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。局限是 planner 还不会根据 researcher 中间结果动态追加子问题。
+Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。`ResearchRequest.planner_model` 或 `LLM_PLANNER_MODEL` 可以覆盖 planning stage 的模型名。局限是 planner 还不会根据 researcher 中间结果做 LLM 语义级动态追加子问题。
 
 DeepSeek Planner 验证：`src/deepresearch_agent/llm.py` 里新增了 `DeepSeekLLMProvider.plan`，第一步先独立验证结构化输出；验证脚本是 `src/deepresearch_agent/validate_deepseek_structured_output.py`，它从环境变量读取 `DEEPSEEK_API_KEY`，用 JSON mode 请求默认 `deepseek-v4-flash`，并用现有 `SubQuestion` Pydantic schema 解析输出。后续步骤再把同一个 provider 扩展到 `create_brief` 和 `synthesize`，避免一次性接太多导致错误边界不清。
 
-DeepSeek Synthesizer 接入：步骤 2 以后，`DeepSeekLLMProvider.create_brief`、`plan`、`synthesize` 都走 DeepSeek JSON mode。CLI 和 API 可以通过 `llm_provider="deepseek"` 或 CLI 参数 `--llm-provider deepseek` 显式启用；默认仍是 mock，保证离线测试不受 API key 影响。当前 synthesis 要求模型输出 `{"answer": "...", "claims": [...]}`，并要求每条 factual claim 使用输入 sources 中已有的 `[Sx]` citation ID。
+DeepSeek Synthesizer 接入：步骤 2 以后，`DeepSeekLLMProvider.create_brief`、`plan`、`synthesize` 都走 DeepSeek JSON mode。CLI 和 API 可以通过 `llm_provider="deepseek"` 或 CLI 参数 `--llm-provider deepseek` 显式启用；默认仍是 mock，保证离线测试不受 API key 影响。当前 synthesis 要求模型输出 `{"answer": "...", "claims": [...]}`，并要求每条 factual claim 使用输入 sources 中已有的 `[Sx]` citation ID。`brief_model`、`planner_model`、`synthesis_model` 会分别覆盖 DeepSeek 请求体中的 `model` 字段；不填时回落到 `llm_model` / `DEEPSEEK_MODEL`。
 
 Researcher：`src/deepresearch_agent/orchestrator.py` 的 `_research_one`。输入是子问题，输出是 `Finding`。它调用 `SearchService` 和 `LocalRagRetriever`，再 dedup、verify、summary。`LocalRagRetriever` 内部已经从 keyword overlap 升级为可配置的 keyword / hybrid retrieval，但 orchestrator 仍只接收 `Source` 列表。局限是 summary 仍是模板化，不是自然语言 LLM 压缩。
 
@@ -225,7 +234,7 @@ Synthesizer：`src/deepresearch_agent/llm.py` 的 `synthesize`。输入是 brief
 
 Citation Checker：`src/deepresearch_agent/citation.py`。输入是 claims 和 sources，输出 `CitationCheckReport`。每条 `CitationAssessment` 现在包含 citation IDs、`supported`、`support_level`、overlap score 和最多 3 条 `evidence_quotes`。checker 会从 cited source 里按句子找最接近 claim 的 quote，输出 `supported / partial / unsupported / unverifiable`。局限是证据定位仍基于 lexical overlap，还不是 NLI/LLM judge。
 
-Cost Tracker：`src/deepresearch_agent/cost.py`。mock provider 仍使用字符数近似估算；DeepSeek provider 已接入 API 返回的真实 `prompt_tokens` / `completion_tokens`，并通过 `CostTracker.add_usage()` 记录到同一套 `CostSummary`。当前 `deepseek-v4-flash` 成本计算按 DeepSeek 官方 Models & Pricing 页，核对日期 `2026-06-07`：input cache hit `$0.0028/1M tokens`，input cache miss `$0.14/1M tokens`，output `$0.28/1M tokens`。legacy alias 只作为 v4-flash 兼容入口使用同一价格表；未配置价格的模型会直接报错，避免 silently 用错单价。如果响应没有 token usage，DeepSeek 路径会直接失败，不会退回字符估算伪装成真实 usage。
+Cost Tracker：`src/deepresearch_agent/cost.py`。mock provider 仍使用字符数近似估算；DeepSeek provider 已接入 API 返回的真实 `prompt_tokens` / `completion_tokens`，并通过 `CostTracker.add_usage()` 记录到同一套 `CostSummary`。每条 `CostRecord` 现在支持单独的 `model`，所以 brief_generation、planning、synthesis 可以显示不同 stage model。当前 `deepseek-v4-flash` 成本计算按 DeepSeek 官方 Models & Pricing 页，核对日期 `2026-06-07`：input cache hit `$0.0028/1M tokens`，input cache miss `$0.14/1M tokens`，output `$0.28/1M tokens`。legacy alias 只作为 v4-flash 兼容入口使用同一价格表；未配置价格的模型会直接报错，避免 silently 用错单价。如果响应没有 token usage，DeepSeek 路径会直接失败，不会退回字符估算伪装成真实 usage。
 
 Trace Logger：`src/deepresearch_agent/tracing.py`。每个 run 写 `logs/research-<run_id>.jsonl`，记录 stage、status、duration_ms、payload。runtime trace 默认不提交 Git，benchmark 原始记录提交。
 
@@ -378,6 +387,15 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 复盘：检索测试必须把融合权重写进配置，否则测试失败会混淆“索引是否复用”和“RRF 排序是否符合预期”两个问题。
 面试可能追问：这说明 hybrid 不稳定吗？回答：是的，RRF 权重会影响结果，所以我把它配置化并用独立评测看指标，不会把某一次排序当成普遍规律。
 
+## 问题 17：阶段模型测试第一次跑得过慢
+
+现象：新增 `tests/test_stage_models.py` 后第一次单测通过，但耗时 `34.33s`，明显不该出现在只验证模型路由的测试里。
+原因：mock orchestrator 测试没有显式设置 `local_retrieval_mode="keyword"`，导致默认 hybrid retrieval 路径加载本地 embedding/Chroma。测试目标是验证 cost record 的 stage model，不应该把 embedding 冷启动混进来。
+排查：看测试内容只有 mock provider 和 1 个 researcher，慢点只能来自 local RAG 默认 hybrid；对照其他 API/run control 测试也都显式设置了 keyword。
+修复：把测试 orchestrator 改成 `DeepResearchOrchestrator(settings=Settings(local_retrieval_mode="keyword"))`。重跑 `tests/test_stage_models.py` 变成 `2 passed in 0.35s`。
+复盘：单元测试要隔离目标变量。多模型路由测试只该测 LLM/cost，不该顺带测向量检索模型加载。
+面试可能追问：这是不是说明默认 hybrid 有问题？回答：不是功能错误，但说明本地 embedding 冷启动会污染无关测试和 demo，需要通过显式配置或持久化索引控制。
+
 # 7 实测数据
 
 本节所有 mock benchmark 数字只用于证明 pipeline plumbing 能端到端跑通，不能当作真实性能、真实成本或真实答案质量成果。尤其不能在面试里说“我的 DeepResearch p50 是个位数毫秒”这类话，因为这个延迟测的是本机 Python 跑 deterministic mock 的速度，换机器、换进程热身状态、换依赖版本都会变。
@@ -385,7 +403,7 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
-测试验证：`py -3.11 -m pytest -q`，最新结果 `52 passed, 2 warnings in 59.78s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `54 passed, 2 warnings in 57.65s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -412,6 +430,8 @@ Run review UI smoke：`py -3.11 -m pytest tests/test_run_control.py tests/test_a
 Worker lease smoke：`py -3.11 -m pytest tests/test_run_control.py -q` 成功，`12 passed, 1 warning in 6.97s`。新增测试覆盖 `RunStore.acquire_lease()` 只能让一个 worker 获得 lease、同 worker heartbeat、release 后另一个 worker 可重新 acquire、同一 worker 即使跨过 TTL 也能在未被别人接管时续租；API 测试覆盖 `/runs/{run_id}/lease`、竞争 worker 返回 `409`、`/heartbeat` 更新 `heartbeat_at`、`/runs/stale` 能列出过期 running run、`/runs/recover-stale` 会把 stale run 标记为 `failed` 并清空 `leased_by`；migration 测试覆盖旧版 `agent_runs` 表缺少 lease 列时，`RunStore` 会自动补 `leased_by`、`heartbeat_at`、`lease_expires_at`。
 
 Persistent vector index smoke：`py -3.11 -m pytest tests/test_hybrid_retrieval.py -q` 成功，`3 passed, 1 warning in 2.77s`。新增测试用静态 embedding provider 和临时 Chroma PersistentClient 验证：第一次检索会 embed 2 个 corpus chunk 和 1 个 query，第二个 `LocalRagRetriever` 指向同一 `LOCAL_VECTOR_INDEX_PATH` 时只 embed query，不重新 embed corpus；`ChromaVectorIndex.reused_existing` 为 `True`。这只验证索引复用语义，没有做真实 BGE 冷/热启动延迟 benchmark。
+
+Stage model routing smoke：`py -3.11 -m pytest tests/test_stage_models.py -q` 成功，`2 passed in 0.35s`。测试覆盖 mock orchestrator 在 `brief_model`、`planner_model`、`synthesis_model` 不同时，`CostRecord.model` 分别记录 `mock-brief`、`mock-planner`、`mock-synthesis`；同时用不联网的 `RecordingDeepSeekProvider` 验证 DeepSeek 请求体按 stage 发送 `deepseek-chat`、`deepseek-reasoner`、`deepseek-v4-flash`，且 cost records 记录同一模型序列。CLI smoke：`py -3.11 -m deepresearch_agent.cli "How should model routing work in a research agent?" --llm-provider mock --llm-model mock-default --brief-model mock-brief --planner-model mock-planner --synthesis-model mock-synthesis --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --json` 后抽取 `cost.records[].model`，输出 `['mock-brief', 'mock-planner', 'mock-synthesis']`。这只验证路由和记录，不代表这些模型组合已做真实质量/成本对比。
 
 mock benchmark 原始记录：`logs/benchmark-20260606T152954Z.jsonl`。
 当前 benchmark summary：`results/benchmark_summary.json`，已被真实 DeepSeek + Wikipedia benchmark 覆盖。
@@ -522,7 +542,7 @@ multi-hop / reflection 成功率：当前没有真实 multi-hop 标注集，未�
 
 # 10 局限与优化空间
 
-真实 LLM provider 覆盖还窄：当前只接了 DeepSeek v4-flash，一个 provider 不能代表所有模型/价格/限流行为。可行方案是继续实现 OpenAI/Anthropic 等 OpenAI-compatible 或原生 provider，并统一 structured output、usage 解析、重试、模型定价表和测试替身。工程代价是 API key、价格、限流、错误码差异和 CI mock。面试怎么讲：我会说我已经把真实 provider 接入路径跑通，但不会把单 provider 小样本夸成通用生产能力。
+真实 LLM provider 覆盖还窄：当前只接了 DeepSeek v4-flash 及其兼容 alias，并支持 brief/planner/synthesis 的阶段模型覆盖，但一个 provider 不能代表所有模型/价格/限流行为。可行方案是继续实现 OpenAI/Anthropic/OpenRouter/Ollama 等 provider，并统一 structured output、usage 解析、重试、模型定价表、动态降级和测试替身。工程代价是 API key、价格、限流、错误码差异和 CI mock。面试怎么讲：我会说我已经把真实 provider 接入路径和阶段模型路由打通，但不会把单 provider 小样本夸成通用生产能力。
 
 Citation checker 语义能力弱：当前问题是 lexical overlap 只能拦明显错引。可行方案是加 LLM judge、NLI 模型或 sentence embedding entailment。工程代价是成本、延迟和 judge 可靠性评估。面试怎么讲：我会说现在是 CI 友好的第一道闸，不是最终事实评审。
 
