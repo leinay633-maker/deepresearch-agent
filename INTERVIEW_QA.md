@@ -533,11 +533,11 @@
 [状态: 待消化]
 标签：Run Control / Failure Recovery
 检索关键词：cancel, retry, failed run
-回答：`cancel` 会把非终态 run 标成 `cancelled`，后续 approve 会被拒绝；当前同步 mock 路径主要覆盖 waiting_approval 后取消。`retry` 只允许 failed run，优先复用 planner checkpoint，从 researcher 阶段重新跑，并在 step 里写 `retry_count=1`、event 里写 `retrying`。这不是精确恢复到某个 researcher 内部，而是可解释的稳定 checkpoint 重跑。
+回答：`cancel` 会把非终态 run 标成 `cancelled`，后续 approve 会被拒绝；运行中取消现在也有阶段边界检查，`RunCancelledError` 会被单独捕获，保证用户取消不会被通用异常路径误记成 `failed`，lease 也会释放。它不是强杀正在进行的 LLM/search 请求，而是在 planner/researcher/synthesizer/verifier 阶段边界协作式生效。`retry` 只允许 failed run，优先复用 planner checkpoint，从 researcher 阶段重新跑，并在 step 里写 `retry_count=1`、event 里写 `retrying`。这不是精确恢复到某个 researcher 内部，而是可解释的稳定 checkpoint 重跑。
 关联模块：`run_control.py`, `tests/test_run_control.py`
 可追问：
 1. 为什么 retry 不重跑 planner？
-2. running 时取消有什么局限？
+2. 为什么 running cancel 不是强制抢占？
 3. retry 怎么避免无限循环？
 
 ## Q：为什么 planner 后要 human-in-the-loop？
@@ -632,7 +632,7 @@
 [状态: 待消化]
 标签：生产化 / Roadmap
 检索关键词：worker queue, lease, production
-回答：下一步不是再加 provider，而是把 run control 继续生产化：真正的任务队列、多进程 worker pool、幂等阶段执行、Postgres 持久化、对象存储保存大结果、权限和审计、provider 级限流。现在版本已经把状态机、checkpoint、request_json、单机 lease/heartbeat、worker-once 和本地 polling worker 边界打出来，后面替换存储和调度不会影响 Agent 主链路。
+回答：下一步不是再加 provider，而是把 run control 继续生产化：真正的任务队列、多进程 worker pool、幂等阶段执行、Postgres 持久化、对象存储保存大结果、权限和审计、provider 级限流和 abort signal。现在版本已经把状态机、checkpoint、request_json、单机 lease/heartbeat、worker-once、本地 polling worker，以及运行中取消的终态一致性打出来，后面替换存储和调度不会影响 Agent 主链路。
 关联模块：`run_control.py`, `run_store.py`, `api.py`
 可追问：
 1. 哪一步最该先做？

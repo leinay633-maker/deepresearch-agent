@@ -118,7 +118,7 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 可选方案：直接迁移 LangGraph durable execution；引入 Redis/Postgres/队列；在现有 FastAPI + async pipeline 外包一层轻量 run control；继续只保留一次性接口。
 最终选择：不迁移 LangGraph，不重构主链路；新增自己的 `run_id + SQLite checkpoint + step trace + approval gate + SSE replay` 控制平面。
 理由：本项目已有清晰的 orchestrator 主链路，这次目标是补生产化能力而不是换框架。SQLite 足够让本地 demo 和测试在服务重启后读回 run、steps、events；planner 后 HITL 能在 researcher 和 synthesis 之前阻止错误方向继续消耗 token/search 成本；SSE replay 能让客户端断线后按 `Last-Event-ID` 补发历史事件。
-代价：它不是分布式调度系统；现在只有 SQLite 单机 lease/heartbeat 和 worker-once 消费入口，没有常驻 worker pool、并发抢占和跨进程实时取消；阶段级恢复当前以 planner checkpoint 后从 researcher 重跑为主，没有精确恢复到某个 researcher 子任务内部。
+代价：它不是分布式调度系统；现在只有 SQLite 单机 lease/heartbeat、worker-once 消费入口和阶段边界协作式取消，没有常驻 worker pool、强制抢占正在进行的 LLM/search 调用；阶段级恢复当前以 planner checkpoint 后从 researcher 重跑为主，没有精确恢复到某个 researcher 子任务内部。
 面试怎么答：我会说我借鉴的是 LangGraph 的 durable execution、checkpoint 和 human-in-the-loop 思想，但没有为了框架迁移牺牲项目可读性；我实现的是后端控制平面最小闭环：状态机、SQLite checkpoint、approval/resume/cancel/retry、SSE replay。
 
 ## 决策 11：为什么先补公开 Deep Research artifact 评测，而不是先做 judge 打分
@@ -181,7 +181,7 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 可选方案：直接上 Redis/RQ/Celery；用 Postgres advisory lock；在 SQLite `agent_runs` 上加 lease/heartbeat 字段；暂时不管并发 worker。
 最终选择：在 `agent_runs` 增加 `leased_by`、`heartbeat_at`、`lease_expires_at`，用原子 SQL `UPDATE ... WHERE lease is null/expired/same worker` 获取 lease；新增 heartbeat、stale list 和 recover stale API。内部 planner/researcher/synthesizer/verifier 执行路径也会自动 acquire/heartbeat/release。
 理由：这个项目默认仍要无外部依赖跑通，SQLite lease 能先把 worker ownership、过期检测、stale recovery 这些生产概念打出来。以后迁移 Postgres/Redis 时，业务层只需要替换 `RunStore` 的 lease 实现。
-代价：这不是完整任务队列，没有常驻 worker pool、分布式调度、公平排队、幂等 stage replay、长任务实时取消抢占和强事务隔离；SQLite 锁竞争下也不适合高并发。
+代价：这不是完整任务队列，没有常驻 worker pool、分布式调度、公平排队、幂等 stage replay、长任务强制抢占和强事务隔离；运行中取消只在 planner/researcher/synthesizer/verifier 阶段边界生效。SQLite 锁竞争下也不适合高并发。
 面试怎么答：我会说我先补的是“同一个 run 只能被一个 worker 拿走”的控制平面语义，而不是假装做了生产队列。这个取舍让项目保持可跑，同时能解释下一步怎么演进到 Postgres/Redis/worker pool。
 
 ## 决策 18：为什么先做可选持久化 Chroma index，而不是直接上 Qdrant/Milvus
@@ -244,7 +244,7 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 可选方案：直接接 Redis/RQ/Celery；引入 Postgres job table；保留同步 API；在 SQLite run store 上先补 queued run 和单次 worker 消费。
 最终选择：给 `CreateRunRequest` 增加 `defer_execution`，默认 `false`，不改变原 `/runs` 行为；创建 run 时把完整请求写入 `agent_runs.request_json`；`/runs/worker/next` 用原子 SQL claim 最早的 queued run，拿到 lease 后从 `request_json` 恢复 provider、模型、并发和检索参数，再执行 planner/researcher/synthesis/verifier。
 理由：这一步把“API 只入队、worker 后台执行”的控制面打通，但仍保持无外部依赖和可测试。`request_json` 是关键：否则 worker 只能看到 query，会退回默认 settings，容易重现以前 benchmark 配置快照和实际运行不一致的问题。
-代价：它只是 worker-once，不是常驻 worker pool；没有 Redis 可见队列、并发 worker 调度、任务优先级、幂等 stage replay、跨进程实时取消或 backpressure。SQLite 锁竞争下仍不适合高并发生产。
+代价：它只是 worker-once，不是常驻 worker pool；没有 Redis 可见队列、并发 worker 调度、任务优先级、幂等 stage replay、强制抢占或 backpressure。运行中取消是阶段边界检查，不会打断已经发出的 LLM/search 请求。SQLite 锁竞争下仍不适合高并发生产。
 面试怎么答：我会说这一步不是宣称完成 Celery/RQ，而是把生产 run control 的下一块拼上：入队、请求快照、worker claim、lease ownership、状态和事件可追踪。后续迁移 Redis/Postgres 时，可以保留同样的 API 语义。
 
 ## 决策 25：为什么加本地 polling worker CLI，但仍不引入 Celery
@@ -282,6 +282,15 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 理由：HTTP adapter 不新增 SDK 依赖，也不破坏无外部服务可跑通的默认路径；同时把 vector index provider 边界抽出来，后续接 Milvus 或 Qdrant Cloud 只需要替换索引层，不碰 orchestrator、dedup、verifier 或 synthesizer。
 代价：当前只用 stub HTTP 单测验证 collection create/upsert/search 和 reuse 逻辑，没有启动真实 Qdrant 服务，也没有做大规模向量库延迟、并发写、删除同步、payload filter 或权限隔离评测。
 面试怎么答：我会说我已经把 Chroma 单机索引升级成可替换的 vector index provider，并补了 Qdrant HTTP 入口；但默认不切过去，因为项目要保证 clone 后无服务依赖也能跑，真实 Qdrant 质量和运维还需要单独 benchmark。
+
+## 决策 29：为什么运行中取消做成阶段边界检查，而不是强制杀任务
+
+背景：run control 已经有 `/cancel`，但如果用户在 researcher 或 synthesizer 正在执行时取消，原来的通用异常处理可能把后续 `run cancelled` 当成失败，导致终态从 `cancelled` 被覆盖成 `failed`。生产长任务系统需要区分“用户主动取消”和“系统失败”。
+可选方案：直接取消 asyncio task；给每个 provider 做 abort signal；在 run control 阶段边界做协作式取消；继续只支持 waiting_approval 前取消。
+最终选择：新增 `RunCancelledError`，`planner/researcher/synthesizer/verifier` 阶段边界调用 `_raise_if_cancelled()`；`create_run/retry/process_next_queued/_continue_from_plan` 单独捕获取消异常，返回并保留 `cancelled` 终态，不再写 failed step/event。`_acquire_execution_lease()` 和 `_heartbeat_execution_lease()` 遇到已取消 run 也转成同一类取消异常。
+理由：这个改法不重构 orchestrator，不改变 provider 接口，也不会破坏无 key mock 路径；它先保证 run state machine 的语义正确：用户取消不是系统失败，后续 approve/retry/fail 不能覆盖取消终态。
+代价：这是协作式取消，只在阶段边界生效。已经发出去的 LLM 请求、search 请求或本地 embedding/rerank 计算不会被强制中断；真正的抢占式取消需要 provider 级 timeout/abort、worker task registry，甚至进程级隔离。
+面试怎么答：我会说当前版本先把控制平面的状态一致性修好：取消后不会被误报为失败，lease 会释放，事件也保持可追踪。它不是 Kubernetes/Celery 那种任务抢占，生产化下一步才是给每类 provider 加 abort signal 和更细粒度 checkpoint。
 
 # 5 实现细节
 
@@ -329,7 +338,7 @@ Cost Tracker：`src/deepresearch_agent/cost.py`。mock provider 仍使用字符�
 
 Trace Logger：`src/deepresearch_agent/tracing.py`。每个 run 写 `logs/research-<run_id>.jsonl`，记录 stage、status、duration_ms、payload。默认 `TRACE_EXPORTER=jsonl`；配置 `TRACE_EXPORTER=otlp_http` 和 `OTEL_EXPORTER_OTLP_ENDPOINT` 后，`OtlpHttpTraceExporter` 会把每条 event 额外转成 OTLP HTTP traces JSON 并 POST 到 collector endpoint。export 失败只追加本地 `trace_exporter` error event，不中断主链路。runtime trace 默认不提交 Git，benchmark 原始记录提交。
 
-Agent Run Control Plane：`src/deepresearch_agent/run_control.py` 外包现有 DeepResearch pipeline，不替换 `/research`。`POST /runs` 会创建 `run_id`；默认行为仍是执行 brief/planner，然后在 `require_approval=true` 时进入 `waiting_approval`；如果请求带 `defer_execution=true`，它只写入 queued run 和 `request_json` 快照，不立即跑 planner。`/runs/worker/next` 会 claim 最早 queued run，从 `request_json` 恢复本次 provider、模型、并发和检索参数，再执行 planner/researcher/synthesizer/verifier；没有 queued run 时返回 `null`。`run_worker.py` 提供本地 polling worker CLI，循环复用同一个 `process_next_queued()`，支持 `--max-runs`、`--idle-exit`、`--poll-interval-seconds` 和 `--json`。`approve` 会从 planner checkpoint 继续 researcher、synthesizer、verifier；`edit` 会保存修改后的 subquestions 再继续；`reject/cancel` 会终止 run；`retry` 对 failed run 优先复用 `plan_json` 从 researcher 阶段重跑，没有 planner checkpoint 时会优先用 `request_json` 恢复原始请求。`run_store.py` 的 SQLite schema 是三张表：`agent_runs` 保存 run 状态、请求快照、plan/result、token/cost、`leased_by`、`heartbeat_at`、`lease_expires_at`；`agent_steps` 保存阶段输入输出、latency、token_usage、cost、error、retry_count；`agent_events` 保存可 SSE replay 的单调递增 event。内部执行路径会在 planner/researcher/synthesizer/verifier 阶段 acquire/heartbeat/release lease；外部 worker 也可以用 `/runs/{run_id}/lease`、`/heartbeat`、`/runs/stale`、`/runs/recover-stale` 做 ownership 和 stale recovery 验证。
+Agent Run Control Plane：`src/deepresearch_agent/run_control.py` 外包现有 DeepResearch pipeline，不替换 `/research`。`POST /runs` 会创建 `run_id`；默认行为仍是执行 brief/planner，然后在 `require_approval=true` 时进入 `waiting_approval`；如果请求带 `defer_execution=true`，它只写入 queued run 和 `request_json` 快照，不立即跑 planner。`/runs/worker/next` 会 claim 最早 queued run，从 `request_json` 恢复本次 provider、模型、并发和检索参数，再执行 planner/researcher/synthesizer/verifier；没有 queued run 时返回 `null`。`run_worker.py` 提供本地 polling worker CLI，循环复用同一个 `process_next_queued()`，支持 `--max-runs`、`--idle-exit`、`--poll-interval-seconds` 和 `--json`。`approve` 会从 planner checkpoint 继续 researcher、synthesizer、verifier；`edit` 会保存修改后的 subquestions 再继续；`reject/cancel` 会终止 run；运行中取消通过 `RunCancelledError` 在阶段边界协作式生效，保证终态保留为 `cancelled` 而不是被通用失败处理覆盖；`retry` 对 failed run 优先复用 `plan_json` 从 researcher 阶段重跑，没有 planner checkpoint 时会优先用 `request_json` 恢复原始请求。`run_store.py` 的 SQLite schema 是三张表：`agent_runs` 保存 run 状态、请求快照、plan/result、token/cost、`leased_by`、`heartbeat_at`、`lease_expires_at`；`agent_steps` 保存阶段输入输出、latency、token_usage、cost、error、retry_count；`agent_events` 保存可 SSE replay 的单调递增 event。内部执行路径会在 planner/researcher/synthesizer/verifier 阶段 acquire/heartbeat/release lease；外部 worker 也可以用 `/runs/{run_id}/lease`、`/heartbeat`、`/runs/stale`、`/runs/recover-stale` 做 ownership 和 stale recovery 验证。
 
 Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.py`。`GET /ui` 返回内置 HTML/JS；`GET /runs` 返回最近 run list，底层是 `RunStore.list_runs()`。页面直接调用现有 `/runs/{id}/approve`、`/edit`、`/reject`、`/cancel`、`/events`，展示 planner subquestions、event stream、answer、sources 和 citation evidence quotes。局限是它只是本地审核面，没有权限、协作、前端构建/测试体系。
 
@@ -528,6 +537,15 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 复盘：搜索 provider 扩展要把“能解析 API”与“真实质量提升”分开讲。
 面试可能追问：为什么不直接跑 Brave/Tavily？回答：没有 key 就不伪造 live 结果；有 key 后用同一套 benchmark/public eval 重跑并记录真实数字。
 
+## 问题 23：运行中取消不能被误记成 failed
+
+现象：run control 已经有 `_raise_if_cancelled()` 阶段检查，但取消异常原来会被通用 `except Exception` 捕获并走 `_fail_run()`，存在把用户主动取消的 run 覆盖成 `failed` 的风险。
+原因：代码没有把“用户取消”和“系统失败”建模成不同异常类型；`create_run`、`process_next_queued`、`retry` 和 `_continue_from_plan` 都只按普通异常处理。
+排查：沿着 researcher/synthesizer/verifier 阶段边界看状态流，发现只要运行中途 `cancel()` 改成 `cancelled`，下一次阶段检查抛错后就可能进入 failed 路径。
+修复：新增 `RunCancelledError`，取消检查、lease acquire/heartbeat 遇到 cancelled 时都抛这个异常；外层执行入口单独捕获后调用 `_cancelled_run()`，保留 `cancelled` 终态并释放 lease。新增测试用 monkeypatch 模拟 researcher 阶段被外部取消，验证最终状态不是 failed。
+复盘：长任务控制平面要把 terminal state 的语义分清楚。用户取消不是系统失败，不能混到 retry/failure 指标里。
+面试可能追问：这是不是实时取消？回答：不是强制抢占，当前是阶段边界协作式取消；已发出的 LLM/search 请求不会被杀掉，下一步要做 provider 级 abort signal 或 worker task registry。
+
 # 7 实测数据
 
 本节所有 mock benchmark 数字只用于证明 pipeline plumbing 能端到端跑通，不能当作真实性能、真实成本或真实答案质量成果。尤其不能在面试里说“我的 DeepResearch p50 是个位数毫秒”这类话，因为这个延迟测的是本机 Python 跑 deterministic mock 的速度，换机器、换进程热身状态、换依赖版本都会变。
@@ -535,7 +553,7 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
-测试验证：`py -3.11 -m pytest -q`，最新结果 `82 passed, 2 warnings in 65.39s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `83 passed, 2 warnings in 70.37s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -565,7 +583,7 @@ Worker lease smoke：`py -3.11 -m pytest tests/test_run_control.py -q` 成功，
 
 Deferred worker smoke：`py -3.11 -m pytest tests/test_run_control.py -q` 成功，最新结果 `14 passed, 1 warning in 7.56s`。新增测试覆盖 `defer_execution=true` 创建后 run 保持 `queued/planner`，`agent_runs.request_json` 保存本次请求快照且 planner steps 为空；调用 `POST /runs/worker/next` 后同一 run 执行到 `succeeded`，事件里出现 `worker.claimed`，lease 最终释放；无 queued run 时 `/runs/worker/next` 返回 JSON `null`；旧版 `agent_runs` 表缺少 `request_json` 时，`RunStore` 会自动迁移补列。这里没有启动常驻 worker pool，也没有做 Redis/Celery live 验证。
 
-Local worker loop smoke：`py -3.11 -m pytest tests/test_run_worker.py tests/test_run_control.py -q` 成功，`16 passed, 1 warning in 8.19s`。新增测试覆盖 `run_worker_loop(max_runs=1)` 能消费一个 `defer_execution=true` 的 queued run 并执行到 `succeeded`，summary 记录 `processed_count=1`、`stopped_reason=max_runs`；空队列时 `idle_exit=True` 返回 `processed_count=0`、`idle_polls=1`、`stopped_reason=idle`。这里没有做多进程 worker 竞争压测，也没有 Redis/Celery broker。
+Local worker loop / running cancellation smoke：`py -3.11 -m pytest tests/test_run_control.py tests/test_run_worker.py -q` 成功，最新结果 `17 passed, 1 warning in 8.66s`。测试覆盖 `run_worker_loop(max_runs=1)` 能消费一个 `defer_execution=true` 的 queued run 并执行到 `succeeded`，summary 记录 `processed_count=1`、`stopped_reason=max_runs`；空队列时 `idle_exit=True` 返回 `processed_count=0`、`idle_polls=1`、`stopped_reason=idle`；新增运行中取消回归用 monkeypatch 模拟 researcher 阶段被外部 `cancel()`，确认最终状态保持 `cancelled`、lease 释放、没有 failed event。这里没有做多进程 worker 竞争压测，也没有 Redis/Celery broker；取消也不是强制抢占已经发出的 LLM/search 请求。
 
 Persistent vector index / Qdrant provider smoke：`py -3.11 -m pytest tests/test_hybrid_retrieval.py -q` 成功，最新结果 `5 passed, 1 warning in 2.55s`。测试用静态 embedding provider 和临时 Chroma PersistentClient 验证：第一次检索会 embed 2 个 corpus chunk 和 1 个 query，第二个 `LocalRagRetriever` 指向同一 `LOCAL_VECTOR_INDEX_PATH` 时只 embed query，不重新 embed corpus；`ChromaVectorIndex.reused_existing` 为 `True`。新增 Qdrant stub HTTP 测试覆盖 collection missing 时 create collection、upsert points、search 返回指定 chunk、`api-key` header 从环境变量读取，以及已有 collection points_count 匹配时复用 collection、不重新 embed corpus。这里没有启动真实 Qdrant 服务，也没有做真实 BGE 冷/热启动或外部向量库延迟 benchmark。
 
@@ -700,7 +718,7 @@ Citation checker 语义能力仍需实测：当前已经有可选 heuristic / De
 
 Hybrid retrieval / private corpus 还没有证明质量稳定提升：当前已经实现 keyword + vector + RRF、Markdown/TXT/PDF/DOCX 到 JSONL ingest、可选持久化 Chroma index、可选 Qdrant HTTP vector index provider 和可选 rerank，但 5 case 小样本里 hybrid success_rate 反而低于 keyword baseline，Qdrant 也只做了 stub HTTP 单测。可行方案是扩大本地语料、补人工相关性标注、调 RRF 权重、做增量 manifest/embedding cache、OCR 扫描件、启动真实 Qdrant/Milvus 做索引生命周期和延迟评测，并把 rerank 纳入全量 benchmark。工程代价是索引生命周期、模型加载时间、评测集标注、外部服务运维和更多运行成本。面试怎么讲：我会说我完成了检索结构、私有文档入口和向量库 provider 边界升级，但不会把一次小样本结果或 stub Qdrant 测试包装成质量提升，也不会把基础文件 ingest 说成完整 RAGFlow。
 
-Run control 还不是分布式调度：当前已经有 SQLite run store、request_json 请求快照、planner checkpoint、approval/resume/cancel/retry、SSE replay、单机 worker lease/heartbeat、`defer_execution=true` + `/runs/worker/next` 的 worker-once 消费入口，以及本地 polling worker CLI，但它仍是轻量实现。可行方案是引入真正的 worker queue、多进程 worker pool、PostgreSQL/Redis、阶段幂等和更细粒度 checkpoint。工程代价是并发一致性、任务抢占、schema migration 和运维复杂度。面试怎么讲：我会说我先把长任务控制平面闭环、worker ownership 和最小队列消费语义做出来，生产化再升级存储和调度，不把 SQLite 版本包装成高并发任务系统。
+Run control 还不是分布式调度：当前已经有 SQLite run store、request_json 请求快照、planner checkpoint、approval/resume/cancel/retry、SSE replay、单机 worker lease/heartbeat、`defer_execution=true` + `/runs/worker/next` 的 worker-once 消费入口、本地 polling worker CLI，以及运行中取消的阶段边界状态一致性保护，但它仍是轻量实现。可行方案是引入真正的 worker queue、多进程 worker pool、PostgreSQL/Redis、provider 级 abort、阶段幂等和更细粒度 checkpoint。工程代价是并发一致性、任务抢占、schema migration 和运维复杂度。面试怎么讲：我会说我先把长任务控制平面闭环、worker ownership、最小队列消费语义和取消终态一致性做出来，生产化再升级存储和调度，不把 SQLite 版本包装成高并发任务系统。
 
 内容导出还不是完整办公文档 / podcast 生成：当前支持 Markdown、HTML、JSON、文本版 PDF、DOCX、PPTX artifact 和 Windows SAPI WAV 语音摘要，但还没有复杂版式、图表、图片、批注、模板系统、配乐、多角色播客或跨平台 TTS。可行方案是为 PDF/DOCX/PPTX 做模板、目录、分页和渲染校验，并把 TTS provider 扩展到云端或本地跨平台语音引擎。工程代价是版式、字体、分页、图片、图表、音频时长、语音质量和跨平台验证。面试怎么讲：我会说我已经把常见报告文件格式和本地语音摘要打通，但不会把它包装成完整文档/podcast 生产系统。
 

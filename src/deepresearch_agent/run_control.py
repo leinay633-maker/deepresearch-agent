@@ -39,6 +39,10 @@ from deepresearch_agent.tracing import TraceLogger, build_trace_exporter
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 
 
+class RunCancelledError(RuntimeError):
+    pass
+
+
 class RunController:
     def __init__(
         self,
@@ -62,6 +66,8 @@ class RunController:
             return run
         try:
             return await self._run_planner(run_id, request)
+        except RunCancelledError:
+            return self._cancelled_run(run_id)
         except Exception as exc:  # noqa: BLE001
             return self._fail_run(run_id, "planner", exc)
 
@@ -119,6 +125,8 @@ class RunController:
         request = self._request_from_run(run, require_approval=False)
         try:
             return await self._run_planner(run_id, request, retry_count=1)
+        except RunCancelledError:
+            return self._cancelled_run(run_id)
         except Exception as exc:  # noqa: BLE001
             return self._fail_run(run_id, "planner", exc, retry_count=1)
 
@@ -138,6 +146,8 @@ class RunController:
         request = self._request_from_run(run)
         try:
             return await self._run_planner(run.run_id, request)
+        except RunCancelledError:
+            return self._cancelled_run(run.run_id)
         except Exception as exc:  # noqa: BLE001
             return self._fail_run(run.run_id, "planner", exc)
 
@@ -275,8 +285,10 @@ class RunController:
         llm = orchestrator._build_llm_provider(request)
         cost = self._new_cost_tracker(llm)
         brief = await llm.create_brief(request, cost)
+        self._raise_if_cancelled(run_id)
         max_researchers = min(request.max_researchers, self.settings.max_researchers)
         plan = await llm.plan(brief, max_researchers=max_researchers, cost=cost)
+        self._raise_if_cancelled(run_id)
         cost_summary = cost.summary()
         plan_state = {
             "request": request.model_dump(mode="json"),
@@ -347,6 +359,8 @@ class RunController:
                 planner_cost,
                 retry_count=retry_count,
             )
+        except RunCancelledError:
+            return self._cancelled_run(run.run_id)
         except Exception as exc:  # noqa: BLE001
             return self._fail_run(run.run_id, "researcher", exc, retry_count=retry_count)
 
@@ -665,7 +679,7 @@ class RunController:
 
     def _raise_if_cancelled(self, run_id: str) -> None:
         if self.store.require_run(run_id).status == "cancelled":
-            raise RuntimeError("run cancelled")
+            raise RunCancelledError("run cancelled")
 
     def _acquire_execution_lease(self, run_id: str) -> AgentRun:
         run = self.store.acquire_lease(
@@ -674,6 +688,8 @@ class RunController:
             lease_seconds=self.settings.run_lease_seconds,
         )
         if run is None:
+            if self.store.require_run(run_id).status == "cancelled":
+                raise RunCancelledError("run cancelled")
             raise RuntimeError(f"run {run_id} lease is unavailable")
         return run
 
@@ -684,11 +700,25 @@ class RunController:
             lease_seconds=self.settings.run_lease_seconds,
         )
         if run is None:
+            if self.store.require_run(run_id).status == "cancelled":
+                raise RunCancelledError("run cancelled")
             raise RuntimeError(f"run {run_id} lease heartbeat rejected")
         return run
 
     def _release_execution_lease(self, run_id: str) -> AgentRun:
         return self.store.release_lease(run_id, worker_id=self.worker_id)
+
+    def _cancelled_run(self, run_id: str) -> AgentRun:
+        run = self.store.require_run(run_id)
+        if run.status != "cancelled":
+            self._event(run_id, "run", "cancelled", {"previous_status": run.status})
+            self.store.update_run(
+                run_id,
+                status="cancelled",
+                current_stage="completed",
+                error_message="run cancelled",
+            )
+        return self.store.clear_lease(run_id)
 
     def _fail_run(
         self,

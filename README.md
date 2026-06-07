@@ -100,7 +100,7 @@ Invoke-RestMethod http://127.0.0.1:8000/runs/$($run.run_id)/trace
 http://127.0.0.1:8000/ui
 ```
 
-这个页面复用上面的 run control API，支持创建 mock run、查看最近 runs、编辑 planner subquestions、approve/reject/cancel，并展示 SSE events、report、sources 和 citation evidence。它是本地审核面，不包含登录权限或多人协作。
+这个页面复用上面的 run control API，支持创建 mock run、查看最近 runs、编辑 planner subquestions、approve/reject/cancel，并展示 SSE events、report、sources 和 citation evidence。运行中取消是阶段边界协作式取消：系统会保留 `cancelled` 终态并释放 lease，但不会强制打断已经发出的 LLM/search 请求。它是本地审核面，不包含登录权限或多人协作。
 
 创建后先排队，再由单次 worker 消费下一条 queued run：
 
@@ -130,7 +130,7 @@ Invoke-RestMethod http://127.0.0.1:8000/runs/stale
 Invoke-RestMethod -Method Post http://127.0.0.1:8000/runs/recover-stale -ContentType "application/json" -Body '{"reason":"manual stale lease recovery"}'
 ```
 
-Lease 目前用于 SQLite 单机 worker ownership 和 stale run recovery，不是完整分布式任务队列。
+Lease 目前用于 SQLite 单机 worker ownership、stale run recovery 和取消后的 lease 清理，不是完整分布式任务队列。
 
 订阅持久化 run 事件，断线后可用 `Last-Event-ID` 续传：
 

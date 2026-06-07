@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import sqlite3
 from datetime import timedelta
@@ -7,7 +8,10 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from deepresearch_agent.config import load_settings
 from deepresearch_agent.api import app
+from deepresearch_agent.run_control import RunController
+from deepresearch_agent.run_models import CreateRunRequest
 from deepresearch_agent.run_store import RunStore
 from deepresearch_agent.schemas import utc_now
 
@@ -308,6 +312,41 @@ def test_cancel_prevents_later_approval(tmp_path, monkeypatch) -> None:
     assert cancelled.json()["status"] == "cancelled"
     assert approved.status_code == 409
     assert "researcher" not in {step.stage for step in store.list_steps(run_id)}
+
+
+def test_running_cancel_does_not_become_failed(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "runs.sqlite"
+    monkeypatch.setenv("RUN_STORE_PATH", str(db_path))
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("SEARCH_PROVIDER", "mock")
+    monkeypatch.setenv("LOCAL_RETRIEVAL_MODE", "keyword")
+    store = RunStore(db_path)
+
+    async def cancelling_researcher(self, run_id, *args, **kwargs):
+        self.cancel(run_id)
+        return [], 0, 0, [], []
+
+    monkeypatch.setattr(RunController, "_run_researcher_stage", cancelling_researcher)
+    controller = RunController(store=store, settings=load_settings())
+
+    run = asyncio.run(
+        controller.create_run(
+            CreateRunRequest(
+                query="How should running cancellation preserve terminal state?",
+                search_provider="mock",
+                llm_provider="mock",
+                max_researchers=1,
+                max_results_per_researcher=1,
+                require_approval=False,
+            )
+        )
+    )
+
+    assert run.status == "cancelled"
+    assert run.error_message == "run cancelled"
+    assert run.leased_by is None
+    assert not any(event.status == "failed" for event in store.list_events(run.run_id))
+    assert store.require_run(run.run_id).status == "cancelled"
 
 
 def test_retry_failed_run_reuses_planner_checkpoint(tmp_path, monkeypatch) -> None:
