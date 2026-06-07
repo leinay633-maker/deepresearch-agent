@@ -12,6 +12,7 @@ from urllib.parse import quote_plus, urlencode
 from urllib.request import Request, urlopen
 
 from deepresearch_agent.config import Settings
+from deepresearch_agent.mcp_tools import McpServerConfig, McpToolSearchAdapter, build_mcp_client
 from deepresearch_agent.schemas import Source
 
 
@@ -423,6 +424,21 @@ def build_search_adapter(
         return JinaSearchAdapter(
             base_url=settings.jina_search_base_url,
             max_chars=settings.crawler_max_chars,
+        )
+    if selected == "mcp":
+        config = McpServerConfig(
+            transport=settings.mcp_transport,
+            command=settings.mcp_command,
+            args=settings.mcp_args,
+            http_url=settings.mcp_http_url,
+            search_tool=settings.mcp_search_tool,
+            query_argument=settings.mcp_query_argument,
+            timeout_seconds=settings.request_timeout_seconds,
+        )
+        return McpToolSearchAdapter(
+            client=build_mcp_client(config),
+            tool_name=config.search_tool,
+            query_argument=config.query_argument,
         )
     raise ValueError(f"unknown search provider: {selected}")
 

@@ -68,7 +68,11 @@ def _settings_from_args(args: argparse.Namespace):
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a local DeepResearch Agent query.")
     parser.add_argument("query")
-    parser.add_argument("--search-provider", choices=["mock", "wikipedia", "searxng", "jina"], default=None)
+    parser.add_argument(
+        "--search-provider",
+        choices=["mock", "wikipedia", "searxng", "jina", "mcp"],
+        default=None,
+    )
     parser.add_argument("--llm-provider", choices=["mock", "deepseek"], default=None)
     parser.add_argument("--llm-model", default=None)
     parser.add_argument("--embedding-provider", choices=["local", "dashscope"], default=None)

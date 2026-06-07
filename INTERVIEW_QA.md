@@ -191,6 +191,17 @@
 2. fallback 会不会污染答案？
 3. 如何向用户暴露 fallback？
 
+## Q：MCP 工具接入现在做到什么程度？
+[状态: 待消化]
+标签：MCP / Tool Adapter
+检索关键词：MCP, tools/list, tools/call, Source
+回答：我新增了 `mcp_tools.py`，先把 MCP 当成工具来源接进 search adapter，而不是重构整个 Agent 工具层。`McpToolSearchAdapter` 会调用配置好的 `MCP_SEARCH_TOOL`，把 tool result 里的 sources 或 text content 转成统一 `Source`，所以下游 dedup、verifier、synthesizer 和 citation checker 不用改。它支持 stdio/http 两种 JSON-RPC client，但当前只用 fake client 做了 adapter 单测，还没有真实 MCP server live run。
+关联模块：`mcp_tools.py`, `search.py`, `tests/test_mcp_tools.py`
+可追问：
+1. 为什么不直接用完整 MCP SDK？
+2. stdio MCP 怎么通信？
+3. MCP tool 失败怎么办？
+
 ## Q：RAG 在项目里怎么实现？
 [状态: 待消化]
 标签：RAG / Retriever

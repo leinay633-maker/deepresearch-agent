@@ -433,7 +433,11 @@ def main() -> None:
     parser.add_argument("--split", default="test")
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit", type=int, default=3)
-    parser.add_argument("--search-provider", choices=["mock", "wikipedia", "searxng", "jina"], default="mock")
+    parser.add_argument(
+        "--search-provider",
+        choices=["mock", "wikipedia", "searxng", "jina", "mcp"],
+        default="mock",
+    )
     parser.add_argument("--llm-provider", choices=["mock", "deepseek"], default="mock")
     parser.add_argument("--llm-model", default=None)
     parser.add_argument("--embedding-provider", choices=["local", "dashscope"], default="local")

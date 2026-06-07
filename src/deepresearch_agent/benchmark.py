@@ -231,7 +231,11 @@ def _benchmark_notes(config_snapshot: dict[str, Any]) -> tuple[str, str, list[st
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the DeepResearch Agent benchmark.")
     parser.add_argument("--cases", default=None)
-    parser.add_argument("--search-provider", choices=["mock", "wikipedia", "searxng", "jina"], default="mock")
+    parser.add_argument(
+        "--search-provider",
+        choices=["mock", "wikipedia", "searxng", "jina", "mcp"],
+        default="mock",
+    )
     parser.add_argument("--llm-provider", choices=["mock", "deepseek"], default="mock")
     parser.add_argument("--llm-model", default=None)
     parser.add_argument("--embedding-provider", choices=["local", "dashscope"], default="local")

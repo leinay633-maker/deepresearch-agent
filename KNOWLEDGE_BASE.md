@@ -157,6 +157,15 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 代价：当前 reflection 是启发式，不是真正语义判断“信息是否足够”；追加问题模板也比较通用，可能召回重复信息。run control 已复用同一 helper，但还没有阶段级 checkpoint 到单个 reflection round。
 面试怎么答：我会说这是从 pipeline 到 agent loop 的第一步：先把循环、压缩、追加问题和 trace 边界做出来，再把启发式 policy 换成 LLM reflection 或 evaluator。
 
+## 决策 15：为什么 MCP 先作为 search/tool adapter 接入
+
+背景：open_deep_research 和 DeerFlow 都把 MCP 当外部工具扩展点；本项目之前只有 Python adapter，工具生态和它们相比差距明显。但直接把所有 researcher tool call 都迁成 MCP 会影响主链路稳定性。
+可选方案：暂不做 MCP；引入完整 MCP SDK 并重构工具层；先写一个最小 JSON-RPC stdio/http client；只做 MCP search adapter，把 tool result 转成 `Source`。
+最终选择：新增 `src/deepresearch_agent/mcp_tools.py`，支持 stdio/http JSON-RPC 的 `tools/list` 和 `tools/call`，并在 `search.py` 里加 `mcp` search provider。通过 `MCP_SEARCH_TOOL` 调一个明确的搜索工具，结果统一转换成 `Source`，下游 dedup/verifier/synthesizer 不需要改。
+理由：这保持了本项目的边界：researcher 仍消费 `Source`，MCP 只是新工具来源；默认不启用，不影响无 key / 无 server 路径。配置全部来自环境变量：`MCP_TRANSPORT`、`MCP_COMMAND`、`MCP_ARGS`、`MCP_HTTP_URL`、`MCP_SEARCH_TOOL`、`MCP_QUERY_ARGUMENT`。
+代价：当前没有接真实 MCP server 做 live run，只用 fake client 和 adapter 单测验证协议边界；stdio client 是最小实现，不包含长连接复用、server capability 细分、资源订阅和复杂认证。
+面试怎么答：我会说我没有把主链路绑死在某个 MCP server 上，而是先把 MCP 的工具结果纳入统一 Source 模型。后续接 filesystem、browser、company search MCP server 时，不需要改 synthesizer 和 citation checker。
+
 # 5 实现细节
 
 Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。局限是 planner 还不会根据 researcher 中间结果动态追加子问题。
@@ -170,6 +179,8 @@ Researcher：`src/deepresearch_agent/orchestrator.py` 的 `_research_one`。输�
 Reflection / Compression Loop：`src/deepresearch_agent/orchestrator.py` 的 `_run_reflection_rounds`、`_compress_findings`、`_reflect_on_evidence`。输入是初始 plan 和 researcher results，输出是可能扩展后的 plan/results。开启 `reflection_enabled` 后，每轮先把 findings 压成短文本写入 `compression.roundN` trace，再根据 fallback_count 和每个 finding 的唯一 source 数是否低于 `reflection_min_sources` 来决定是否追加 `R<N>` 子问题。`run_control.py` 的 researcher 阶段也调用同一个 helper，所以 `/research` 和 `/runs` 语义一致。局限是当前 policy 是启发式，不是 LLM reflection。
 
 Web Search / Crawler Provider：`src/deepresearch_agent/search.py`。`build_search_adapter()` 现在按 provider name 构造 `mock`、`wikipedia`、`searxng` 或 `jina`，`build_crawler()` 按配置构造 `JinaReaderCrawler`。`SearxngSearchAdapter` 调 `SEARXNG_BASE_URL/search?format=json`，解析 title/url/snippet，再可选调用 crawler 抽正文；`JinaReaderCrawler` 用 `https://r.jina.ai/<url>` 抽 LLM-friendly text；`JinaSearchAdapter` 用 `https://s.jina.ai/<query>`。`JINA_API_KEY` 是可选环境变量，不进入 Settings 快照。
+
+MCP Tool Adapter：`src/deepresearch_agent/mcp_tools.py`。`McpToolSearchAdapter` 用 `McpClient.call_tool()` 调配置好的 search tool，把 MCP result 里的 `sources` 或 `content[type=text]` 解析成统一 `Source`。`HttpMcpClient` 用 JSON-RPC HTTP POST，`StdioMcpClient` 用 MCP 的 `Content-Length` framing 和子进程 stdin/stdout。当前实现只覆盖 `tools/list`、`tools/call` 和 search-like result 转换，不做资源订阅或长连接池。
 
 Embedding Provider：`src/deepresearch_agent/embeddings.py`。输入文本列表，输出向量列表。默认 `LocalEmbeddingProvider` 使用 `sentence-transformers` 加载 `BAAI/bge-small-zh-v1.5`，无 API key；`DashScopeEmbeddingProvider` 调百炼 OpenAI-compatible embeddings endpoint，key 只从 `DASHSCOPE_API_KEY` 读。验证脚本是 `src/deepresearch_agent/validate_embeddings.py`，本机 local BGE 实测维度 `512`；DashScope 因未配置 key，只做了 stub endpoint 解析测试。
 
@@ -319,7 +330,7 @@ Agent Run Control Plane：`src/deepresearch_agent/run_control.py` 外包现有 D
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
-测试验证：`py -3.11 -m pytest -q`，最新结果 `43 passed, 2 warnings in 55.03s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 Chroma/OpenTelemetry 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `47 passed, 2 warnings in 54.62s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 Chroma/OpenTelemetry 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -338,6 +349,8 @@ Web search / crawler provider smoke：`py -3.11 -m pytest tests/test_web_search_
 Claim-level evidence grounding smoke：`py -3.11 -m pytest tests/test_quality_and_citations.py -q` 成功，`6 passed in 0.26s`；新增测试覆盖 supported claim 提取 evidence quote，以及 missing source 标成 `unverifiable`。`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?" --search-provider mock --llm-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --json` 成功，输出里的 citation assessment 已包含 `support_level="supported"` 和 `evidence_quotes`，quote 示例来自本地 source 句子 “Normal RAG retrieves context once for a single answer...”。这只证明 evidence quote plumbing 和 lexical grounding 生效，不代表语义事实校验完成。
 
 Reflection loop smoke：`py -3.11 -m pytest tests/test_reflection_loop.py tests/test_run_control.py -q` 成功，`9 passed, 1 warning in 4.49s`。`tests/test_reflection_loop.py` 覆盖 orchestrator 在 `reflection_enabled=True`、`max_reflection_rounds=1`、`reflection_min_sources=4` 时追加 `R1` follow-up question，并写入 `compression.round1` / `reflection.round1` trace。`tests/test_run_control.py` 也覆盖了 `/runs` approve 后 result_json 的 plan 包含 `R1`，trace_events 包含 `reflection.round1`。CLI smoke：`py -3.11 -m deepresearch_agent.cli "How should citation grounding work in a research agent?" --search-provider mock --llm-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --reflection-enabled --max-reflection-rounds 1 --reflection-min-sources 4 --json` 成功，输出可见 `id="R1"`、`compression.round1`、`reflection.round1` 和 `should_add_question=true`。
+
+MCP adapter smoke：`py -3.11 -m pytest tests/test_mcp_tools.py tests/test_web_search_providers.py tests/test_failure_handling.py -q` 成功，`14 passed in 0.37s`。覆盖 MCP result 的 `sources` array 转 `Source`、`content[type=text]` JSON 转 `Source`、`McpToolSearchAdapter` 调 fake client、`build_search_adapter(..., "mcp")` 构造 provider、以及缺少 `MCP_SEARCH_TOOL` 时 fail-fast。当前没有配置真实 MCP server，所以 stdio/http live call 未实测。
 
 mock benchmark 原始记录：`logs/benchmark-20260606T152954Z.jsonl`。
 当前 benchmark summary：`results/benchmark_summary.json`，已被真实 DeepSeek + Wikipedia benchmark 覆盖。
