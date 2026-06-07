@@ -2,7 +2,7 @@
 
 一个故意收窄的 DeepResearch Agent：从用户问题出发，生成 research brief，拆分子问题，并发检索，去重和来源质量过滤后，合成带引用的结构化报告，并对引用做 faithfulness 检查。
 
-默认运行不需要 API key。默认 LLM 和 search 都走 `mock`，用于稳定演示、测试和 mock plumbing benchmark；local retrieval 默认使用本地 BGE embedding 做 keyword + vector hybrid，不需要 API key。也可以显式切到 DeepSeek 真实 LLM provider、OpenAI-compatible LLM adapter、Wikipedia 真实无 key search adapter、Brave/Tavily/Jina 搜索 adapter，以及 DashScope embedding/rerank provider。所有 key 只从环境变量读取：DeepSeek 用 `DEEPSEEK_API_KEY`，OpenAI-compatible adapter 默认读 `OPENAI_COMPATIBLE_API_KEY`（可配置为非必需，方便接本地 Ollama 兼容端点），DashScope 用 `DASHSCOPE_API_KEY`，Brave 用 `BRAVE_SEARCH_API_KEY`，Tavily 用 `TAVILY_API_KEY`，Jina 用 `JINA_API_KEY`。
+默认运行不需要 API key。默认 LLM 和 search 都走 `mock`，用于稳定演示、测试和 mock plumbing benchmark；local retrieval 默认使用本地 BGE embedding 做 keyword + vector hybrid，不需要 API key。也可以显式切到 DeepSeek 真实 LLM provider、OpenAI-compatible LLM adapter、Wikipedia 真实无 key search adapter、Brave/Tavily/Jina 搜索 adapter、DashScope embedding/rerank provider，以及可选 Qdrant HTTP vector index。所有 key 只从环境变量读取：DeepSeek 用 `DEEPSEEK_API_KEY`，OpenAI-compatible adapter 默认读 `OPENAI_COMPATIBLE_API_KEY`（可配置为非必需，方便接本地 Ollama 兼容端点），DashScope 用 `DASHSCOPE_API_KEY`，Brave 用 `BRAVE_SEARCH_API_KEY`，Tavily 用 `TAVILY_API_KEY`，Jina 用 `JINA_API_KEY`，Qdrant 可选读 `QDRANT_API_KEY`。
 
 ## Quickstart
 
@@ -210,6 +210,7 @@ Local retrieval：
 - embedding provider 默认 `local`，模型是 `BAAI/bge-small-zh-v1.5`；可显式切到 `dashscope`，key 从 `DASHSCOPE_API_KEY` 读。
 - rerank provider 默认 `local`，模型是 `BAAI/bge-reranker-base`，但 `--rerank-enabled` 才会启用；也可以显式切到 DashScope rerank。
 - 持久化向量索引默认关闭；设置 `LOCAL_VECTOR_INDEX_PERSIST=true` 后会把 Chroma index 写到 `LOCAL_VECTOR_INDEX_PATH`（默认 `data/vector_index`，已 gitignore），按 corpus + embedding provider + model 指纹复用 collection。
+- vector index provider 默认 `chroma`；可设置 `LOCAL_VECTOR_INDEX_PROVIDER=qdrant` 或 CLI `--local-vector-index-provider qdrant`，通过 `QDRANT_BASE_URL`、`QDRANT_COLLECTION`、`QDRANT_API_KEY_ENV` 访问 Qdrant HTTP API。当前只做 stub 单测，未做真实 Qdrant live benchmark。
 
 Citation judge：
 
@@ -229,7 +230,7 @@ src/deepresearch_agent/
   run_worker.py       Local polling worker for queued runs
   llm.py              Mock and DeepSeek structured-output model providers
   search.py           Search adapters, retry, timeout, circuit breaker, fallback
-  rag.py              Local keyword/vector hybrid RAG retriever
+  rag.py              Local keyword/vector hybrid RAG retriever, Chroma/Qdrant index adapters
   ingest_corpus.py    Markdown/TXT to local JSONL corpus ingestion
   embeddings.py       Local and DashScope embedding providers
   rerankers.py        Optional local and DashScope rerank providers

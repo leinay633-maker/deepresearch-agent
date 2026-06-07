@@ -50,8 +50,12 @@ class Settings:
     local_vector_weight: float = 1.0
     local_chunk_size_chars: int = 600
     local_chunk_overlap_chars: int = 80
+    local_vector_index_provider: str = "chroma"
     local_vector_index_persist: bool = False
     local_vector_index_path: str = "data/vector_index"
+    qdrant_base_url: str = "http://localhost:6333"
+    qdrant_collection: str = "deepresearch_local_rag"
+    qdrant_api_key_env: str = "QDRANT_API_KEY"
     rerank_enabled: bool = False
     rerank_provider: str = "local"
     local_rerank_model: str = "BAAI/bge-reranker-base"
@@ -175,9 +179,18 @@ def load_settings() -> Settings:
         local_vector_weight=_float_env("LOCAL_VECTOR_WEIGHT", 1.0),
         local_chunk_size_chars=_int_env("LOCAL_CHUNK_SIZE_CHARS", 600),
         local_chunk_overlap_chars=_int_env("LOCAL_CHUNK_OVERLAP_CHARS", 80),
+        local_vector_index_provider=(
+            os.getenv("LOCAL_VECTOR_INDEX_PROVIDER", "chroma").strip().lower() or "chroma"
+        ),
         local_vector_index_persist=_bool_env("LOCAL_VECTOR_INDEX_PERSIST", False),
         local_vector_index_path=os.getenv("LOCAL_VECTOR_INDEX_PATH", "data/vector_index").strip()
         or "data/vector_index",
+        qdrant_base_url=os.getenv("QDRANT_BASE_URL", "http://localhost:6333").strip()
+        or "http://localhost:6333",
+        qdrant_collection=os.getenv("QDRANT_COLLECTION", "deepresearch_local_rag").strip()
+        or "deepresearch_local_rag",
+        qdrant_api_key_env=os.getenv("QDRANT_API_KEY_ENV", "QDRANT_API_KEY").strip()
+        or "QDRANT_API_KEY",
         rerank_enabled=_bool_env("RERANK_ENABLED", False),
         rerank_provider=os.getenv("RERANK_PROVIDER", "local").strip().lower() or "local",
         local_rerank_model=(

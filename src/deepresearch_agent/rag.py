@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import os
 import re
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from deepresearch_agent.config import Settings, load_settings
 from deepresearch_agent.embeddings import EmbeddingProvider, build_embedding_provider
@@ -32,6 +36,16 @@ class RankedChunk:
     method: str
 
 
+class VectorIndex(Protocol):
+    reused_existing: bool
+
+    async def build(self) -> None:
+        raise NotImplementedError
+
+    async def search(self, query: str, top_k: int) -> list[RankedChunk]:
+        raise NotImplementedError
+
+
 class LocalRagRetriever:
     name = "local_rag"
 
@@ -49,7 +63,7 @@ class LocalRagRetriever:
         self.chunks = self._chunk_documents(self.documents)
         self.embedding_provider = embedding_provider
         self.rerank_provider = rerank_provider
-        self._vector_index: ChromaVectorIndex | None = None
+        self._vector_index: VectorIndex | None = None
 
     async def retrieve(self, query: str, max_results: int = 2) -> list[Source]:
         mode = self.settings.local_retrieval_mode.strip().lower()
@@ -93,18 +107,31 @@ class LocalRagRetriever:
         index = await self._ensure_vector_index()
         return await index.search(query, top_k=top_k)
 
-    async def _ensure_vector_index(self) -> "ChromaVectorIndex":
+    async def _ensure_vector_index(self) -> VectorIndex:
         if self._vector_index is None:
             provider = self.embedding_provider or build_embedding_provider(self.settings)
-            self._vector_index = ChromaVectorIndex(
-                chunks=self.chunks,
-                embedding_provider=provider,
-                persist_path=(
-                    Path(self.settings.local_vector_index_path)
-                    if self.settings.local_vector_index_persist
-                    else None
-                ),
-            )
+            index_provider = self.settings.local_vector_index_provider.strip().lower()
+            if index_provider == "chroma":
+                self._vector_index = ChromaVectorIndex(
+                    chunks=self.chunks,
+                    embedding_provider=provider,
+                    persist_path=(
+                        Path(self.settings.local_vector_index_path)
+                        if self.settings.local_vector_index_persist
+                        else None
+                    ),
+                )
+            elif index_provider == "qdrant":
+                self._vector_index = QdrantVectorIndex(
+                    chunks=self.chunks,
+                    embedding_provider=provider,
+                    base_url=self.settings.qdrant_base_url,
+                    collection_prefix=self.settings.qdrant_collection,
+                    timeout=self.settings.request_timeout_seconds,
+                    api_key=os.environ.get(self.settings.qdrant_api_key_env),
+                )
+            else:
+                raise ValueError(f"unknown local vector index provider: {index_provider}")
             await self._vector_index.build()
         return self._vector_index
 
@@ -167,6 +194,7 @@ class LocalRagRetriever:
                 "keyword_score": item["keyword_score"],
                 "vector_rank": item["vector_rank"],
                 "vector_score": item["vector_score"],
+                "vector_index_provider": self.settings.local_vector_index_provider,
                 "rrf_k": self.settings.local_hybrid_rrf_k,
                 "keyword_weight": self.settings.local_keyword_weight,
                 "vector_weight": self.settings.local_vector_weight,
@@ -357,6 +385,178 @@ class ChromaVectorIndex:
             digest.update(b"\0")
             digest.update(chunk.content.encode("utf-8"))
         return f"local_rag_{digest.hexdigest()[:16]}"
+
+
+class QdrantVectorIndex:
+    def __init__(
+        self,
+        chunks: list[LocalChunk],
+        embedding_provider: EmbeddingProvider,
+        base_url: str,
+        collection_prefix: str,
+        timeout: float,
+        api_key: str | None = None,
+    ) -> None:
+        self.chunks = chunks
+        self.embedding_provider = embedding_provider
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.api_key = api_key
+        self.chunk_by_id = {chunk.id: chunk for chunk in chunks}
+        self.collection_name = self._collection_name(collection_prefix)
+        self.reused_existing = False
+
+    async def build(self) -> None:
+        info = await asyncio.to_thread(self._collection_info)
+        points_count = _qdrant_points_count(info)
+        if points_count == len(self.chunks):
+            self.reused_existing = True
+            return
+        if info is not None:
+            await asyncio.to_thread(self._delete_collection)
+
+        embeddings = await self.embedding_provider.embed_texts(
+            [f"{chunk.title}\n{chunk.content}" for chunk in self.chunks]
+        )
+        if not embeddings:
+            return
+        await asyncio.to_thread(self._create_collection, len(embeddings[0]))
+        await asyncio.to_thread(self._upsert_points, embeddings)
+
+    async def search(self, query: str, top_k: int) -> list[RankedChunk]:
+        query_vector = await self.embedding_provider.embed_text(query)
+        payload = {
+            "vector": query_vector,
+            "limit": min(top_k, len(self.chunks)),
+            "with_payload": True,
+        }
+        result = await asyncio.to_thread(
+            self._request_json,
+            "POST",
+            f"/collections/{self.collection_name}/points/search",
+            payload,
+        )
+        ranked: list[RankedChunk] = []
+        for index, item in enumerate(result.get("result", []), start=1):
+            payload = item.get("payload") or {}
+            chunk_id = payload.get("chunk_id")
+            if chunk_id not in self.chunk_by_id:
+                continue
+            ranked.append(
+                RankedChunk(
+                    chunk=self.chunk_by_id[chunk_id],
+                    score=float(item.get("score", 0.0)),
+                    rank=index,
+                    method="vector",
+                )
+            )
+        return ranked
+
+    def _collection_info(self) -> dict[str, Any] | None:
+        return self._request_json(
+            "GET",
+            f"/collections/{self.collection_name}",
+            allow_404=True,
+        )
+
+    def _create_collection(self, vector_size: int) -> None:
+        self._request_json(
+            "PUT",
+            f"/collections/{self.collection_name}",
+            {
+                "vectors": {
+                    "size": vector_size,
+                    "distance": "Cosine",
+                }
+            },
+        )
+
+    def _delete_collection(self) -> None:
+        self._request_json("DELETE", f"/collections/{self.collection_name}")
+
+    def _upsert_points(self, embeddings: list[list[float]]) -> None:
+        points = []
+        for chunk, vector in zip(self.chunks, embeddings, strict=False):
+            points.append(
+                {
+                    "id": str(uuid.uuid5(uuid.NAMESPACE_URL, chunk.id)),
+                    "vector": vector,
+                    "payload": {
+                        "chunk_id": chunk.id,
+                        "document_id": chunk.document_id,
+                        "title": chunk.title,
+                        "url": chunk.url,
+                        "chunk_index": chunk.chunk_index,
+                    },
+                }
+            )
+        self._request_json(
+            "PUT",
+            f"/collections/{self.collection_name}/points?wait=true",
+            {"points": points},
+        )
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        allow_404: bool = False,
+    ) -> dict[str, Any] | None:
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["api-key"] = self.api_key
+        request = urllib.request.Request(
+            f"{self.base_url}{path}",
+            data=data,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            if allow_404 and exc.code == 404:
+                return None
+            raise RuntimeError(
+                f"Qdrant request failed: {method} {path} -> {exc.code} {body}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                f"Qdrant request failed: {method} {path} -> {exc.reason}"
+            ) from exc
+        return json.loads(raw) if raw else {}
+
+    def _collection_name(self, prefix: str) -> str:
+        safe_prefix = (
+            re.sub(r"[^a-zA-Z0-9_-]+", "_", prefix.strip())
+            or "deepresearch_local_rag"
+        )
+        digest = hashlib.sha256()
+        digest.update(self.embedding_provider.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(self.embedding_provider.model.encode("utf-8"))
+        for chunk in self.chunks:
+            digest.update(b"\0")
+            digest.update(chunk.id.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(chunk.title.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(chunk.url.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(chunk.content.encode("utf-8"))
+        return f"{safe_prefix}_{digest.hexdigest()[:16]}"
+
+
+def _qdrant_points_count(info: dict[str, Any] | None) -> int | None:
+    if info is None:
+        return None
+    result = info.get("result") or {}
+    count = result.get("points_count", result.get("vectors_count"))
+    return int(count) if count is not None else None
 
 
 def _tokens(text: str) -> set[str]:

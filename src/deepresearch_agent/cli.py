@@ -62,6 +62,10 @@ def _settings_from_args(args: argparse.Namespace):
         ("local_keyword_weight", "local_keyword_weight"),
         ("local_vector_weight", "local_vector_weight"),
         ("local_hybrid_rrf_k", "local_hybrid_rrf_k"),
+        ("local_vector_index_provider", "local_vector_index_provider"),
+        ("qdrant_base_url", "qdrant_base_url"),
+        ("qdrant_collection", "qdrant_collection"),
+        ("qdrant_api_key_env", "qdrant_api_key_env"),
         ("rerank_provider", "rerank_provider"),
         ("local_rerank_candidate_k", "local_rerank_candidate_k"),
         ("searxng_base_url", "searxng_base_url"),
@@ -102,6 +106,14 @@ def main() -> None:
     parser.add_argument("--local-keyword-weight", type=float, default=None)
     parser.add_argument("--local-vector-weight", type=float, default=None)
     parser.add_argument("--local-hybrid-rrf-k", type=int, default=None)
+    parser.add_argument(
+        "--local-vector-index-provider",
+        choices=["chroma", "qdrant"],
+        default=None,
+    )
+    parser.add_argument("--qdrant-base-url", default=None)
+    parser.add_argument("--qdrant-collection", default=None)
+    parser.add_argument("--qdrant-api-key-env", default=None)
     parser.add_argument("--rerank-enabled", action="store_true")
     parser.add_argument("--rerank-provider", choices=["local", "dashscope"], default=None)
     parser.add_argument("--local-rerank-candidate-k", type=int, default=None)
