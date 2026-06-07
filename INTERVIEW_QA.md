@@ -343,9 +343,9 @@
 ## Q：Citation Checker 怎么工作？
 [状态: 待消化]
 标签：Citation / Faithfulness
-检索关键词：CitationChecker, overlap
-回答：`CitationChecker` 从 claim 里提取 `[S1]` 这种 citation ID，找到对应 source，然后计算 claim 和 source content 的 token overlap。overlap 达到阈值就认为第一层 supported，否则标 unsupported。
-关联模块：`citation.py`
+检索关键词：CitationChecker, overlap, evidence quote, support_level
+回答：`CitationChecker` 从 claim 里提取 `[S1]` 这种 citation ID，找到对应 source，然后在 source content 里按句子找最接近 claim 的 evidence quote。输出里既保留 `supported` 和 overlap score，也新增 `support_level`：supported、partial、unsupported、unverifiable。这样我不只是知道 retention，还能看到 claim 到底被哪段 source text 支撑。它仍然是 lexical grounding，不是最终语义 judge。
+关联模块：`citation.py`, `schemas.py`
 可追问：
 1. 为什么不用 LLM judge？
 2. overlap 阈值是多少？
@@ -377,7 +377,7 @@
 [状态: 待消化]
 标签：Citation / 局限
 检索关键词：lexical overlap limitation
-回答：最大风险是 lexical overlap 不等于语义支持。两个句子词重叠高也可能表达相反意思，词重叠低也可能语义等价。所以我把它定位成便宜、可 CI 化的第一层检查，不把它包装成最终事实验证。
+回答：最大风险仍然是 lexical overlap 不等于语义支持。现在我已经加了 evidence quote 和 support_level，能让人复查“系统认为哪段话支撑 claim”，但它还不能判断反义、讽刺、复杂表格和跨句蕴含。所以我把它定位成便宜、可 CI 化的第一层 grounding，不把它包装成最终事实验证。
 关联模块：`citation.py`, `KNOWLEDGE_BASE.md`
 可追问：
 1. 怎么升级到语义级？
@@ -388,8 +388,8 @@
 [状态: 待消化]
 标签：Citation / 错误处理
 检索关键词：missing citation, unsupported
-回答：如果 claim 没有 citation ID，或者 citation ID 找不到 source，`CitationChecker` 会给 overlap 0，并标成 unsupported。这样即使 synthesizer 出错，最终 report 里的 citation_check 也能暴露问题。
-关联模块：`citation.py`
+回答：如果 claim 没有 citation ID，`CitationChecker` 会标成 unsupported；如果 citation ID 找不到 source，会标成 `unverifiable`，overlap 是 0，evidence_quotes 为空。这样能区分“模型没给引用”和“模型引用了不存在的 source”，最终 report 里的 citation_check 会暴露问题。
+关联模块：`citation.py`, `schemas.py`
 可追问：
 1. API 是否应该直接失败？
 2. 用户界面怎么显示？

@@ -59,6 +59,21 @@ def test_citation_checker_flags_unsupported_claim() -> None:
 
     assert report.supported_claims == 1
     assert report.unsupported_claims == 1
+    assert report.assessments[0].support_level == "supported"
+    assert report.assessments[0].evidence_quotes[0].source_id == "S1"
+    assert "Structured trace logs" in report.assessments[0].evidence_quotes[0].quote
+    assert report.assessments[1].support_level == "unsupported"
+
+
+def test_citation_checker_marks_missing_source_unverifiable() -> None:
+    checker = CitationChecker()
+
+    report = checker.check(["Postgres checkpointing is implemented [S9]"], [])
+
+    assert report.supported_claims == 0
+    assert report.unsupported_claims == 1
+    assert report.assessments[0].support_level == "unverifiable"
+    assert report.assessments[0].evidence_quotes == []
 
 
 def test_cost_tracker_can_record_provider_usage() -> None:

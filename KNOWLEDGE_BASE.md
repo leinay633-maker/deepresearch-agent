@@ -139,6 +139,15 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 代价：当前没有自建 SearxNG 实例，所以 SearxNG 只做了 stub 单测；Jina Reader live crawl `https://example.com` 成功，但 Jina Search live smoke 在当前网络下返回 `401/403`，实际 query 走了 mock fallback。它是 provider 结构升级，还不是“真实搜索质量已经解决”。
 面试怎么答：我会说这一步补的是工具层边界，不是刷 benchmark。真实网页搜索要分成 query→URL 和 URL→content 两层，否则后面 citation grounding 没法定位证据片段。
 
+## 决策 13：为什么先做 claim-level evidence quote，而不是直接上 LLM judge
+
+背景：当前 citation checker 只有 claim/source lexical overlap，能算 retention，但不能告诉我“具体哪段 source 支撑了这个 claim”。如果直接接 LLM judge，成本、延迟和 judge 自身可靠性都会让问题变复杂。
+可选方案：继续只算 overlap；直接上 DeepSeek/OpenAI judge；先做 evidence span/quote grounding；用本地 NLI 模型做 entailment。
+最终选择：在 `CitationAssessment` 里新增 `support_level` 和 `evidence_quotes`。checker 仍从 `[Sx]` 找 source，但会在每个 cited source 内按句子找最接近 claim 的证据 quote，输出 `supported / partial / unsupported / unverifiable` 四种 level。
+理由：这一步不需要额外 API key，能保持 CI 可跑，也为后续 LLM judge/NLI 提供结构化输入：claim、citation_id、source_title、evidence_quote、overlap_score。旧的 `supported` 和 `retention_rate` 语义保留，已有 benchmark 不会被强行换口径。
+代价：它仍然是 lexical grounding，不等于语义蕴含；中文和长表格/列表的句子切分仍粗糙；`partial` 只是提示证据不足，不是严格事实分类。
+面试怎么答：我会说我没有一步跳到昂贵 judge，而是先把 citation 从“一个分数”升级成“claim -> cited source -> evidence quote”的可审计结构。后续接 LLM judge 时，judge 看的是具体 quote，不是整篇网页。
+
 # 5 实现细节
 
 Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。局限是 planner 还不会根据 researcher 中间结果动态追加子问题。
@@ -165,7 +174,7 @@ Verifier：`src/deepresearch_agent/verifier.py`。输入是 source 列表，输�
 
 Synthesizer：`src/deepresearch_agent/llm.py` 的 `synthesize`。输入是 brief、plan、findings、sources，输出 answer 和 claims。默认 mock 会生成可测报告，DeepSeek provider 会用 JSON mode 生成 markdown answer 和结构化 claims。局限是 DeepSeek 输出目前只靠 prompt 约束和后置 citation checker，没有做二次 LLM judge 或强制 source quote。
 
-Citation Checker：`src/deepresearch_agent/citation.py`。输入是 claims 和 sources，输出 `CitationCheckReport`。关键设计是每条 claim 都落到 citation ID 和 overlap score。局限是只能做 lexical support。
+Citation Checker：`src/deepresearch_agent/citation.py`。输入是 claims 和 sources，输出 `CitationCheckReport`。每条 `CitationAssessment` 现在包含 citation IDs、`supported`、`support_level`、overlap score 和最多 3 条 `evidence_quotes`。checker 会从 cited source 里按句子找最接近 claim 的 quote，输出 `supported / partial / unsupported / unverifiable`。局限是证据定位仍基于 lexical overlap，还不是 NLI/LLM judge。
 
 Cost Tracker：`src/deepresearch_agent/cost.py`。mock provider 仍使用字符数近似估算；DeepSeek provider 已接入 API 返回的真实 `prompt_tokens` / `completion_tokens`，并通过 `CostTracker.add_usage()` 记录到同一套 `CostSummary`。当前 `deepseek-v4-flash` 成本计算按 DeepSeek 官方 Models & Pricing 页，核对日期 `2026-06-07`：input cache hit `$0.0028/1M tokens`，input cache miss `$0.14/1M tokens`，output `$0.28/1M tokens`。legacy alias 只作为 v4-flash 兼容入口使用同一价格表；未配置价格的模型会直接报错，避免 silently 用错单价。如果响应没有 token usage，DeepSeek 路径会直接失败，不会退回字符估算伪装成真实 usage。
 
@@ -283,6 +292,15 @@ Agent Run Control Plane：`src/deepresearch_agent/run_control.py` 外包现有 D
 复盘：CLI 扩展不能假设所有调用者都从 parser 进来；测试、库函数、外部脚本都可能直接传 Namespace。
 面试可能追问：为什么不改测试补字段？回答：测试补字段也可以，但生产代码更应该对可选参数缺省鲁棒，尤其是 benchmark runner 这种会被脚本复用的入口。
 
+## 问题 13：组合跑 citation/API/spine 测试时超时
+
+现象：我第一次用 `py -3.11 -m pytest tests/test_quality_and_citations.py tests/test_spine.py tests/test_api.py -q` 验证 citation grounding 时，命令在约 `124s` 超时，没有输出断言失败。
+原因：`test_spine.py` 和 `test_api.py` 会走默认 local hybrid retrieval，首次/冷启动路径会加载本地 embedding/Chroma，单个文件就可能跑到 80 秒以上；组合跑在这次命令的 timeout 预算内不够。
+排查：拆开跑后，`tests/test_quality_and_citations.py` 是 `6 passed in 0.26s`，`tests/test_spine.py` 是 `1 passed, 1 warning in 86.23s`，`tests/test_api.py` 是 `2 passed, 2 warnings in 84.51s`，说明不是 citation schema 破坏了 API。
+修复：没有改功能代码；后续验证用更大的 full test timeout，并记录 local hybrid 测试路径偏慢。
+复盘：本地 embedding/hybrid 默认路径会影响测试耗时。之后如果 CI 要稳定，可以在 API/spine 测试里显式设置 `LOCAL_RETRIEVAL_MODE=keyword` 或做 fixture 级缓存。
+面试可能追问：为什么不马上优化？回答：这次功能目标是 citation grounding，不做额外性能 refactor；但这个现象说明生产/CI 里需要索引缓存和测试模式隔离。
+
 # 7 实测数据
 
 本节所有 mock benchmark 数字只用于证明 pipeline plumbing 能端到端跑通，不能当作真实性能、真实成本或真实答案质量成果。尤其不能在面试里说“我的 DeepResearch p50 是个位数毫秒”这类话，因为这个延迟测的是本机 Python 跑 deterministic mock 的速度，换机器、换进程热身状态、换依赖版本都会变。
@@ -290,7 +308,7 @@ Agent Run Control Plane：`src/deepresearch_agent/run_control.py` 外包现有 D
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
-测试验证：`py -3.11 -m pytest -q`，最新结果 `40 passed, 2 warnings in 63.30s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 Chroma/OpenTelemetry 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `41 passed, 2 warnings in 111.07s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 Chroma/OpenTelemetry 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -305,6 +323,8 @@ Embedding provider 验证：`py -3.11 -m deepresearch_agent.validate_embeddings 
 Reranker smoke：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?" --search-provider mock --llm-provider mock --max-researchers 1 --max-results 2 --local-retrieval-mode hybrid --rerank-enabled --rerank-provider local` 成功。因为首次下载/加载 `BAAI/bge-reranker-base`，latency 达到 `279692.721ms`。这只证明可选 rerank provider 能接入，不作为常规性能指标。
 
 Web search / crawler provider smoke：`py -3.11 -m pytest tests/test_web_search_providers.py tests/test_failure_handling.py -q` 成功，`10 passed in 0.36s`，覆盖 SearxNG JSON parsing、crawler 内容替换、Jina Reader URL prefix、Jina Search JSON parsing、provider registry 和 unknown provider fail-fast。真实外网 smoke：`https://r.jina.ai/https://example.com` 返回 `200` 和 clean text，说明 Jina Reader crawler 这层能 live 访问；`--search-provider jina` 的 CLI run 成功但触发 fallback，trace error 是 `HTTP Error 401: Unauthorized`，所以 Jina Search 真实检索在当前环境未通过。SearxNG 需要 `SEARXNG_BASE_URL`，当前没有自建实例，未做 live search。
+
+Claim-level evidence grounding smoke：`py -3.11 -m pytest tests/test_quality_and_citations.py -q` 成功，`6 passed in 0.26s`；新增测试覆盖 supported claim 提取 evidence quote，以及 missing source 标成 `unverifiable`。`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?" --search-provider mock --llm-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --json` 成功，输出里的 citation assessment 已包含 `support_level="supported"` 和 `evidence_quotes`，quote 示例来自本地 source 句子 “Normal RAG retrieves context once for a single answer...”。这只证明 evidence quote plumbing 和 lexical grounding 生效，不代表语义事实校验完成。
 
 mock benchmark 原始记录：`logs/benchmark-20260606T152954Z.jsonl`。
 当前 benchmark summary：`results/benchmark_summary.json`，已被真实 DeepSeek + Wikipedia benchmark 覆盖。
@@ -365,7 +385,7 @@ benchmark 汇总：管线 plumbing 指标，mock，非真实性能。具体 late
 # 8 评测设计
 
 answer completeness：当前未做 LLM judge 或官方 Deep Research judge，只用 case success 间接衡量。LiveDRBench preview 已经能驱动完整 orchestrator 产 artifact，但 answer-quality 官方分数仍未实测。
-citation faithfulness：当前实测指标是 claim/source lexical overlap。mock plumbing run 平均 retention 是 `1.0`，只能说明 mock 引用链路没断；最新 DeepSeek v4-flash + Wikipedia 对比里，keyword baseline 平均 retention 是 `0.8867`，local hybrid 是 `0.8929`，但 hybrid success_rate 更低，说明不能只看均值。
+citation faithfulness：当前实测指标仍以 claim/source lexical overlap 为基础，但已经从单一分数升级到 `support_level` 和 `evidence_quotes`。mock plumbing run 平均 retention 是 `1.0`，只能说明 mock 引用链路没断；最新 DeepSeek v4-flash + Wikipedia 对比里，keyword baseline 平均 retention 是 `0.8867`，local hybrid 是 `0.8929`，但 hybrid success_rate 更低，说明不能只看均值。下一步才是 LLM judge / NLI entailment。
 retrieval quality：端到端 benchmark 里的 citation_retention 会受 LLM 和 search 波动影响，所以我新增了 BEIR/scifact 独立检索评测，直接用 qrels 计算 Recall@10、nDCG@10、MRR。当前真实结果是 keyword `0.6000/0.4823/0.4548`，hybrid `0.8239/0.6597/0.6114`，hybrid+rerank `0.8239/0.7307/0.7083`。
 source diversity：当前记录 deduped_source_count，也记录 local retrieval metadata 里的 keyword/vector/rerank rank；但还没有按 domain/provider 多样性和人工相关性打分。
 hallucination rate：当前用 unsupported citation count 作为 proxy，不能覆盖无引用幻觉。

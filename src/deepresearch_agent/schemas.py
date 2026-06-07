@@ -55,12 +55,21 @@ class Finding(BaseModel):
     sources: list[Source]
 
 
+class EvidenceQuote(BaseModel):
+    source_id: str
+    source_title: str
+    quote: str
+    overlap_score: float
+
+
 class CitationAssessment(BaseModel):
     claim: str
     citation_ids: list[str]
     supported: bool
+    support_level: Literal["supported", "partial", "unsupported", "unverifiable"] = "unsupported"
     reason: str
     overlap_score: float
+    evidence_quotes: list[EvidenceQuote] = Field(default_factory=list)
 
 
 class CitationCheckReport(BaseModel):
