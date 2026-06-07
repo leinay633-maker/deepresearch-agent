@@ -220,6 +220,15 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 代价：这不是完整 OpenTelemetry instrumentation，没有上下文传播、采样、batch processor、metrics/logs pipeline、LangSmith run tree 或线上 collector 验证；当前只验证了本地 HTTP test server 收到 OTLP 风格 JSON。
 面试怎么答：我会说我先把 trace 从“只能本地看”推进到“可以接 collector 的出口”，但仍保留 JSONL 作为默认和兜底，不把它包装成完整可观测平台。
 
+## 决策 22：为什么 citation judge 默认关闭，但做成可切换 provider
+
+背景：原来的 `CitationChecker` 已能找 citation ID、evidence quote 和 lexical support_level，但 lexical overlap 不能判断语义蕴含、反义或复杂跨句支撑。直接把 LLM judge 默认打开会改变历史 benchmark 口径，并引入额外成本、延迟和 judge 自身不稳定。
+可选方案：继续只做 lexical；默认启用 LLM judge；新增本地 heuristic judge；做 provider 抽象，默认 none，显式启用 heuristic/deepseek。
+最终选择：新增 `src/deepresearch_agent/citation_judge.py`，提供 `HeuristicCitationJudgeProvider` 和 `DeepSeekCitationJudgeProvider`；`CitationChecker.check()` 接收可选 judge provider 和 cost tracker。默认 `CITATION_JUDGE_PROVIDER=none`，CLI/benchmark/public eval 可以显式传 `--citation-judge-provider heuristic|deepseek`。
+理由：默认不改变既有结果；无 key 环境可以用 heuristic smoke 验证 judge plumbing；有 `DEEPSEEK_API_KEY` 时可以用 DeepSeek JSON mode 做 claim/evidence 判断，并把 usage 计入 `citation_judge` 成本阶段。
+代价：heuristic judge 本质仍是 overlap；DeepSeek judge 目前只用 stub 测了解析和 usage 成本，没有做真实 live benchmark，也没有 NLI 模型、人工标注集或 judge 可靠性评估。
+面试怎么答：我会说 citation faithfulness 现在是两层结构：默认 lexical 负责便宜可复现，optional judge 负责语义评审接口；我不会声称 LLM judge 已经实测提升质量。
+
 # 5 实现细节
 
 Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。`ResearchRequest.planner_model` 或 `LLM_PLANNER_MODEL` 可以覆盖 planning stage 的模型名。局限是 planner 还不会根据 researcher 中间结果做 LLM 语义级动态追加子问题。
@@ -250,7 +259,9 @@ Verifier：`src/deepresearch_agent/verifier.py`。输入是 source 列表，输�
 
 Synthesizer：`src/deepresearch_agent/llm.py` 的 `synthesize`。输入是 brief、plan、findings、sources，输出 answer 和 claims。默认 mock 会生成可测报告，DeepSeek provider 会用 JSON mode 生成 markdown answer 和结构化 claims。局限是 DeepSeek 输出目前只靠 prompt 约束和后置 citation checker，没有做二次 LLM judge 或强制 source quote。
 
-Citation Checker：`src/deepresearch_agent/citation.py`。输入是 claims 和 sources，输出 `CitationCheckReport`。每条 `CitationAssessment` 现在包含 citation IDs、`supported`、`support_level`、overlap score 和最多 3 条 `evidence_quotes`。checker 会从 cited source 里按句子找最接近 claim 的 quote，输出 `supported / partial / unsupported / unverifiable`。局限是证据定位仍基于 lexical overlap，还不是 NLI/LLM judge。
+Citation Checker：`src/deepresearch_agent/citation.py`。输入是 claims 和 sources，输出 `CitationCheckReport`。每条 `CitationAssessment` 现在包含 citation IDs、`supported`、`support_level`、overlap score、最多 3 条 `evidence_quotes`，以及可选 judge metadata。checker 会从 cited source 里按句子找最接近 claim 的 quote，输出 `supported / partial / unsupported / unverifiable`。默认仍是 lexical grounding；启用 judge 后，judge verdict 会覆盖最终 support_level，并保留 `judge_provider`、`judge_model`、`judge_confidence`、`judge_reason`。
+
+Citation Judge Provider：`src/deepresearch_agent/citation_judge.py`。输入是 claim 和 evidence quotes，输出 `CitationJudgeResult`。`HeuristicCitationJudgeProvider` 完全本地运行、无 key；`DeepSeekCitationJudgeProvider` 调 DeepSeek JSON mode，要求返回 `verdict/confidence/reason`，并用 DeepSeek usage 字段估算 `citation_judge` 成本。`orchestrator.py` 和 `run_control.py` 都通过 `build_citation_judge_provider()` 接入，所以 `/research`、CLI、`/runs` 和 eval runner 的语义一致。局限是真实 DeepSeek judge 尚未 live benchmark，也没有 judge agreement 评测。
 
 Report Exporter：`src/deepresearch_agent/report_exporter.py`。输入是 `StructuredReport`，输出 Markdown、HTML、JSON 文件路径。Markdown/HTML 会展开 answer、sources、citation assessments 和 evidence quotes；JSON 保存完整 `model_dump(mode="json")`，方便后续二次处理。CLI 通过 `--export-dir` 和 `--export-formats` 调用它；`--json` 模式下导出路径写到 stderr，避免污染 stdout JSON。
 
@@ -432,6 +443,23 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 复盘：可观测性要先保证“不影响业务路径”。我没有为了贴 OpenTelemetry 标签引入完整 SDK，而是先把现有 trace event 做成可外送的稳定接口。
 面试可能追问：这算 OpenTelemetry 吗？回答：它是 OTLP HTTP traces 的轻量出口，不是完整 OTel SDK 接入；如果生产化，我会换成官方 SDK + batch processor + collector 配置。
 
+## 问题 20：citation judge 容易改变历史 benchmark 口径
+
+现象：实现 citation judge 时，如果直接默认启用，会让 `citation_retention_rate` 从 lexical overlap 口径变成 judge verdict 口径，历史 `results/benchmark_summary.json` 和 retrieval 对比就不能直接比较。
+工程风险：LLM judge 会增加成本和延迟，还可能因为 judge 本身输出波动改变 success_rate；如果不写清楚，面试时会把“引用检查口径变了”误讲成“质量提升了”。
+修复：默认 `CITATION_JUDGE_PROVIDER=none`，历史 benchmark 口径不变；只有显式传 `--citation-judge-provider heuristic|deepseek` 才启用。benchmark 和 public eval 的 config snapshot 会记录 citation judge provider/model。
+复盘：评测系统里，指标定义比实现更重要。新增 judge 是能力边界，不是自动替换已有指标。
+面试可能追问：现在的 citation_retention 和 judge 分数怎么比较？回答：不能混着比；要把 lexical baseline、heuristic judge、DeepSeek judge 分成不同口径重新跑。
+
+## 问题 21：public eval 测试暴露 argparse Namespace 兼容性问题
+
+现象：新增 `citation_judge_provider` 字段后，`tests/test_deep_research_eval.py` 里手工构造的 `argparse.Namespace` 没有这个属性，第一次跑相关测试失败，报 `AttributeError: 'Namespace' object has no attribute 'citation_judge_provider'`。
+原因：脚本真实 CLI 会由 parser 注入新字段，但单测和其他程序化调用可能传入旧 Namespace。
+排查：失败栈指向 `deep_research_eval.py` 的 `replace(settings, citation_judge_provider=args.citation_judge_provider, ...)`。
+修复：`benchmark.py` 和 `deep_research_eval.py` 都改成 `getattr(args, "citation_judge_provider", None)` / `getattr(args, "citation_judge_model", None)`，缺字段时回落到 Settings。
+复盘：CLI 增参不能只考虑命令行路径，测试和程序化调用也需要兼容。
+面试可能追问：为什么不直接改测试？回答：测试暴露的是兼容性风险；修业务代码比让所有调用方同步加字段更稳。
+
 # 7 实测数据
 
 本节所有 mock benchmark 数字只用于证明 pipeline plumbing 能端到端跑通，不能当作真实性能、真实成本或真实答案质量成果。尤其不能在面试里说“我的 DeepResearch p50 是个位数毫秒”这类话，因为这个延迟测的是本机 Python 跑 deterministic mock 的速度，换机器、换进程热身状态、换依赖版本都会变。
@@ -439,7 +467,7 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
-测试验证：`py -3.11 -m pytest -q`，最新结果 `60 passed, 2 warnings in 60.02s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `64 passed, 2 warnings in 59.66s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -472,6 +500,8 @@ Stage model routing smoke：`py -3.11 -m pytest tests/test_stage_models.py -q` �
 Report exporter smoke：`py -3.11 -m pytest tests/test_report_exporter.py -q` 成功，`3 passed in 0.33s`。测试覆盖 Markdown/HTML/JSON 三种文件写出、HTML answer 内容转义、未知格式报错。CLI smoke：`py -3.11 -m deepresearch_agent.cli "How should report export work?" --llm-provider mock --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --export-dir <temp> --export-formats markdown,html,json` 成功，在临时目录生成 `3ad3725ca515.md`、`3ad3725ca515.html`、`3ad3725ca515.json`。这只验证本地 artifact 导出，不代表 PDF/DOCX/PPT 已实现。
 
 Trace exporter smoke：`py -3.11 -m pytest tests/test_tracing_exporter.py -q` 成功，`3 passed in 0.90s`。测试覆盖 `OtlpHttpTraceExporter` 向本地 HTTP server 的 `/v1/traces` POST、`build_trace_exporter()` 读取 OTLP 配置、以及 exporter 抛错时 `TraceLogger` 仍写 JSONL 并追加 `trace_exporter` error event。这里没有接真实 collector、LangSmith 或线上 APM。
+
+Citation judge smoke：`py -3.11 -m pytest tests/test_citation_judge.py tests/test_quality_and_citations.py -q` 成功，`10 passed in 0.54s`。测试覆盖 fake judge 覆盖 verdict 并记录 `citation_judge` cost、heuristic judge 无 key 返回 `unverifiable`、DeepSeek judge stub 解析 `verdict/confidence/reason` 与 usage 成本、以及 orchestrator 配置 `citation_judge_provider="heuristic"` 后 assessment 带 `judge_provider="heuristic"`。相关集成回归：`py -3.11 -m pytest tests/test_citation_judge.py tests/test_quality_and_citations.py tests/test_spine.py tests/test_run_control.py tests/test_deep_research_eval.py -q` 成功，`27 passed, 2 warnings in 50.94s`。CLI smoke：`py -3.11 -m deepresearch_agent.cli "How should citation judges work?" --llm-provider mock --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --citation-judge-provider heuristic --json` 成功，输出包含 `judge_provider="heuristic"` 和 `success=true`。这里没有真实调用 DeepSeek citation judge，也没有重跑 benchmark。
 
 mock benchmark 原始记录：`logs/benchmark-20260606T152954Z.jsonl`。
 当前 benchmark summary：`results/benchmark_summary.json`，已被真实 DeepSeek + Wikipedia benchmark 覆盖。
@@ -527,12 +557,12 @@ benchmark 汇总：管线 plumbing 指标，mock，非真实性能。具体 late
 
 这条公开真实 case 的 query 是让系统根据 `American Community Survey / FEMA Harvey flood depths / USDA Food Access Research Atlas / Streetlight / SafeGraph POI` 找使用全部数据集的论文，并按 JSON 返回 `paper_title`。真实组没有报错，也没有 fallback，但 success 为 0，说明当前 DeepSeek + Wikipedia + 本地 keyword RAG 没有解决这类公开精确查证任务；citation retention 只有 `0.5`，也说明 lexical citation check 已经暴露支撑不足。面试里我会把它讲成“公开评测入口已经打通，但质量短板被暴露出来”，不会把 mock 组的 `1.0` 当质量成果。
 
-未实测：LiveDRBench/Deep Research Bench 官方 judge 分数、真实搜索 API 高并发限流、语义级 citation faithfulness、Redis/PostgreSQL 缓存、真实 OpenTelemetry collector / LangSmith tracing、真实用户流量、DashScope 真实 embedding/rerank、rerank 5 case 全量 benchmark。
+未实测：LiveDRBench/Deep Research Bench 官方 judge 分数、真实搜索 API 高并发限流、DeepSeek citation judge live benchmark、Redis/PostgreSQL 缓存、真实 OpenTelemetry collector / LangSmith tracing、真实用户流量、DashScope 真实 embedding/rerank、rerank 5 case 全量 benchmark。
 
 # 8 评测设计
 
 answer completeness：当前未做 LLM judge 或官方 Deep Research judge，只用 case success 间接衡量。LiveDRBench preview 已经能驱动完整 orchestrator 产 artifact，但 answer-quality 官方分数仍未实测。
-citation faithfulness：当前实测指标仍以 claim/source lexical overlap 为基础，但已经从单一分数升级到 `support_level` 和 `evidence_quotes`。mock plumbing run 平均 retention 是 `1.0`，只能说明 mock 引用链路没断；最新 DeepSeek v4-flash + Wikipedia 对比里，keyword baseline 平均 retention 是 `0.8867`，local hybrid 是 `0.8929`，但 hybrid success_rate 更低，说明不能只看均值。下一步才是 LLM judge / NLI entailment。
+citation faithfulness：当前提交过的 benchmark 指标仍以 claim/source lexical overlap 为基础，但已经从单一分数升级到 `support_level`、`evidence_quotes`，并新增可选 citation judge provider。mock plumbing run 平均 retention 是 `1.0`，只能说明 mock 引用链路没断；最新 DeepSeek v4-flash + Wikipedia 对比里，keyword baseline 平均 retention 是 `0.8867`，local hybrid 是 `0.8929`，但 hybrid success_rate 更低，说明不能只看均值。DeepSeek citation judge 还没有真实 benchmark，不能把它当成已验证质量提升。
 retrieval quality：端到端 benchmark 里的 citation_retention 会受 LLM 和 search 波动影响，所以我新增了 BEIR/scifact 独立检索评测，直接用 qrels 计算 Recall@10、nDCG@10、MRR。当前真实结果是 keyword `0.6000/0.4823/0.4548`，hybrid `0.8239/0.6597/0.6114`，hybrid+rerank `0.8239/0.7307/0.7083`。
 source diversity：当前记录 deduped_source_count，也记录 local retrieval metadata 里的 keyword/vector/rerank rank；但还没有按 domain/provider 多样性和人工相关性打分。
 hallucination rate：当前用 unsupported citation count 作为 proxy，不能覆盖无引用幻觉。
@@ -584,7 +614,7 @@ multi-hop / reflection 成功率：当前没有真实 multi-hop 标注集，未�
 
 真实 LLM provider 覆盖还窄：当前只接了 DeepSeek v4-flash 及其兼容 alias，并支持 brief/planner/synthesis 的阶段模型覆盖，但一个 provider 不能代表所有模型/价格/限流行为。可行方案是继续实现 OpenAI/Anthropic/OpenRouter/Ollama 等 provider，并统一 structured output、usage 解析、重试、模型定价表、动态降级和测试替身。工程代价是 API key、价格、限流、错误码差异和 CI mock。面试怎么讲：我会说我已经把真实 provider 接入路径和阶段模型路由打通，但不会把单 provider 小样本夸成通用生产能力。
 
-Citation checker 语义能力弱：当前问题是 lexical overlap 只能拦明显错引。可行方案是加 LLM judge、NLI 模型或 sentence embedding entailment。工程代价是成本、延迟和 judge 可靠性评估。面试怎么讲：我会说现在是 CI 友好的第一道闸，不是最终事实评审。
+Citation checker 语义能力仍需实测：当前已经有可选 heuristic / DeepSeek citation judge provider，但默认 benchmark 仍是 lexical overlap，DeepSeek judge 没有 live 跑完整评测。可行方案是用公开/人工标注 claim-evidence 集测 judge agreement，再接 NLI 模型或 sentence embedding entailment。工程代价是成本、延迟、标注和 judge 可靠性评估。面试怎么讲：我会说现在是“lexical baseline + optional judge 接口”，不是最终事实评审。
 
 Wikipedia 不是专业 search provider：当前问题是真实 adapter 能跑但相关性和覆盖有限。可行方案是接 Tavily/Brave/SerpAPI 或自建 SearxNG。工程代价是 key、限流、费用和 provider schema 差异。面试怎么讲：我会强调 adapter 已经抽象好，替换 provider 不影响 orchestrator。
 

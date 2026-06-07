@@ -77,6 +77,10 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
         llm_brief_model=stage_models["brief_generation"] or settings.llm_brief_model,
         llm_planner_model=stage_models["planning"] or settings.llm_planner_model,
         llm_synthesis_model=stage_models["synthesis"] or settings.llm_synthesis_model,
+        citation_judge_provider=getattr(args, "citation_judge_provider", None)
+        or settings.citation_judge_provider,
+        citation_judge_model=getattr(args, "citation_judge_model", None)
+        or settings.citation_judge_model,
     )
     config_snapshot = {
         "benchmark_name": args.benchmark_name,
@@ -101,6 +105,8 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
         "reflection_enabled": reflection_enabled,
         "max_reflection_rounds": max_reflection_rounds,
         "reflection_min_sources": reflection_min_sources,
+        "citation_judge_provider": effective_settings.citation_judge_provider,
+        "citation_judge_model": effective_settings.citation_judge_model,
         "judge_provider": args.judge_provider,
         "official_judge_score": "not_run",
         "settings": {
@@ -221,6 +227,8 @@ async def _run_case(
         reflection_enabled=getattr(args, "reflection_enabled", False),
         max_reflection_rounds=getattr(args, "max_reflection_rounds", 1),
         reflection_min_sources=getattr(args, "reflection_min_sources", 4),
+        citation_judge_provider=settings.citation_judge_provider,
+        citation_judge_model=settings.citation_judge_model,
     )
     try:
         report = await DeepResearchOrchestrator(settings=settings).run(request)
@@ -475,6 +483,12 @@ def main() -> None:
     parser.add_argument("--reflection-enabled", action="store_true")
     parser.add_argument("--max-reflection-rounds", type=int, default=1)
     parser.add_argument("--reflection-min-sources", type=int, default=4)
+    parser.add_argument(
+        "--citation-judge-provider",
+        choices=["none", "heuristic", "deepseek"],
+        default=None,
+    )
+    parser.add_argument("--citation-judge-model", default=None)
     parser.add_argument("--searxng-base-url", default=None)
     parser.add_argument("--web-crawler-provider", choices=["none", "jina", "jina_reader"], default=None)
     parser.add_argument("--jina-reader-base-url", default=None)

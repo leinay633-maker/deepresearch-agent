@@ -24,6 +24,8 @@ class ResearchRequest(BaseModel):
     reflection_enabled: bool = False
     max_reflection_rounds: int = Field(default=1, ge=0, le=3)
     reflection_min_sources: int = Field(default=4, ge=1, le=20)
+    citation_judge_provider: str | None = None
+    citation_judge_model: str | None = None
 
 
 class ResearchBrief(BaseModel):
@@ -76,6 +78,10 @@ class CitationAssessment(BaseModel):
     reason: str
     overlap_score: float
     evidence_quotes: list[EvidenceQuote] = Field(default_factory=list)
+    judge_provider: str | None = None
+    judge_model: str | None = None
+    judge_confidence: float | None = None
+    judge_reason: str | None = None
 
 
 class CitationCheckReport(BaseModel):

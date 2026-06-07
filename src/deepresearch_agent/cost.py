@@ -93,10 +93,11 @@ class CostTracker:
         output_tokens: int,
         estimated_cost_usd: float,
         model: str | None = None,
+        provider: str | None = None,
     ) -> CostRecord:
         record = CostRecord(
             stage=stage,
-            provider=self.provider,
+            provider=provider or self.provider,
             model=model or self.model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,

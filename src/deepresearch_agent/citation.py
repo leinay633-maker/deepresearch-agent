@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 
+from deepresearch_agent.citation_judge import CitationJudgeProvider
+from deepresearch_agent.cost import CostTracker
 from deepresearch_agent.schemas import CitationAssessment, CitationCheckReport, EvidenceQuote, Source
 
 
@@ -30,7 +32,13 @@ class CitationChecker:
     def __init__(self, min_overlap: float = 0.08) -> None:
         self.min_overlap = min_overlap
 
-    def check(self, claims: list[str], sources: list[Source]) -> CitationCheckReport:
+    def check(
+        self,
+        claims: list[str],
+        sources: list[Source],
+        judge_provider: CitationJudgeProvider | None = None,
+        cost: CostTracker | None = None,
+    ) -> CitationCheckReport:
         source_by_id = {source.id: source for source in sources}
         assessments: list[CitationAssessment] = []
         for claim in claims:
@@ -63,17 +71,18 @@ class CitationChecker:
                 min_overlap=self.min_overlap,
             )
             supported = support_level == "supported"
-            assessments.append(
-                CitationAssessment(
-                    claim=claim,
-                    citation_ids=citation_ids,
-                    supported=supported,
-                    support_level=support_level,
-                    reason=reason,
-                    overlap_score=round(best_overlap, 3),
-                    evidence_quotes=evidence_quotes[:3],
-                )
+            assessment = CitationAssessment(
+                claim=claim,
+                citation_ids=citation_ids,
+                supported=supported,
+                support_level=support_level,
+                reason=reason,
+                overlap_score=round(best_overlap, 3),
+                evidence_quotes=evidence_quotes[:3],
             )
+            if judge_provider is not None:
+                assessment = _apply_judge(assessment, judge_provider, cost)
+            assessments.append(assessment)
         supported_count = sum(1 for item in assessments if item.supported)
         total = len(assessments)
         retention = supported_count / total if total else 1.0
@@ -131,6 +140,34 @@ def _support_level(
     if missing_citations:
         return "unverifiable", "some cited source IDs are missing and no cited text grounds the claim"
     return "unsupported", "citation is present but cited source text does not ground the claim"
+
+
+def _apply_judge(
+    assessment: CitationAssessment,
+    judge_provider: CitationJudgeProvider,
+    cost: CostTracker | None,
+) -> CitationAssessment:
+    judgment = judge_provider.judge(assessment.claim, assessment.evidence_quotes)
+    if cost is not None and judgment.input_tokens + judgment.output_tokens > 0:
+        cost.add_usage(
+            stage="citation_judge",
+            input_tokens=judgment.input_tokens,
+            output_tokens=judgment.output_tokens,
+            estimated_cost_usd=judgment.estimated_cost_usd,
+            provider=judgment.provider,
+            model=judgment.model,
+        )
+    return assessment.model_copy(
+        update={
+            "supported": judgment.verdict == "supported",
+            "support_level": judgment.verdict,
+            "reason": f"{assessment.reason}; judge verdict: {judgment.reason}",
+            "judge_provider": judgment.provider,
+            "judge_model": judgment.model,
+            "judge_confidence": judgment.confidence,
+            "judge_reason": judgment.reason,
+        }
+    )
 
 
 def _claim_tokens(claim: str) -> set[str]:

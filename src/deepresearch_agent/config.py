@@ -28,6 +28,9 @@ class Settings:
     llm_brief_model: str = ""
     llm_planner_model: str = ""
     llm_synthesis_model: str = ""
+    citation_judge_provider: str = "none"
+    citation_judge_model: str = "deepseek-v4-flash"
+    citation_judge_timeout_seconds: float = 30.0
     embedding_provider: str = "local"
     local_embedding_model: str = "BAAI/bge-small-zh-v1.5"
     dashscope_embedding_model: str = "text-embedding-v4"
@@ -115,6 +118,13 @@ def load_settings() -> Settings:
         llm_brief_model=os.getenv("LLM_BRIEF_MODEL", "").strip(),
         llm_planner_model=os.getenv("LLM_PLANNER_MODEL", "").strip(),
         llm_synthesis_model=os.getenv("LLM_SYNTHESIS_MODEL", "").strip(),
+        citation_judge_provider=os.getenv("CITATION_JUDGE_PROVIDER", "none").strip().lower()
+        or "none",
+        citation_judge_model=(
+            os.getenv("CITATION_JUDGE_MODEL", "deepseek-v4-flash").strip()
+            or "deepseek-v4-flash"
+        ),
+        citation_judge_timeout_seconds=_float_env("CITATION_JUDGE_TIMEOUT_SECONDS", 30.0),
         embedding_provider=os.getenv("EMBEDDING_PROVIDER", "local").strip().lower()
         or "local",
         local_embedding_model=(

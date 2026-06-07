@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from deepresearch_agent.citation import CitationChecker
+from deepresearch_agent.citation_judge import build_citation_judge_provider
 from deepresearch_agent.config import Settings, load_settings
 from deepresearch_agent.cost import CostTracker
 from deepresearch_agent.dedup import SourceDeduplicator
@@ -131,7 +132,12 @@ class DeepResearchOrchestrator:
         )
 
         stage_start = trace.now()
-        citation_report = self.citation_checker.check(claims, sources)
+        citation_report = self.citation_checker.check(
+            claims,
+            sources,
+            judge_provider=self._build_citation_judge_provider(request),
+            cost=cost,
+        )
         await self._record(
             trace,
             "citation_check",
@@ -188,6 +194,13 @@ class DeepResearchOrchestrator:
             "synthesis": request.synthesis_model or self.settings.llm_synthesis_model,
         }
         return {stage: model for stage, model in candidates.items() if model}
+
+    def _build_citation_judge_provider(self, request: ResearchRequest):
+        return build_citation_judge_provider(
+            self.settings,
+            provider_name=request.citation_judge_provider,
+            model=request.citation_judge_model,
+        )
 
     async def _research_one(
         self,

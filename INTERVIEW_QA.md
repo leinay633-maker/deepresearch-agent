@@ -353,7 +353,7 @@
 [状态: 待消化]
 标签：Mock / 限制
 检索关键词：mock synthesis, deterministic
-回答：默认 mock 报告仍然比较模板化，这是为了保证离线测试和 mock plumbing benchmark 稳定。真实写作路径已经接入 DeepSeek，但我不会把它说成完全解决了幻觉，因为现在主要靠 prompt 约束和后置 lexical citation checker，还没有 LLM judge 或语义 entailment。
+回答：默认 mock 报告仍然比较模板化，这是为了保证离线测试和 mock plumbing benchmark 稳定。真实写作路径已经接入 DeepSeek，但我不会把它说成完全解决了幻觉，因为默认仍主要靠 prompt 约束和后置 lexical citation checker。现在有可选 DeepSeek citation judge provider，但还没有真实 benchmark 证明它提升质量。
 关联模块：`llm.py`
 可追问：
 1. 面试时会不会被认为太简单？
@@ -387,13 +387,24 @@
 ## Q：Citation Checker 怎么工作？
 [状态: 待消化]
 标签：Citation / Faithfulness
-检索关键词：CitationChecker, overlap, evidence quote, support_level
-回答：`CitationChecker` 从 claim 里提取 `[S1]` 这种 citation ID，找到对应 source，然后在 source content 里按句子找最接近 claim 的 evidence quote。输出里既保留 `supported` 和 overlap score，也新增 `support_level`：supported、partial、unsupported、unverifiable。这样我不只是知道 retention，还能看到 claim 到底被哪段 source text 支撑。它仍然是 lexical grounding，不是最终语义 judge。
-关联模块：`citation.py`, `schemas.py`
+检索关键词：CitationChecker, overlap, evidence quote, support_level, citation judge
+回答：`CitationChecker` 从 claim 里提取 `[S1]` 这种 citation ID，找到对应 source，然后在 source content 里按句子找最接近 claim 的 evidence quote。默认输出 `supported`、overlap score、`support_level` 和 evidence quotes。现在还可以显式启用 citation judge provider：`heuristic` 本地无 key，`deepseek` 调 DeepSeek JSON mode，judge verdict 会写进 assessment 的 `judge_provider`、`judge_confidence`、`judge_reason` 并覆盖最终 support_level。默认仍是 lexical，避免历史 benchmark 口径被悄悄改掉。
+关联模块：`citation.py`, `citation_judge.py`, `schemas.py`
 可追问：
-1. 为什么不用 LLM judge？
+1. 为什么不默认开 LLM judge？
 2. overlap 阈值是多少？
 3. 中文怎么处理？
+
+## Q：LLM citation judge 做到什么程度？
+[状态: 待消化]
+标签：Citation / LLM Judge
+检索关键词：CitationJudgeProvider, DeepSeekCitationJudgeProvider
+回答：我新增了 `citation_judge.py`，把 citation judge 做成 provider：默认 `none`，本地 `heuristic` 无 key，`deepseek` 会用 DeepSeek JSON mode 判断 claim 是否被 evidence quotes 支撑。它会返回 verdict、reason、confidence，并把 DeepSeek usage 记到 `citation_judge` 成本阶段。当前只做了 stub 单测和 heuristic orchestrator smoke，没有真实 DeepSeek judge benchmark，所以我不会说它已经提升了 citation faithfulness。
+关联模块：`citation_judge.py`, `citation.py`, `cost.py`, `benchmark.py`
+可追问：
+1. judge 会不会也幻觉？
+2. judge 成本怎么记？
+3. 怎么评估 judge 可靠性？
 
 ## Q：citation_retention_rate 是什么？
 [状态: 待消化]
@@ -421,8 +432,8 @@
 [状态: 待消化]
 标签：Citation / 局限
 检索关键词：lexical overlap limitation
-回答：最大风险仍然是 lexical overlap 不等于语义支持。现在我已经加了 evidence quote 和 support_level，能让人复查“系统认为哪段话支撑 claim”，但它还不能判断反义、讽刺、复杂表格和跨句蕴含。所以我把它定位成便宜、可 CI 化的第一层 grounding，不把它包装成最终事实验证。
-关联模块：`citation.py`, `KNOWLEDGE_BASE.md`
+回答：最大风险仍然是 lexical overlap 不等于语义支持。现在我已经加了 evidence quote、support_level 和可选 citation judge provider，能让人复查“系统认为哪段话支撑 claim”，也能把 LLM judge 接进来。但 DeepSeek judge 还没有真实 benchmark，heuristic 也仍是 overlap，所以我把它定位成 grounding 框架升级，不包装成最终事实验证。
+关联模块：`citation.py`, `citation_judge.py`, `KNOWLEDGE_BASE.md`
 可追问：
 1. 怎么升级到语义级？
 2. LLM judge 会不会也幻觉？
@@ -713,8 +724,8 @@
 [状态: 待消化]
 标签：局限 / 诚实表达
 检索关键词：limitations, real LLM, semantic evaluation
-回答：最大短板已经不是“完全没有真实 LLM”，而是公开真实任务上的质量还没站住：DeepSeek v4-flash 只接了一个 provider，Wikipedia 不是生产级搜索，LiveDRBench preview 的 1 条真实样本已经跑通但 `success_rate=0.0`，而 citation checker 仍只是 lexical overlap。现在我会主动说：公开评测 artifact 入口已经有了，但官方 judge、网页 crawler、语义级 grounding 和多 provider 还没完成。
-关联模块：`llm.py`, `search.py`, `citation.py`, `deep_research_eval.py`, `KNOWLEDGE_BASE.md`
+回答：最大短板已经不是“完全没有真实 LLM”，而是公开真实任务上的质量还没站住：DeepSeek v4-flash 只接了一个 provider，Wikipedia 不是生产级搜索，LiveDRBench preview 的 1 条真实样本已经跑通但 `success_rate=0.0`。citation 现在有 lexical baseline 和可选 DeepSeek judge provider，但 judge 还没有真实 benchmark。现在我会主动说：公开评测 artifact 入口已经有了，但官方 judge、网页 crawler、语义级 grounding 评测和多 provider 还没完成。
+关联模块：`llm.py`, `search.py`, `citation.py`, `citation_judge.py`, `deep_research_eval.py`, `KNOWLEDGE_BASE.md`
 可追问：
 1. 下一步先补哪个？
 2. 怎么接 OpenAI？

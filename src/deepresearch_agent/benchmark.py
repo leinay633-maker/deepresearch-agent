@@ -63,6 +63,10 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         llm_brief_model=stage_models["brief_generation"] or settings.llm_brief_model,
         llm_planner_model=stage_models["planning"] or settings.llm_planner_model,
         llm_synthesis_model=stage_models["synthesis"] or settings.llm_synthesis_model,
+        citation_judge_provider=getattr(args, "citation_judge_provider", None)
+        or settings.citation_judge_provider,
+        citation_judge_model=getattr(args, "citation_judge_model", None)
+        or settings.citation_judge_model,
     )
     settings_snapshot = asdict(effective_settings)
     settings_snapshot["llm_model"] = effective_llm_model
@@ -94,6 +98,8 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "reflection_enabled": reflection_enabled,
         "max_reflection_rounds": max_reflection_rounds,
         "reflection_min_sources": reflection_min_sources,
+        "citation_judge_provider": effective_settings.citation_judge_provider,
+        "citation_judge_model": effective_settings.citation_judge_model,
     }
 
     with raw_path.open("w", encoding="utf-8") as file:
@@ -113,6 +119,8 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 reflection_enabled=reflection_enabled,
                 max_reflection_rounds=max_reflection_rounds,
                 reflection_min_sources=reflection_min_sources,
+                citation_judge_provider=effective_settings.citation_judge_provider,
+                citation_judge_model=effective_settings.citation_judge_model,
             )
             report = await DeepResearchOrchestrator(settings=effective_settings).run(request)
             record = {
@@ -279,6 +287,12 @@ def main() -> None:
     parser.add_argument("--reflection-enabled", action="store_true")
     parser.add_argument("--max-reflection-rounds", type=int, default=1)
     parser.add_argument("--reflection-min-sources", type=int, default=4)
+    parser.add_argument(
+        "--citation-judge-provider",
+        choices=["none", "heuristic", "deepseek"],
+        default=None,
+    )
+    parser.add_argument("--citation-judge-model", default=None)
     args = parser.parse_args()
     summary = asyncio.run(run_benchmark(args))
     print(json.dumps(summary, ensure_ascii=False, indent=2))

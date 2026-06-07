@@ -28,6 +28,8 @@ async def _run(args: argparse.Namespace) -> int:
         reflection_enabled=args.reflection_enabled,
         max_reflection_rounds=args.max_reflection_rounds,
         reflection_min_sources=args.reflection_min_sources,
+        citation_judge_provider=args.citation_judge_provider,
+        citation_judge_model=args.citation_judge_model,
     )
     report = await DeepResearchOrchestrator(settings=settings).run(request)
     if args.json:
@@ -109,6 +111,12 @@ def main() -> None:
     parser.add_argument("--reflection-enabled", action="store_true")
     parser.add_argument("--max-reflection-rounds", type=int, default=1)
     parser.add_argument("--reflection-min-sources", type=int, default=4)
+    parser.add_argument(
+        "--citation-judge-provider",
+        default=None,
+        help="Optional citation judge provider: none, heuristic, deepseek.",
+    )
+    parser.add_argument("--citation-judge-model", default=None)
     parser.add_argument("--seed", type=int, default=20260606)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--export-dir", default=None)

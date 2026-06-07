@@ -66,6 +66,14 @@ py -3.11 -m deepresearch_agent.cli "How should trace export work?" --llm-provide
 
 默认 `TRACE_EXPORTER=jsonl`，只写本地 `logs/research-<run_id>.jsonl`。`otlp_http` 会把每个 trace event 额外 POST 到 `<endpoint>/v1/traces`；export 失败只写本地 `trace_exporter` error event，不中断 research run。
 
+可选启用 citation judge：
+
+```powershell
+py -3.11 -m deepresearch_agent.cli "How should citation judges work?" --llm-provider mock --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --citation-judge-provider heuristic
+```
+
+默认 `CITATION_JUDGE_PROVIDER=none`，保持原来的 lexical citation checker 口径。`heuristic` 是本地无 key judge；`deepseek` 会调用 DeepSeek JSON mode，key 仍只从 `DEEPSEEK_API_KEY` 读取，并把 judge usage 计入 `citation_judge` 成本阶段。
+
 创建可审核的长任务 run，并在 planner 后 approve 继续：
 
 ```powershell
@@ -174,6 +182,12 @@ Local retrieval：
 - rerank provider 默认 `local`，模型是 `BAAI/bge-reranker-base`，但 `--rerank-enabled` 才会启用；也可以显式切到 DashScope rerank。
 - 持久化向量索引默认关闭；设置 `LOCAL_VECTOR_INDEX_PERSIST=true` 后会把 Chroma index 写到 `LOCAL_VECTOR_INDEX_PATH`（默认 `data/vector_index`，已 gitignore），按 corpus + embedding provider + model 指纹复用 collection。
 
+Citation judge：
+
+- `none`：默认，只使用 lexical citation checker，保持 benchmark 旧口径。
+- `heuristic`：本地无 key judge，基于 evidence quote overlap 给出 supported / partial / unsupported / unverifiable。
+- `deepseek`：可选 LLM citation judge，默认模型 `deepseek-v4-flash`，可用 `CITATION_JUDGE_MODEL` 或 CLI `--citation-judge-model` 覆盖；需要 `DEEPSEEK_API_KEY`。
+
 ## Project Layout
 
 ```text
@@ -190,6 +204,7 @@ src/deepresearch_agent/
   rerankers.py        Optional local and DashScope rerank providers
   verifier.py         Source quality filtering
   citation.py         Citation faithfulness check
+  citation_judge.py   Optional heuristic and DeepSeek citation judge providers
   report_exporter.py  Markdown/HTML/JSON report exports
   cost.py             Token/cost attribution
   tracing.py          Structured JSONL trace events and optional OTLP HTTP export

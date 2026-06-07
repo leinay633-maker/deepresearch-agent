@@ -360,7 +360,7 @@ class RunController:
         )
 
         self._raise_if_cancelled(run_id)
-        answer, claims, synthesis_cost = await self._run_synthesizer_stage(
+        answer, claims, _synthesis_cost = await self._run_synthesizer_stage(
             run_id,
             brief,
             plan,
@@ -374,13 +374,15 @@ class RunController:
         self._raise_if_cancelled(run_id)
         citation_report = await self._run_verifier_stage(
             run_id,
+            request,
             claims,
             sources,
             orchestrator,
+            cost,
             retry_count,
         )
 
-        total_cost = _merge_costs(planner_cost, synthesis_cost)
+        total_cost = _merge_costs(planner_cost, cost.summary())
         latency_ms = sum(step.latency_ms or 0.0 for step in self.store.list_steps(run_id))
         metrics = {
             "latency_ms": round(latency_ms, 3),
@@ -534,9 +536,11 @@ class RunController:
     async def _run_verifier_stage(
         self,
         run_id: str,
+        request: ResearchRequest,
         claims: list[str],
         sources: list[Source],
         orchestrator: DeepResearchOrchestrator,
+        cost: CostTracker,
         retry_count: int,
     ):
         self._heartbeat_execution_lease(run_id)
@@ -550,7 +554,12 @@ class RunController:
             input_json={"claim_count": len(claims), "source_count": len(sources)},
             retry_count=retry_count,
         )
-        citation_report = orchestrator.citation_checker.check(claims, sources)
+        citation_report = orchestrator.citation_checker.check(
+            claims,
+            sources,
+            judge_provider=orchestrator._build_citation_judge_provider(request),
+            cost=cost,
+        )
         self._step(
             run_id,
             "verifier",
