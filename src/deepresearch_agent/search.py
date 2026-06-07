@@ -8,7 +8,7 @@ import re
 import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from typing import Any, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 from urllib.parse import quote_plus, urlencode
 from urllib.request import Request, urlopen
 
@@ -490,16 +490,50 @@ class CircuitBreaker:
             self.opened_at = time.monotonic()
 
 
+class SearchRateLimiter:
+    def __init__(
+        self,
+        rate_per_second: float,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+    ) -> None:
+        self.rate_per_second = rate_per_second
+        self.clock = clock
+        self.sleep = sleep
+        self._lock = asyncio.Lock()
+        self._next_allowed_at = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return self.rate_per_second > 0
+
+    async def wait(self) -> None:
+        if not self.enabled:
+            return
+        interval = 1.0 / self.rate_per_second
+        async with self._lock:
+            now = self.clock()
+            if now < self._next_allowed_at:
+                await self.sleep(self._next_allowed_at - now)
+                now = self.clock()
+            self._next_allowed_at = max(now, self._next_allowed_at) + interval
+
+
 class SearchService:
     def __init__(
         self,
         primary: SearchAdapter,
         fallback: SearchAdapter,
         settings: Settings,
+        rate_limiter: SearchRateLimiter | None = None,
     ) -> None:
         self.primary = primary
         self.fallback = fallback
         self.settings = settings
+        self.rate_limiter = rate_limiter or SearchRateLimiter(
+            settings.search_rate_limit_per_second
+        )
         self.breaker = CircuitBreaker(
             settings.circuit_breaker_failure_threshold,
             settings.circuit_breaker_cooldown_seconds,
@@ -514,6 +548,7 @@ class SearchService:
         if self.breaker.allow():
             for _ in range(self.settings.max_retries + 1):
                 try:
+                    await self.rate_limiter.wait()
                     sources = await asyncio.wait_for(
                         self.primary.search(query, max_results, self.settings.request_timeout_seconds),
                         timeout=self.settings.request_timeout_seconds + 0.5,

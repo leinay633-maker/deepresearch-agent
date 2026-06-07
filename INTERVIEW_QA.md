@@ -205,13 +205,13 @@
 ## Q：工具失败怎么处理？
 [状态: 待消化]
 标签：Tool / 可靠性 / 降级
-检索关键词：retry, timeout, circuit breaker, fallback
-回答：`SearchService` 包了 timeout、bounded retry、circuit breaker 和 fallback。primary adapter 连续失败后 breaker 会打开，后续请求直接走 mock fallback。测试里用 `FailingSearchAdapter` 验证了 forced failure 和 circuit breaker open 两种情况。
+检索关键词：retry, timeout, circuit breaker, fallback, rate limit
+回答：`SearchService` 包了 timeout、bounded retry、circuit breaker、fallback 和可选本地 rate limit。primary adapter 连续失败后 breaker 会打开，后续请求直接走 mock fallback；如果配置 `SEARCH_RATE_LIMIT_PER_SECOND`，primary search 调用前会按 min-interval 节流，避免并发 researcher 瞬间打爆真实搜索 API。测试里用 `FailingSearchAdapter` 验证 forced failure 和 circuit breaker open，用 fake clock/sleep 验证 2 QPS 会产生两个 `0.5s` 间隔。这个限流是单进程保护，不是 Redis/网关级全局 quota。
 关联模块：`search.py`, `tests/test_failure_handling.py`
 可追问：
 1. retry 次数怎么设？
 2. fallback 会不会污染答案？
-3. 如何向用户暴露 fallback？
+3. 本地 rate limit 和生产全局限流差在哪？
 
 ## Q：MCP 工具接入现在做到什么程度？
 [状态: 待消化]

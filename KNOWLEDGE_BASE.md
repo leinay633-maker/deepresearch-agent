@@ -51,10 +51,10 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 ## 决策 3：工具失败怎么兜
 
 背景：真实搜索 API 会超时、限流或返回空结果，DeepResearch 不能因为一个工具失败就整体失败。
-可选方案：直接抛错；只 retry；retry + timeout + circuit breaker + fallback。
-最终选择：`SearchService` 里做 bounded retry、timeout、circuit breaker，失败后降级到 mock search。
-理由：这个组合能把外部不稳定性限制在 researcher 层。
-代价：fallback 结果不等于真实搜索结果，报告必须标明 provider 和 fallback_count。
+可选方案：直接抛错；只 retry；retry + timeout + circuit breaker + fallback；再加进程内 rate limiter。
+最终选择：`SearchService` 里做 bounded retry、timeout、circuit breaker、可选 primary search rate limiter，失败后降级到 mock search。
+理由：这个组合能把外部不稳定性限制在 researcher 层；rate limiter 默认关闭，只有配置 `SEARCH_RATE_LIMIT_PER_SECOND` 时才对 primary search 生效。
+代价：fallback 结果不等于真实搜索结果，报告必须标明 provider 和 fallback_count；进程内 rate limiter 不是跨 worker 的全局配额控制。
 面试怎么答：我会强调「可用性优先，真实性不造假」，fallback 是保证流程不断，不是伪装成真实外部检索。
 
 ## 决策 4：citation 怎么校验
@@ -69,11 +69,11 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 ## 决策 5：并发怎么控限流
 
 背景：researcher 并发能降低延迟，但并发过高会放大 API 限流和成本。
-可选方案：无限 gather；固定串行；`asyncio.Semaphore` 控制并发。
-最终选择：`asyncio.Semaphore(max_researchers)`，默认最多 3。
-理由：足够展示并发，同时保持输出和 trace 易读。
-代价：没有 per-provider QPS bucket，未实测高并发流量。
-面试怎么答：我会说 MVP 先控制任务级并发，v2 再加 provider 级 token bucket。
+可选方案：无限 gather；固定串行；`asyncio.Semaphore` 控制并发；再给 search provider 做请求节流。
+最终选择：`asyncio.Semaphore(max_researchers)` 控制 researcher 并发，默认最多 3；`SearchRateLimiter` 可通过 `SEARCH_RATE_LIMIT_PER_SECOND` 对 primary search 做本地进程内节流。
+理由：足够展示并发，同时保持输出和 trace 易读；真实搜索 provider 有 key/额度时，可以先用本地节流降低 burst 风险。
+代价：不是分布式限流，也没有 provider 级 quota 感知；多个 worker 进程仍需要 Redis/Postgres/网关级全局限流。
+面试怎么答：我会说 MVP 先控制任务级并发，再补 SearchService 级本地节流；真正生产要按 provider 和 worker 池做全局 rate limit。
 
 ## 决策 6：为什么先用自定义 orchestrator 而不是 LangGraph
 
@@ -300,6 +300,15 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 理由：这是最小的幂等恢复增量：不改 orchestrator、不改 search adapter，也不需要引入队列框架，就能避免“后处理失败后重新检索”。对求职展示来说，这比空谈分布式恢复更具体。
 代价：checkpoint 粒度是整个 researcher 阶段，不是单个 subquestion；SQLite 里会保存 findings 和 source 内容，结果变大；如果失败发生在 researcher 内部，仍然需要重跑 researcher。真正生产化还需要按 researcher 子任务、reflection round、synthesis、verifier 分别做幂等节点和大对象存储。
 面试怎么答：我会说我先解决最常见的浪费：检索已经成功，但合成或校验失败时不应该重新打搜索。当前是阶段级 checkpoint reuse，不是完整 DAG replay。
+
+## 决策 31：为什么 search rate limit 做成进程内可选配置
+
+背景：真实 web search provider 可能有 QPS、并发或额度限制；多个 researcher 并发时，即使有 retry/circuit breaker，也可能在短时间内打出 burst 请求。
+可选方案：不做限流；在每个 provider adapter 里硬编码 sleep；在 `SearchService` 外层做统一进程内 limiter；直接引入 Redis/网关级全局限流。
+最终选择：新增 `SearchRateLimiter`，用 async lock 和 min-interval 控制 primary search 调用间隔；`Settings.search_rate_limit_per_second` 默认 `0.0` 表示关闭，可用环境变量 `SEARCH_RATE_LIMIT_PER_SECOND` 开启。fallback mock 不限流，避免外部失败后本地兜底也被拖慢。
+理由：限流应该贴近工具调用层，而不是散落在每个 provider；默认关闭能保持 mock/CI 快速和无 key 路径不变。有真实 Brave/Tavily/SearxNG/Jina key 时，可以先用这个本地 limiter 降低 burst 风险。
+代价：它只约束当前 Python 进程，不是跨进程/跨机器全局 quota；它也不理解不同 provider 的真实套餐、429 backoff 或动态配额。生产化仍需要 provider-specific backoff、分布式 rate limit 和集中任务队列。
+面试怎么答：我会说我先把 rate limit 作为 SearchService 的可配置保护补上，避免并发 researcher 直接打爆外部搜索；但我不会把它说成生产级全局限流。
 
 # 5 实现细节
 
@@ -564,6 +573,14 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 复盘：幂等恢复不一定一开始就上完整 DAG。先保存阶段输出，能解决“检索成功但后处理失败”的重复成本问题。
 面试可能追问：为什么不是每个 subquestion checkpoint？回答：当前先做阶段级复用，改动小且足够证明思路；细粒度恢复需要拆 researcher 子任务状态、reflection round 和大对象存储。
 
+## 问题 25：search 限流只能先做本地进程内保护
+
+现象：多 researcher 并发时，SearchService 之前只有 retry、timeout、circuit breaker 和 fallback，没有主动控制 primary search 请求发出的节奏。
+工程风险：真实 Brave/Tavily/SearxNG/Jina provider 有 QPS/额度限制；没有节流时，一次 run 的并发 researcher 可能瞬间打出 burst，请求失败后才靠 fallback 兜底。
+修复：新增 `SearchRateLimiter` 和 `SEARCH_RATE_LIMIT_PER_SECOND` 配置，默认关闭；开启后只在 primary search 调用前等待，不限制 mock fallback。单测用 fake clock/sleep 验证 2 QPS 时连续三次 wait 产生两个 `0.5s` 间隔，并验证 SearchService 在 primary 调用前执行 limiter。
+复盘：本地 limiter 是可靠性保护，不是质量提升。它减少 burst 风险，但不能替代 provider-specific 429 backoff 或跨 worker 全局配额。
+面试可能追问：为什么不直接做 Redis 限流？回答：当前项目默认无外部依赖；先把 SearchService 层的限流接口和测试打出来，生产化再换 Redis/网关级全局 limiter。
+
 # 7 实测数据
 
 本节所有 mock benchmark 数字只用于证明 pipeline plumbing 能端到端跑通，不能当作真实性能、真实成本或真实答案质量成果。尤其不能在面试里说“我的 DeepResearch p50 是个位数毫秒”这类话，因为这个延迟测的是本机 Python 跑 deterministic mock 的速度，换机器、换进程热身状态、换依赖版本都会变。
@@ -571,7 +588,7 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
-测试验证：`py -3.11 -m pytest -q`，最新结果 `84 passed, 2 warnings in 64.84s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `86 passed, 2 warnings in 68.61s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -585,7 +602,7 @@ Embedding provider 验证：`py -3.11 -m deepresearch_agent.validate_embeddings 
 
 Reranker smoke：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?" --search-provider mock --llm-provider mock --max-researchers 1 --max-results 2 --local-retrieval-mode hybrid --rerank-enabled --rerank-provider local` 成功。因为首次下载/加载 `BAAI/bge-reranker-base`，latency 达到 `279692.721ms`。这只证明可选 rerank provider 能接入，不作为常规性能指标。
 
-Web search / crawler provider smoke：`py -3.11 -m pytest tests/test_web_search_providers.py tests/test_failure_handling.py -q` 成功，最新结果 `15 passed in 0.39s`，覆盖 SearxNG JSON parsing、crawler 内容替换、Jina Reader URL prefix、本地 HTML crawler 去掉 script/style 并抽正文、Jina Search JSON parsing、Brave/Tavily stub parsing、provider registry、unknown provider fail-fast、primary failure fallback 和 circuit breaker open。真实外网 smoke：`https://r.jina.ai/https://example.com` 返回 `200` 和 clean text，说明 Jina Reader crawler 这层能 live 访问；`--search-provider jina` 的 CLI run 成功但触发 fallback，trace error 是 `HTTP Error 401: Unauthorized`，所以 Jina Search 真实检索在当前环境未通过。SearxNG 需要 `SEARXNG_BASE_URL`，当前没有自建实例，未做 live search；本地 HTML crawler 只做 stub 单测，没有 live 大规模网页抽取评测。
+Web search / crawler provider smoke：`py -3.11 -m pytest tests/test_web_search_providers.py tests/test_failure_handling.py -q` 成功，最新结果 `17 passed in 0.46s`，覆盖 SearxNG JSON parsing、crawler 内容替换、Jina Reader URL prefix、本地 HTML crawler 去掉 script/style 并抽正文、Jina Search JSON parsing、Brave/Tavily stub parsing、provider registry、unknown provider fail-fast、primary failure fallback、circuit breaker open、SearchRateLimiter 的 min-interval 计算，以及 SearchService 在 primary search 前执行 limiter。真实外网 smoke：`https://r.jina.ai/https://example.com` 返回 `200` 和 clean text，说明 Jina Reader crawler 这层能 live 访问；`--search-provider jina` 的 CLI run 成功但触发 fallback，trace error 是 `HTTP Error 401: Unauthorized`，所以 Jina Search 真实检索在当前环境未通过。SearxNG 需要 `SEARXNG_BASE_URL`，当前没有自建实例，未做 live search；本地 HTML crawler 只做 stub 单测，没有 live 大规模网页抽取评测；search rate limit 目前只做本地单测，没有真实 provider QPS 压测。
 
 Brave/Tavily provider smoke：`py -3.11 -m pytest tests/test_web_search_providers.py tests/test_failure_handling.py -q` 成功，最新相关结果 `14 passed in 0.41s`。新增覆盖 Brave Search 的 `X-Subscription-Token` header、`web.results` 解析、缺 `BRAVE_SEARCH_API_KEY` fail-fast；Tavily Search 的 Bearer auth、JSON body `query/search_depth/max_results`、`results` 解析、缺 `TAVILY_API_KEY` fail-fast；provider registry 可构造 `brave` 和 `tavily`。当前没有真实 Brave/Tavily key，所以没有 live API 调用、延迟、成本或质量数字。
 
@@ -675,7 +692,7 @@ Public eval answer judge smoke：`py -3.11 -m pytest tests/test_deep_research_ev
 
 Source diversity metrics smoke：`py -3.11 -m pytest tests/test_spine.py tests/test_run_control.py tests/test_deep_research_eval.py -q` 成功，最新结果 `20 passed, 2 warnings in 60.65s`。新增断言覆盖 `/research` 生成的 `StructuredReport.metrics` 和 `/runs/worker/next` 结果里包含 `source_provider_count`、`source_domain_count`、`source_provider_counts`、`source_domain_counts`；`benchmark.py` 和 `deep_research_eval.py` 也会把 provider/domain count 写入 case record 并汇总平均数。这里没有重跑真实 DeepSeek/Wikipedia benchmark，指标只证明 plumbing 和 schema 已接入。
 
-未实测：LiveDRBench/Deep Research Bench 官方 judge 分数、DeepSeek answer judge live benchmark、真实搜索 API 高并发限流、Brave/Tavily live search benchmark、OpenAI-compatible LLM live endpoint、DeepSeek citation judge live benchmark、Redis/PostgreSQL 缓存、多进程 worker pool / 分布式队列、真实 OpenTelemetry collector / LangSmith tracing、真实用户流量、DashScope 真实 embedding/rerank、真实 Qdrant 服务 live benchmark、扫描件 OCR、大规模私有语料增量 reindex、rerank 5 case 全量 benchmark。
+未实测：LiveDRBench/Deep Research Bench 官方 judge 分数、DeepSeek answer judge live benchmark、真实搜索 API 高并发/多进程全局限流、Brave/Tavily live search benchmark、OpenAI-compatible LLM live endpoint、DeepSeek citation judge live benchmark、Redis/PostgreSQL 缓存、多进程 worker pool / 分布式队列、真实 OpenTelemetry collector / LangSmith tracing、真实用户流量、DashScope 真实 embedding/rerank、真实 Qdrant 服务 live benchmark、扫描件 OCR、大规模私有语料增量 reindex、rerank 5 case 全量 benchmark。
 
 # 8 评测设计
 
@@ -686,7 +703,7 @@ source diversity：当前记录 deduped_source_count，也新增了 `source_prov
 hallucination rate：当前用 unsupported citation count 作为 proxy，不能覆盖无引用幻觉。
 latency：benchmark 记录每 case latency_ms，并计算 P50/P90/max；mock latency 只能作为 plumbing 回归信号，DeepSeek + Wikipedia latency 包含真实网络/API 时间，也不能当线上 SLA。local hybrid 比 keyword baseline p50 多 `6151.778ms`；独立检索评测里 keyword 平均每 query `0.3070s`，hybrid `0.5781s`，hybrid+rerank `3.4431s`，这些都需要如实讲。
 cost：mock provider 成本为 0，token 用字符估算；DeepSeek provider 已接真实 usage，并按当前实现里的 v4-flash 价格常量估算成本，价格核对日期 `2026-06-07`。BEIR/scifact 独立检索评测不调用 LLM，LLM token 和 API cost 都是 0；本地 embedding/rerank 不产生 API 成本，但会产生本机 CPU/GPU 时间；DashScope 成本未实测。
-工具失败恢复：有 unit test 覆盖 primary failure fallback 和 circuit breaker open；第一次 DeepSeek + Wikipedia benchmark 出现过 fallback，修复 Wikipedia 长查询压缩后 fallback 曾降到 0，但最新 keyword/hybrid 对比里仍分别出现 `fallback_count_total=1` 和 `2`，已在第 7 节如实记录。
+工具失败恢复：有 unit test 覆盖 primary failure fallback、circuit breaker open 和本地 SearchRateLimiter；第一次 DeepSeek + Wikipedia benchmark 出现过 fallback，修复 Wikipedia 长查询压缩后 fallback 曾降到 0，但最新 keyword/hybrid 对比里仍分别出现 `fallback_count_total=1` 和 `2`，已在第 7 节如实记录。限流目前只是单进程 primary search 节流，没有真实 429/backoff 或跨 worker 全局 quota 实测。
 multi-hop / reflection 成功率：当前没有真实 multi-hop 标注集，未实测质量提升；但 reflection loop 的控制流已用 mock/keyword smoke 验证，会在证据不足启发式触发时追加 `R<N>` follow-up question，并把 compression/reflection payload 写入 trace。下一步需要公开多跳任务或人工标注集来评估是否真的提升答案质量。
 
 评测集构造方式：端到端 5 条 case 是围绕本项目核心能力手写的 smoke benchmark，覆盖 supervisor-researcher、citation faithfulness、tool failure、cost tracking、benchmark reproducibility。公开检索标准口径采用 BEIR/scifact test qrels，只评测 local retriever，不评测 LLM 回答质量。公开 Deep Research 端到端口径新增 LiveDRBench preview runner，会跑完整 orchestrator 并保存 answer/source/trace/cost/predictions artifacts；有 ground truth 的本地/公开 case 可以额外开 heuristic 或 DeepSeek answer judge；当前只跑了 1 条 mock 和 1 条 DeepSeek/Wikipedia 样本，官方 judge 分数和 DeepSeek answer judge live 口径尚未接入。

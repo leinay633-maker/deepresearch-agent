@@ -198,6 +198,11 @@ Search providers：
 - `tavily`：Tavily Search API adapter，调用 `https://api.tavily.com/search`，key 从 `TAVILY_API_KEY` 读；`TAVILY_SEARCH_DEPTH` 默认 `basic`。
 - `mcp`：MCP tool search adapter，支持 `MCP_TRANSPORT=stdio/http`，用 `MCP_COMMAND`/`MCP_ARGS` 或 `MCP_HTTP_URL` 连接 server，并调用 `MCP_SEARCH_TOOL`；tool result 会转换成统一 `Source`。
 
+Search reliability knobs：
+
+- `SEARCH_RATE_LIMIT_PER_SECOND`：默认 `0` 关闭；设置为正数后，`SearchService` 会在 primary search 调用前做进程内节流，mock fallback 不限流。
+- `MAX_RETRIES`、`REQUEST_TIMEOUT_SECONDS`、`CIRCUIT_BREAKER_FAILURE_THRESHOLD`、`CIRCUIT_BREAKER_COOLDOWN_SECONDS` 控制 retry、timeout、circuit breaker 和 fallback 行为。
+
 Crawler：
 
 - `none`：默认，不抽网页正文，只使用 search snippet。
