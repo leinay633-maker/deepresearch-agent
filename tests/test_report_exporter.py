@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import zipfile
 
 import pytest
 
@@ -22,21 +23,27 @@ from deepresearch_agent.schemas import (
 def test_export_report_writes_markdown_html_and_json(tmp_path) -> None:
     report = _report()
 
-    paths = export_report(report, tmp_path, formats=["markdown", "html", "json"])
+    paths = export_report(report, tmp_path, formats=["markdown", "html", "json", "pdf", "docx"])
 
-    assert set(paths) == {"markdown", "html", "json"}
+    assert set(paths) == {"markdown", "html", "json", "pdf", "docx"}
     markdown = (tmp_path / "run-export.md").read_text(encoding="utf-8")
     html = (tmp_path / "run-export.html").read_text(encoding="utf-8")
     payload = json.loads((tmp_path / "run-export.json").read_text(encoding="utf-8"))
+    pdf = (tmp_path / "run-export.pdf").read_bytes()
+    with zipfile.ZipFile(tmp_path / "run-export.docx") as archive:
+        docx_xml = archive.read("word/document.xml").decode("utf-8")
     assert "# DeepResearch Report" in markdown
     assert "Evidence [S1]" in markdown
     assert "&lt;unsafe&gt;" in html
     assert payload["run_id"] == "run-export"
+    assert pdf.startswith(b"%PDF")
+    assert "DeepResearch Report" in docx_xml
+    assert "Exported reports preserve cited evidence" in docx_xml
 
 
 def test_report_export_rejects_unknown_format(tmp_path) -> None:
     with pytest.raises(ValueError, match="unsupported export format"):
-        export_report(_report(), tmp_path, formats=["pdf"])
+        export_report(_report(), tmp_path, formats=["pptx"])
 
 
 def test_report_to_html_escapes_answer_content() -> None:

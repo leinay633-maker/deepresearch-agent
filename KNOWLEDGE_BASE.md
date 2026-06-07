@@ -202,14 +202,14 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 代价：当前仍只有 mock 和 DeepSeek 两类 LLM provider；没有按 source quality 自动选模型，没有动态降级策略，也没有证明不同 stage model 会提升质量或降低成本。
 面试怎么答：我会说我先做的是“模型路由接口和可观测归因”，不是宣称已经有完整 model zoo。它让面试官看到我知道多 Agent 系统里模型选择应该是按角色管理的，而不是一个全局模型名打到底。
 
-## 决策 20：为什么内容导出先做 Markdown/HTML/JSON，而不是直接做 PDF/DOCX/PPT
+## 决策 20：为什么内容导出分阶段做，而不是一开始做全套办公文档
 
 背景：之前报告只能从 API/CLI 读结构化 JSON 或 markdown answer，不方便把一次 run 交给别人审阅，也没有稳定 artifact 文件。
-可选方案：直接生成 PDF/DOCX/PPT；先导出 Markdown/HTML/JSON；只保留 API JSON；接第三方文档服务。
-最终选择：新增 `src/deepresearch_agent/report_exporter.py`，支持把 `StructuredReport` 导出为 Markdown、静态 HTML 和完整 JSON；CLI 增加 `--export-dir` 和 `--export-formats`。PDF/DOCX/PPT 暂不做。
-理由：Markdown/HTML/JSON 不需要新增依赖，能保留 answer、sources、citation assessments、evidence quotes、metrics 和完整结构化数据，先满足可审计和可分享。后续 PDF/DOCX 可以从这层 exporter 继续扩展。
-代价：HTML 只是静态页面，不是富文本编辑器；没有分页、目录、图片、PDF 排版、DOCX 样式、PPT 或 TTS/podcast。
-面试怎么答：我会说我先把报告从“只能在 stdout/API 里看”变成“能落地成可复查 artifact”，但不会把它包装成完整办公文档生成系统。
+可选方案：只保留 API JSON；先导出 Markdown/HTML/JSON；直接生成 PDF/DOCX/PPT；接第三方文档服务。
+最终选择：第一步新增 `src/deepresearch_agent/report_exporter.py`，支持 Markdown、静态 HTML 和完整 JSON；这次继续扩展到文本版 PDF 和 DOCX，分别用 `reportlab` 和 `python-docx` 生成文件。CLI 仍通过 `--export-dir` 和 `--export-formats` 控制格式。PPT/TTS 暂不做。
+理由：Markdown/HTML/JSON 保留完整可审计结构，PDF/DOCX 解决“发给别人直接打开”的交付形态。PDF/DOCX 仍从同一个 `StructuredReport` 生成，保留 answer、sources、citation assessments 和 evidence quotes，不改变主链路。
+代价：新增 `reportlab`、`python-docx` 依赖；PDF/DOCX 是文本版报告，不是复杂版式系统，没有封面模板、目录、图表、图片布局、批注、修订模式、PPT 或 TTS/podcast。
+面试怎么答：我会说我先交付可审计 artifact，再补常见文档格式；但我不会把文本版 PDF/DOCX 包装成完整办公自动化平台。
 
 ## 决策 21：为什么先做 OTLP HTTP trace export，而不是直接接 LangSmith 或完整 OpenTelemetry SDK
 
@@ -301,7 +301,7 @@ Citation Checker：`src/deepresearch_agent/citation.py`。输入是 claims 和 s
 
 Citation Judge Provider：`src/deepresearch_agent/citation_judge.py`。输入是 claim 和 evidence quotes，输出 `CitationJudgeResult`。`HeuristicCitationJudgeProvider` 完全本地运行、无 key；`DeepSeekCitationJudgeProvider` 调 DeepSeek JSON mode，要求返回 `verdict/confidence/reason`，并用 DeepSeek usage 字段估算 `citation_judge` 成本。`orchestrator.py` 和 `run_control.py` 都通过 `build_citation_judge_provider()` 接入，所以 `/research`、CLI、`/runs` 和 eval runner 的语义一致。局限是真实 DeepSeek judge 尚未 live benchmark，也没有 judge agreement 评测。
 
-Report Exporter：`src/deepresearch_agent/report_exporter.py`。输入是 `StructuredReport`，输出 Markdown、HTML、JSON 文件路径。Markdown/HTML 会展开 answer、sources、citation assessments 和 evidence quotes；JSON 保存完整 `model_dump(mode="json")`，方便后续二次处理。CLI 通过 `--export-dir` 和 `--export-formats` 调用它；`--json` 模式下导出路径写到 stderr，避免污染 stdout JSON。
+Report Exporter：`src/deepresearch_agent/report_exporter.py`。输入是 `StructuredReport`，输出 Markdown、HTML、JSON、PDF、DOCX 文件路径。Markdown/HTML 会展开 answer、sources、citation assessments 和 evidence quotes；JSON 保存完整 `model_dump(mode="json")`，方便后续二次处理；PDF 用 `reportlab` 生成文本版报告；DOCX 用 `python-docx` 生成 Word 文档。CLI 通过 `--export-dir` 和 `--export-formats` 调用它；`--json` 模式下导出路径写到 stderr，避免污染 stdout JSON。局限是 PDF/DOCX 仍是文本版交付，不包含复杂模板、目录、图片、图表或批注。
 
 Cost Tracker：`src/deepresearch_agent/cost.py`。mock provider 仍使用字符数近似估算；DeepSeek provider 已接入 API 返回的真实 `prompt_tokens` / `completion_tokens`，并通过 `CostTracker.add_usage()` 记录到同一套 `CostSummary`。每条 `CostRecord` 现在支持单独的 `model`，所以 brief_generation、planning、synthesis 可以显示不同 stage model。当前 `deepseek-v4-flash` 成本计算按 DeepSeek 官方 Models & Pricing 页，核对日期 `2026-06-07`：input cache hit `$0.0028/1M tokens`，input cache miss `$0.14/1M tokens`，output `$0.28/1M tokens`。legacy alias 只作为 v4-flash 兼容入口使用同一价格表；未配置价格的模型会直接报错，避免 silently 用错单价。如果响应没有 token usage，DeepSeek 路径会直接失败，不会退回字符估算伪装成真实 usage。
 
@@ -467,11 +467,11 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 
 ## 问题 18：报告导出阶段无阻塞 bug，但刻意没有做富文档格式
 
-现象：新增 Markdown/HTML/JSON exporter 和 CLI 参数后，单测与 CLI smoke 都通过，没有出现阻塞性 bug。
-工程风险：Markdown/HTML/JSON 解决的是 artifact 可复查，不等于 PDF/DOCX/PPT 级别的排版交付。HTML 目前只是静态转义，不支持封面、目录、分页、图片、图表或富文本编辑。
-修复：没有为了“看起来完整”去引入重依赖或编造 PDF/DOCX 能力；文档里明确 PDF、DOCX、PPT 未实现。
-复盘：导出层先做稳定数据边界更重要。后续要做 PDF/DOCX 时，可以复用 `report_to_markdown` / `report_to_html` 的结构，再接专门的文档生成依赖。
-面试可能追问：为什么不直接做 PDF？回答：PDF/DOCX 是排版工程，不是 DeepResearch 主链路的核心风险；我先交付可审计 artifact，下一步再做格式化输出。
+现象：第一阶段新增 Markdown/HTML/JSON exporter 和 CLI 参数后，单测与 CLI smoke 都通过，没有出现阻塞性 bug；这次扩展 PDF/DOCX 后，`tests/test_report_exporter.py` 也通过。
+工程风险：PDF/DOCX 现在是文本版报告导出，不等于完整办公文档生成。它保留 answer、sources、citation assessments 和 evidence quotes，但不支持封面、目录、分页模板、图片、图表、批注、修订模式或 PPT。
+修复：没有把文本版 PDF/DOCX 包装成富文档系统；README、知识库和 QA 都写清 PPT/TTS 未实现，PDF/DOCX 只是报告 artifact 的常见文件格式。
+复盘：导出层先做稳定数据边界，再扩展常见格式是合理顺序。后续如果做 PPT/DOCX 高保真排版，应继续复用 `StructuredReport`，而不是让导出层反向影响主链路。
+面试可能追问：为什么不直接做完整 PPT？回答：PPT/高保真排版是展示工程，不是 DeepResearch 主链路的核心风险；我现在先保证引用和来源可追溯，再做格式扩展。
 
 ## 问题 19：OTLP exporter 只做出口验证，不等于生产 tracing 平台
 
@@ -513,7 +513,7 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 实测环境：Windows PowerShell，`py -3.11`，mock search provider，seed `20260606`，5 条 benchmark case，max_researchers=3，max_results=4。
 
 安装验证：`py -3.11 -m pip install --timeout 180 -e ".[dev]"` 成功。为了支持本地 hybrid retrieval，新增安装了 `sentence-transformers` 和 `chromadb`；第一次安装时有一个超时遗留 pip 进程占用 `torch` 文件，结束该遗留进程后重试成功。
-测试验证：`py -3.11 -m pytest -q`，最新结果 `74 passed, 2 warnings in 76.28s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
+测试验证：`py -3.11 -m pytest -q`，最新结果 `74 passed, 2 warnings in 144.23s`。warning 来自 FastAPI TestClient / Starlette 对 httpx 的 deprecation 提示，以及 OpenTelemetry metadata 的 deprecation 提示，未影响功能。
 CLI example：`py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"` 成功，raw_search_result_count `12`，deduped_source_count `8`，total_tokens `4417`。这次运行记录的 latency 是 `10.63ms`，但它只是 mock plumbing run 的本机样本，不作为性能指标引用。citation_retention_rate `1.0` 只说明 mock synthesis 生成的 citation ID 能被当前 checker 找到，不代表真实 LLM 场景下的引用可靠性。estimated_cost_usd `0.0` 是因为 mock provider 单价配置为 0，不代表真实成本。
 真实 adapter probe：`py -3.11 -m deepresearch_agent.cli "What is Model Context Protocol?" --search-provider wikipedia --json` 成功，修复后 sample 输出显示 `fallback_count=0`，latency 约 `1506.501ms`。注意：Wikipedia 是真实无 key adapter，但不是高质量通用搜索，结果质量仍有限。
 
@@ -551,7 +551,7 @@ Document corpus ingest smoke：`py -3.11 -m pytest tests/test_ingest_corpus.py t
 
 Stage model routing smoke：`py -3.11 -m pytest tests/test_stage_models.py -q` 成功，`2 passed in 0.35s`。测试覆盖 mock orchestrator 在 `brief_model`、`planner_model`、`synthesis_model` 不同时，`CostRecord.model` 分别记录 `mock-brief`、`mock-planner`、`mock-synthesis`；同时用不联网的 `RecordingDeepSeekProvider` 验证 DeepSeek 请求体按 stage 发送 `deepseek-chat`、`deepseek-reasoner`、`deepseek-v4-flash`，且 cost records 记录同一模型序列。CLI smoke：`py -3.11 -m deepresearch_agent.cli "How should model routing work in a research agent?" --llm-provider mock --llm-model mock-default --brief-model mock-brief --planner-model mock-planner --synthesis-model mock-synthesis --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --json` 后抽取 `cost.records[].model`，输出 `['mock-brief', 'mock-planner', 'mock-synthesis']`。这只验证路由和记录，不代表这些模型组合已做真实质量/成本对比。
 
-Report exporter smoke：`py -3.11 -m pytest tests/test_report_exporter.py -q` 成功，`3 passed in 0.33s`。测试覆盖 Markdown/HTML/JSON 三种文件写出、HTML answer 内容转义、未知格式报错。CLI smoke：`py -3.11 -m deepresearch_agent.cli "How should report export work?" --llm-provider mock --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --export-dir <temp> --export-formats markdown,html,json` 成功，在临时目录生成 `3ad3725ca515.md`、`3ad3725ca515.html`、`3ad3725ca515.json`。这只验证本地 artifact 导出，不代表 PDF/DOCX/PPT 已实现。
+Report exporter smoke：`py -3.11 -m pytest tests/test_report_exporter.py -q` 成功，`3 passed in 1.10s`。测试覆盖 Markdown/HTML/JSON/PDF/DOCX 五种文件写出、HTML answer 内容转义、PDF 文件头为 `%PDF`、DOCX 的 `word/document.xml` 包含报告内容和 evidence quote、未知格式报错。CLI smoke：`py -3.11 -m deepresearch_agent.cli "How should report export work?" --llm-provider mock --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --export-dir <temp> --export-formats markdown,html,json,pdf,docx` 成功，在临时目录生成 `d448115039a4.md/.html/.json/.pdf/.docx`。这只验证文本版报告 artifact 导出，不代表 PPT/TTS 或复杂办公排版已实现。
 
 Trace exporter smoke：`py -3.11 -m pytest tests/test_tracing_exporter.py -q` 成功，`3 passed in 0.90s`。测试覆盖 `OtlpHttpTraceExporter` 向本地 HTTP server 的 `/v1/traces` POST、`build_trace_exporter()` 读取 OTLP 配置、以及 exporter 抛错时 `TraceLogger` 仍写 JSONL 并追加 `trace_exporter` error event。这里没有接真实 collector、LangSmith 或线上 APM。
 
@@ -676,6 +676,6 @@ Hybrid retrieval / private corpus 还没有证明质量稳定提升：当前已�
 
 Run control 还不是分布式调度：当前已经有 SQLite run store、request_json 请求快照、planner checkpoint、approval/resume/cancel/retry、SSE replay、单机 worker lease/heartbeat、`defer_execution=true` + `/runs/worker/next` 的 worker-once 消费入口，以及本地 polling worker CLI，但它仍是轻量实现。可行方案是引入真正的 worker queue、多进程 worker pool、PostgreSQL/Redis、阶段幂等和更细粒度 checkpoint。工程代价是并发一致性、任务抢占、schema migration 和运维复杂度。面试怎么讲：我会说我先把长任务控制平面闭环、worker ownership 和最小队列消费语义做出来，生产化再升级存储和调度，不把 SQLite 版本包装成高并发任务系统。
 
-内容导出还不是办公文档生成：当前只支持 Markdown、HTML、JSON artifact。可行方案是基于 exporter 增加 PDF、DOCX、PPT、TTS/podcast。工程代价是版式、字体、分页、图片、图表和跨平台渲染验证。面试怎么讲：我会说我先做可审计文件导出，不把它包装成完整文档生产系统。
+内容导出还不是完整办公文档生成：当前支持 Markdown、HTML、JSON、文本版 PDF 和 DOCX artifact，但还没有 PPT、TTS/podcast、复杂版式、图表、图片、批注或模板系统。可行方案是基于 exporter 增加 PPT/TTS，并为 PDF/DOCX 做模板、目录、分页和渲染校验。工程代价是版式、字体、分页、图片、图表和跨平台渲染验证。面试怎么讲：我会说我已经把常见报告文件格式打通，但不会把文本版 PDF/DOCX 包装成完整文档生产系统。
 
 OpenTelemetry/LangSmith 仍是轻量出口：当前已经有可选 OTLP HTTP trace export，但只验证到本地 test server，不是完整 SDK/collector/LangSmith run tree。可行方案是引入官方 OTel SDK、batch processor、collector 配置、采样策略，或增加 LangSmith exporter。工程代价是外部账号、部署、隐私、采样和成本。面试怎么讲：我会说我先做的是稳定 trace event 和可外送边界，生产化再接完整可观测平台。

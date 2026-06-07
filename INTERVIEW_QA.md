@@ -386,12 +386,12 @@
 [状态: 待消化]
 标签：Report / Optional
 检索关键词：report exporter, optional
-回答：现在已经有轻量 `report_exporter.py`，能把 `StructuredReport` 导出成 Markdown、HTML 和 JSON。CLI 支持 `--export-dir`、`--export-formats markdown,html,json`，导出的 Markdown/HTML 会包含 answer、sources、citation assessments 和 evidence quotes，JSON 保留完整结构化报告。PDF、DOCX、PPT 还没做，我不会把当前 exporter 包装成完整办公文档生成。
+回答：现在已经有 `report_exporter.py`，能把 `StructuredReport` 导出成 Markdown、HTML、JSON、PDF 和 DOCX。CLI 支持 `--export-dir`、`--export-formats markdown,html,json,pdf,docx`；导出的文件会包含 answer、sources、citation assessments 和 evidence quotes，JSON 保留完整结构化报告。PDF 用 reportlab，DOCX 用 python-docx。我要主动说明它们是文本版报告 artifact，不是复杂排版系统；PPT/TTS 还没做。
 关联模块：`report_exporter.py`, `cli.py`, `schemas.py`
 可追问：
-1. 怎么加 PDF？
+1. PDF/DOCX 为什么说是文本版？
 2. 导出会影响 citation 吗？
-3. 为什么不先做前端？
+3. 怎么继续做 PPT？
 
 # Citation Checker 模块
 

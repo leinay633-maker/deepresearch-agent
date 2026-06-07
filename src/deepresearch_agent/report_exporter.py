@@ -5,10 +5,14 @@ import json
 from pathlib import Path
 from typing import Iterable
 
+from docx import Document
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+
 from deepresearch_agent.schemas import StructuredReport
 
 
-SUPPORTED_EXPORT_FORMATS = {"markdown", "md", "html", "json"}
+SUPPORTED_EXPORT_FORMATS = {"markdown", "md", "html", "json", "pdf", "docx"}
 
 
 def export_report(
@@ -32,6 +36,10 @@ def export_report(
                 json.dumps(report.model_dump(mode="json"), ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+        elif fmt == "pdf":
+            write_report_pdf(report, path)
+        elif fmt == "docx":
+            write_report_docx(report, path)
         paths[fmt] = str(path)
     return paths
 
@@ -113,6 +121,83 @@ def report_to_html(report: StructuredReport) -> str:
     )
 
 
+def write_report_docx(report: StructuredReport, path: Path) -> None:
+    document = Document()
+    document.add_heading(f"DeepResearch Report: {report.query}", level=1)
+    _docx_paragraph(document, f"Run ID: {report.run_id}")
+    _docx_paragraph(document, f"Citation retention: {report.citation_check.retention_rate}")
+    _docx_paragraph(document, f"Total tokens: {report.cost.total_tokens}")
+    _docx_paragraph(
+        document,
+        f"Estimated cost USD: {report.cost.total_estimated_cost_usd}",
+    )
+    document.add_heading("Answer", level=2)
+    for paragraph in _text_blocks(report.answer):
+        _docx_paragraph(document, paragraph)
+    document.add_heading("Sources", level=2)
+    for source in report.sources:
+        _docx_paragraph(document, f"[{source.id}] {source.title} - {source.url}", style="List Bullet")
+    document.add_heading("Citation Assessments", level=2)
+    for assessment in report.citation_check.assessments:
+        _docx_paragraph(
+            document,
+            f"{assessment.support_level} score {assessment.overlap_score}: {assessment.claim}",
+            style="List Bullet",
+        )
+        for quote in assessment.evidence_quotes:
+            _docx_paragraph(
+                document,
+                f"Evidence [{quote.source_id}]: {quote.quote}",
+                style="List Bullet 2",
+            )
+    document.save(path)
+
+
+def write_report_pdf(report: StructuredReport, path: Path) -> None:
+    styles = getSampleStyleSheet()
+    story = [
+        Paragraph(html.escape(f"DeepResearch Report: {report.query}"), styles["Title"]),
+        Spacer(1, 12),
+        Paragraph(html.escape(f"Run ID: {report.run_id}"), styles["Normal"]),
+        Paragraph(
+            html.escape(f"Citation retention: {report.citation_check.retention_rate}"),
+            styles["Normal"],
+        ),
+        Paragraph(html.escape(f"Total tokens: {report.cost.total_tokens}"), styles["Normal"]),
+        Paragraph(
+            html.escape(f"Estimated cost USD: {report.cost.total_estimated_cost_usd}"),
+            styles["Normal"],
+        ),
+        Spacer(1, 12),
+        Paragraph("Answer", styles["Heading2"]),
+    ]
+    for paragraph in _text_blocks(report.answer):
+        story.append(Paragraph(html.escape(paragraph), styles["BodyText"]))
+        story.append(Spacer(1, 6))
+    story.extend([Spacer(1, 8), Paragraph("Sources", styles["Heading2"])])
+    for source in report.sources:
+        story.append(Paragraph(html.escape(f"[{source.id}] {source.title} - {source.url}"), styles["BodyText"]))
+    story.extend([Spacer(1, 8), Paragraph("Citation Assessments", styles["Heading2"])])
+    for assessment in report.citation_check.assessments:
+        story.append(
+            Paragraph(
+                html.escape(
+                    f"{assessment.support_level} score {assessment.overlap_score}: "
+                    f"{assessment.claim}"
+                ),
+                styles["BodyText"],
+            )
+        )
+        for quote in assessment.evidence_quotes:
+            story.append(
+                Paragraph(
+                    html.escape(f"Evidence [{quote.source_id}]: {quote.quote}"),
+                    styles["BodyText"],
+                )
+            )
+    SimpleDocTemplate(str(path)).build(story)
+
+
 def _normalize_format(value: str) -> str:
     fmt = value.strip().lower()
     if fmt == "md":
@@ -121,3 +206,14 @@ def _normalize_format(value: str) -> str:
         expected = ", ".join(sorted(SUPPORTED_EXPORT_FORMATS))
         raise ValueError(f"unsupported export format: {value}; expected one of {expected}")
     return fmt
+
+
+def _text_blocks(text: str) -> list[str]:
+    return [block.strip() for block in text.strip().split("\n\n") if block.strip()]
+
+
+def _docx_paragraph(document: Document, text: str, style: str | None = None) -> None:
+    if style:
+        document.add_paragraph(text, style=style)
+    else:
+        document.add_paragraph(text)
