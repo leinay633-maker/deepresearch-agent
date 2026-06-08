@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 from pathlib import Path
 import urllib.error
 import urllib.request
@@ -97,6 +98,60 @@ def test_hybrid_retrieval_fuses_keyword_and_vector_results(tmp_path: Path) -> No
     assert results[0].metadata["fusion"] == "rrf"
     assert results[0].metadata["local_doc_id"] == "vector"
     assert results[0].metadata["vector_rank"] == 1
+    assert retriever.last_retrieval_degraded is False
+    assert retriever.last_degrade_reason is None
+
+
+def test_hybrid_retrieval_degrades_to_keyword_when_vector_build_fails(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    corpus = tmp_path / "corpus.jsonl"
+    _write_corpus(
+        corpus,
+        [
+            {
+                "id": "keyword",
+                "title": "Keyword evidence",
+                "url": "file://keyword",
+                "content": "citation checker overlap support",
+            },
+            {
+                "id": "other",
+                "title": "Other note",
+                "url": "file://other",
+                "content": "latency budget retry fallback",
+            },
+        ],
+    )
+
+    async def fail_build(self) -> None:
+        del self
+        raise RuntimeError("synthetic vector build failure")
+
+    monkeypatch.setattr("deepresearch_agent.rag.ChromaVectorIndex.build", fail_build)
+    retriever = LocalRagRetriever(
+        corpus_path=corpus,
+        settings=Settings(
+            local_retrieval_mode="hybrid",
+            local_keyword_top_k=2,
+            local_vector_top_k=2,
+        ),
+        embedding_provider=StaticEmbeddingProvider(),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="deepresearch_agent.rag"):
+        results = asyncio.run(retriever.retrieve("citation support", max_results=1))
+
+    assert results[0].metadata["retrieval_mode"] == "keyword"
+    assert results[0].metadata["local_doc_id"] == "keyword"
+    assert results[0].metadata["retrieval_degraded"] is True
+    assert "synthetic vector build failure" in results[0].metadata["degrade_reason"]
+    assert retriever.last_retrieval_degraded is True
+    assert retriever.last_degrade_reason is not None
+    assert "synthetic vector build failure" in retriever.last_degrade_reason
+    assert "local hybrid retrieval degraded to keyword-only" in caplog.text
 
 
 def test_persistent_vector_index_reuses_existing_collection(tmp_path: Path) -> None:

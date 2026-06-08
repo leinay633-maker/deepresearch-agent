@@ -310,6 +310,15 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 代价：它只约束当前 Python 进程，不是跨进程/跨机器全局 quota；backoff 也没有解析 provider-specific `Retry-After`，不理解不同套餐或动态配额。生产化仍需要 provider-specific backoff、分布式 rate limit 和集中任务队列。
 面试怎么答：我会说我先把 retry backoff 和 rate limit 作为 SearchService 的可配置保护补上，避免并发 researcher 直接打爆外部搜索，失败时也不要马上重试；但我不会把它说成生产级全局限流。
 
+## 决策 32：为什么 hybrid local retrieval 缺向量能力时降级到 keyword
+
+背景：默认 `LOCAL_RETRIEVAL_MODE=hybrid` 能展示关键词 + 向量 + RRF 的完整检索结构，但在没有 Chroma、没有本地 embedding 模型，或者向量索引 build/search 失败的机器上，原实现会直接抛错并打断整条 research run。
+可选方案：把默认改回 keyword；要求所有环境必须安装 ML extras；在 API/spine 测试里手动覆盖成 keyword；保留默认 hybrid，但向量侧不可用时自动降级到 keyword-only。
+最终选择：保留默认 hybrid，不改 CLI / HTTP API；`LocalRagRetriever.retrieve()` 在 hybrid 模式下捕获 vector build/search/embedding 异常，写 `logging.warning`，把本次 retrieval 标成 `last_retrieval_degraded=True`，并返回 keyword 结果。返回的 `Source.metadata` 会带 `retrieval_degraded=True` 和 `degrade_reason`。
+理由：这符合项目“无 key / 弱环境也能跑通”的底线，同时不把降级伪装成正常 hybrid。下游 orchestrator 仍只接收统一 `Source`，不用改主链路。
+代价：降级后没有向量召回和 rerank，结果质量回到 keyword baseline；metadata 只标注 local RAG source，最终 dedup 后如果同 URL 被其他 provider 覆盖，需要看 trace/source metadata 分析。
+面试怎么答：我会说 hybrid 是默认能力，但不是让运行环境因为一个向量依赖失败就整体挂掉。真正工程化要可观测地降级，而不是静默吞错或把 keyword 结果说成 hybrid。
+
 # 5 实现细节
 
 Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。`ResearchRequest.planner_model` 或 `LLM_PLANNER_MODEL` 可以覆盖 planning stage 的模型名。局限是 planner 还不会根据 researcher 中间结果做 LLM 语义级动态追加子问题。
@@ -330,7 +339,7 @@ MCP Tool Adapter：`src/deepresearch_agent/mcp_tools.py`。`McpToolSearchAdapter
 
 Embedding Provider：`src/deepresearch_agent/embeddings.py`。输入文本列表，输出向量列表。默认 `LocalEmbeddingProvider` 使用 `sentence-transformers` 加载 `BAAI/bge-small-zh-v1.5`，无 API key；`DashScopeEmbeddingProvider` 调百炼 OpenAI-compatible embeddings endpoint，key 只从 `DASHSCOPE_API_KEY` 读。验证脚本是 `src/deepresearch_agent/validate_embeddings.py`，本机 local BGE 实测维度 `512`；DashScope 因未配置 key，只做了 stub endpoint 解析测试。
 
-Hybrid Local Retriever：`src/deepresearch_agent/rag.py`。输入 query 和 top-k，输出统一 `Source`。keyword 路按 token overlap 排序；vector 路先把 `data/local_corpus.jsonl` 分块，用 embedding 建 vector index，再做相似度检索；融合用 RRF，metadata 记录 keyword_rank、vector_rank、vector_index_provider、fusion score 和权重。默认 vector index provider 是 Chroma；设置 `LOCAL_VECTOR_INDEX_PERSIST=true` 后，Chroma 会写入 `LOCAL_VECTOR_INDEX_PATH`，collection 名由 corpus chunk、embedding provider 和 model 指纹决定，count 匹配时复用已有 collection；设置 `LOCAL_VECTOR_INDEX_PROVIDER=qdrant` 后会通过 Qdrant HTTP API 创建/复用 collection、upsert point 并 search。局限是 Qdrant 目前只有 stub HTTP 单测，没有真实服务 benchmark，也没有索引管理后台、payload filter 或权限隔离。
+Hybrid Local Retriever：`src/deepresearch_agent/rag.py`。输入 query 和 top-k，输出统一 `Source`。keyword 路按 token overlap 排序；vector 路先把 `data/local_corpus.jsonl` 分块，用 embedding 建 vector index，再做相似度检索；融合用 RRF，metadata 记录 keyword_rank、vector_rank、vector_index_provider、fusion score 和权重。默认 vector index provider 是 Chroma；设置 `LOCAL_VECTOR_INDEX_PERSIST=true` 后，Chroma 会写入 `LOCAL_VECTOR_INDEX_PATH`，collection 名由 corpus chunk、embedding provider 和 model 指纹决定，count 匹配时复用已有 collection；设置 `LOCAL_VECTOR_INDEX_PROVIDER=qdrant` 后会通过 Qdrant HTTP API 创建/复用 collection、upsert point 并 search。现在 hybrid 模式下如果向量索引或 embedding 路径抛错，会降级到 keyword-only，并在 `LocalRagRetriever.last_retrieval_degraded`、`last_degrade_reason` 和返回 `Source.metadata` 里显式标注原因。局限是 Qdrant 目前只有 stub HTTP 单测，没有真实服务 benchmark，也没有索引管理后台、payload filter 或权限隔离。
 
 Document Corpus Ingestor：`src/deepresearch_agent/ingest_corpus.py`。输入是本地文件夹，输出是 `LocalRagRetriever` 可直接消费的 JSONL，每行包含 `id/title/url/content/metadata`。它支持 `.md/.markdown/.txt/.pdf/.docx`，默认排除 `.git/.obsidian/.claude/node_modules/__pycache__`；Markdown 会清理 YAML frontmatter，用 H1 或文件名生成 title；PDF 通过 `pypdf` 抽取每页文本；DOCX 通过 `python-docx` 抽取段落和表格文本；metadata 记录 `source_path` 和 `ingest_format`。局限是它不做扫描件 OCR、增量 manifest、去重、权限过滤或自动触发 vector index rebuild。
 
@@ -581,6 +590,15 @@ Run Review UI：`src/deepresearch_agent/ui.py` 和 `src/deepresearch_agent/api.p
 复盘：本地 limiter/backoff 是可靠性保护，不是质量提升。它减少 burst 和立即重试风险，但不能替代 provider-specific `Retry-After`、429 策略或跨 worker 全局配额。
 面试可能追问：为什么不直接做 Redis 限流？回答：当前项目默认无外部依赖；先把 SearchService 层的限流接口和测试打出来，生产化再换 Redis/网关级全局 limiter。
 
+## 问题 26：默认 hybrid retrieval 在缺向量依赖时会打断无关测试
+
+现象：`local_retrieval_mode` 默认是 `hybrid`，但 `ChromaVectorIndex.build()` 在 Chroma 或 embedding 路径不可用时会抛错；在没有装好 ML 依赖的机器或 CI 上，`test_api`、`test_spine`、`test_rerankers` 这类本来只想验证 API/编排/rerank 语义的测试也可能被 local vector index 冷启动或缺依赖拖垮。
+原因：`LocalRagRetriever.retrieve()` 之前在 hybrid 模式下无保护地调用 `_vector_retrieve()`，没有把向量召回当成可失败的本地工具，也没有把降级状态写回 source metadata。
+排查：先读 `README.md`、`AGENTS.md`、`pyproject.toml`、`rag.py`、`cost.py`、`api.py`、`orchestrator.py`、`search.py`，确认 orchestrator 主链路只依赖 `LocalRagRetriever.retrieve()` 返回统一 `Source`；因此修复可以限制在检索层，不需要改 API 或 researcher 流程。
+修复：在 `retrieve()` 中只包住 vector retrieval 路径，捕获 Chroma 缺失、embedding 加载失败、索引 build/search 抛错等异常；记录 `logging.warning`，设置 `last_retrieval_degraded/last_degrade_reason`，并返回 keyword-only 结果。降级 source 的 metadata 增加 `retrieval_degraded=True` 和 `degrade_reason`。Chroma 正常时原 hybrid + RRF 路径不变。
+复盘：这是可靠性修复，不是质量优化。默认 hybrid 仍保留，但工程系统不能把一个 optional vector path 失败放大成整条 research run 失败。
+面试可能追问：降级会不会掩盖问题？回答：不会静默掩盖，因为 warning、retriever 状态和 source metadata 都能看到降级原因；它只是保证弱环境先跑通，真实质量评测仍要区分 keyword 和 hybrid 口径。
+
 # 7 实测数据
 
 本节所有 mock benchmark 数字只用于证明 pipeline plumbing 能端到端跑通，不能当作真实性能、真实成本或真实答案质量成果。尤其不能在面试里说“我的 DeepResearch p50 是个位数毫秒”这类话，因为这个延迟测的是本机 Python 跑 deterministic mock 的速度，换机器、换进程热身状态、换依赖版本都会变。
@@ -622,7 +640,7 @@ Run control retry/cancellation smoke：`py -3.11 -m pytest tests/test_run_contro
 
 Local worker loop smoke：`py -3.11 -m pytest tests/test_run_worker.py tests/test_run_control.py -q` 最近一次成功，`17 passed, 1 warning in 8.66s`。测试覆盖 `run_worker_loop(max_runs=1)` 能消费一个 `defer_execution=true` 的 queued run 并执行到 `succeeded`，summary 记录 `processed_count=1`、`stopped_reason=max_runs`；空队列时 `idle_exit=True` 返回 `processed_count=0`、`idle_polls=1`、`stopped_reason=idle`。这里没有做多进程 worker 竞争压测，也没有 Redis/Celery broker；取消也不是强制抢占已经发出的 LLM/search 请求。
 
-Persistent vector index / Qdrant provider smoke：`py -3.11 -m pytest tests/test_hybrid_retrieval.py -q` 成功，最新结果 `5 passed, 1 warning in 2.55s`。测试用静态 embedding provider 和临时 Chroma PersistentClient 验证：第一次检索会 embed 2 个 corpus chunk 和 1 个 query，第二个 `LocalRagRetriever` 指向同一 `LOCAL_VECTOR_INDEX_PATH` 时只 embed query，不重新 embed corpus；`ChromaVectorIndex.reused_existing` 为 `True`。新增 Qdrant stub HTTP 测试覆盖 collection missing 时 create collection、upsert points、search 返回指定 chunk、`api-key` header 从环境变量读取，以及已有 collection points_count 匹配时复用 collection、不重新 embed corpus。这里没有启动真实 Qdrant 服务，也没有做真实 BGE 冷/热启动或外部向量库延迟 benchmark。
+Persistent vector index / Qdrant provider / local retrieval degrade smoke：`py -3.11 -m pytest tests/test_hybrid_retrieval.py tests/test_api.py tests/test_spine.py tests/test_rerankers.py -q` 成功，最新结果 `12 passed, 2 warnings in 98.40s`。测试用静态 embedding provider 和临时 Chroma PersistentClient 验证：第一次检索会 embed 2 个 corpus chunk 和 1 个 query，第二个 `LocalRagRetriever` 指向同一 `LOCAL_VECTOR_INDEX_PATH` 时只 embed query，不重新 embed corpus；`ChromaVectorIndex.reused_existing` 为 `True`。Qdrant stub HTTP 测试覆盖 collection missing 时 create collection、upsert points、search 返回指定 chunk、`api-key` header 从环境变量读取，以及已有 collection points_count 匹配时复用 collection、不重新 embed corpus。新增 graceful degrade 回归用 monkeypatch 让 `ChromaVectorIndex.build()` 抛 `RuntimeError("synthetic vector build failure")`，断言 hybrid 不崩、返回 keyword source、metadata 带 `retrieval_degraded=True/degrade_reason`，且 `LocalRagRetriever.last_retrieval_degraded` 和 warning 日志都可观察。这里没有启动真实 Qdrant 服务，也没有做真实 BGE 冷/热启动或外部向量库延迟 benchmark。
 
 Document corpus ingest smoke：`py -3.11 -m pytest tests/test_ingest_corpus.py tests/test_hybrid_retrieval.py -q` 成功，最新结果 `7 passed, 1 warning in 3.64s`。测试覆盖 Markdown YAML frontmatter 清理、H1 title 抽取、TXT 文件名 title、`.obsidian` 目录排除、空文档跳过、PDF 文本抽取、DOCX 段落/表格文本抽取、输出 JSONL 的 `id/title/url/content/metadata` 字段，以及生成的 corpus 能被 `LocalRagRetriever(local_retrieval_mode="keyword")` 直接检索；同组也覆盖 Chroma/Qdrant hybrid retrieval 回归。这里没有测试扫描件 OCR、增量 reindex、权限过滤或大规模 corpus。
 

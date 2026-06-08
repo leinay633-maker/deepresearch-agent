@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import urllib.error
@@ -16,6 +17,8 @@ from deepresearch_agent.config import Settings, load_settings
 from deepresearch_agent.embeddings import EmbeddingProvider, build_embedding_provider
 from deepresearch_agent.rerankers import RerankProvider, build_rerank_provider
 from deepresearch_agent.schemas import Source
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -64,8 +67,12 @@ class LocalRagRetriever:
         self.embedding_provider = embedding_provider
         self.rerank_provider = rerank_provider
         self._vector_index: VectorIndex | None = None
+        self.last_retrieval_degraded = False
+        self.last_degrade_reason: str | None = None
 
     async def retrieve(self, query: str, max_results: int = 2) -> list[Source]:
+        self.last_retrieval_degraded = False
+        self.last_degrade_reason = None
         mode = self.settings.local_retrieval_mode.strip().lower()
         keyword_top_k = max(max_results, self.settings.local_keyword_top_k)
         keyword_results = self._keyword_retrieve(query, top_k=keyword_top_k)
@@ -75,7 +82,15 @@ class LocalRagRetriever:
             raise ValueError(f"unknown local retrieval mode: {mode}")
 
         vector_top_k = max(max_results, self.settings.local_vector_top_k)
-        vector_results = await self._vector_retrieve(query, top_k=vector_top_k)
+        try:
+            vector_results = await self._vector_retrieve(query, top_k=vector_top_k)
+        except Exception as exc:
+            return self._degraded_keyword_sources(
+                query,
+                keyword_results,
+                max_results=max_results,
+                reason=f"{type(exc).__name__}: {exc}",
+            )
         fused = self._rrf_fuse(keyword_results, vector_results)
         candidate_count = (
             max(max_results, self.settings.local_rerank_candidate_k)
@@ -208,6 +223,35 @@ class LocalRagRetriever:
                 )
             )
         return sources
+
+    def _degraded_keyword_sources(
+        self,
+        query: str,
+        ranked: list[RankedChunk],
+        *,
+        max_results: int,
+        reason: str,
+    ) -> list[Source]:
+        self.last_retrieval_degraded = True
+        self.last_degrade_reason = reason
+        logger.warning(
+            "local hybrid retrieval degraded to keyword-only: %s",
+            reason,
+        )
+        sources = self._sources_from_ranked(
+            query,
+            ranked[:max_results],
+            mode="keyword",
+        )
+        output = []
+        for source in sources:
+            metadata = {
+                **source.metadata,
+                "retrieval_degraded": True,
+                "degrade_reason": reason,
+            }
+            output.append(source.model_copy(update={"metadata": metadata}))
+        return output
 
     async def _rerank_sources(
         self, query: str, sources: list[Source], max_results: int

@@ -228,12 +228,13 @@
 [状态: 待消化]
 标签：RAG / Retriever
 检索关键词：LocalRagRetriever, local_corpus, hybrid retrieval
-回答：当前 RAG 是 `LocalRagRetriever`，读取 `data/local_corpus.jsonl` 后先分块。语料既可以手写 JSONL，也可以用 `ingest_corpus.py` 从 Markdown/TXT/PDF/DOCX 文件夹生成。检索支持两种模式：`keyword` 是旧基线，用 token overlap 排序；`hybrid` 是默认模式，用关键词召回和 BGE 向量召回两路并存，再用 RRF 融合。向量侧用 `sentence-transformers` 的 `BAAI/bge-small-zh-v1.5` 生成 embedding，默认用 Chroma 建本地 index；如果设置 `LOCAL_VECTOR_INDEX_PERSIST=true`，会按 corpus 和 embedding 模型指纹复用本地 Chroma collection；如果设置 `LOCAL_VECTOR_INDEX_PROVIDER=qdrant`，会走 Qdrant HTTP vector index provider。无论哪种模式，最后都返回统一的 `Source`，所以下游 dedup、verifier、synthesizer 不需要改。
+回答：当前 RAG 是 `LocalRagRetriever`，读取 `data/local_corpus.jsonl` 后先分块。语料既可以手写 JSONL，也可以用 `ingest_corpus.py` 从 Markdown/TXT/PDF/DOCX 文件夹生成。检索支持两种模式：`keyword` 是旧基线，用 token overlap 排序；`hybrid` 是默认模式，用关键词召回和 BGE 向量召回两路并存，再用 RRF 融合。向量侧用 `sentence-transformers` 的 `BAAI/bge-small-zh-v1.5` 生成 embedding，默认用 Chroma 建本地 index；如果设置 `LOCAL_VECTOR_INDEX_PERSIST=true`，会按 corpus 和 embedding 模型指纹复用本地 Chroma collection；如果设置 `LOCAL_VECTOR_INDEX_PROVIDER=qdrant`，会走 Qdrant HTTP vector index provider。现在 hybrid 下如果 Chroma、embedding 或 vector search 不可用，会可观测地降级成 keyword-only：source metadata 会带 `retrieval_degraded=True/degrade_reason`，retriever 也记录 `last_retrieval_degraded` 和原因。无论哪种模式，最后都返回统一的 `Source`，所以下游 dedup、verifier、synthesizer 不需要改。
 关联模块：`rag.py`, `ingest_corpus.py`, `embeddings.py`, `data/local_corpus.jsonl`
 可追问：
 1. 为什么不用向量替换关键词？
 2. embedding 成本和延迟怎么控制？
 3. 本地 RAG 和 web search 冲突怎么办？
+4. hybrid 降级后怎么知道不是正常向量召回？
 
 ## Q：为什么 Qdrant 已接入但默认仍不是 Qdrant/Milvus？
 [状态: 待消化]
