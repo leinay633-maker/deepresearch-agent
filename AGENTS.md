@@ -247,7 +247,7 @@ open_deep_research、DeerFlow v1 均为 MIT。保持本仓库是自己重写的�
 必做任务：
 
 1. 本地检索 graceful fallback：默认仍为 `hybrid`，但当 Chroma、embedding provider、vector index build/search 任一环节不可用时，自动降级到 keyword-only；返回的 `Source.metadata` 必须包含 `retrieval_degraded=True` 和 `degrade_reason`，`LocalRagRetriever` 需要暴露最近一次降级状态和原因，并用 `logging.warning` 记录；Chroma 正常时不能误降级。
-2. 文档校正：用真实 `pytest -q` 结果替换所有 `20 passed`；把 `REVIEW_PACKAGE_README.md` 里的限制、未实测项和实测结果整理进正式 `README.md` 的 `Limitations / Future work` 小节；确认无引用后删除 `REVIEW_PACKAGE_README.md` 和 `PACKAGE_INFO.md` 这类交接/打包文件。
+2. 文档校正：用真实 `pytest -q` 结果替换旧测试数量记录；把临时交接说明里的限制、未实测项和实测结果整理进正式 `README.md` 的 `Limitations / Future work` 小节；确认无引用后删除交接/打包文件。
 3. 成本计价修正：`cost.py` 只保留核对过官方价格的 `deepseek-v4-flash`，删除把 `deepseek-chat`、`deepseek-reasoner` 映射到 v4-flash 价格的 alias；未知模型继续显式抛 `ValueError`，新增测试覆盖。
 
 可选任务：

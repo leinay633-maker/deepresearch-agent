@@ -213,7 +213,7 @@ Crawler：
 Local retrieval：
 
 - `keyword`：旧基线，只按本地语料 token overlap 排序。
-- `hybrid`：默认本地检索模式，关键词召回 + BGE 向量召回 + Chroma index + RRF 融合，仍输出统一 `Source`。
+- `hybrid`：默认本地检索模式，关键词召回 + BGE 向量召回 + Chroma index + RRF 融合，仍输出统一 `Source`。如果 Chroma、embedding 或 vector search 不可用，会降级为 keyword-only，并在 source metadata 里记录 `retrieval_degraded=True` 和 `degrade_reason`。
 - embedding provider 默认 `local`，模型是 `BAAI/bge-small-zh-v1.5`；可显式切到 `dashscope`，key 从 `DASHSCOPE_API_KEY` 读。
 - rerank provider 默认 `local`，模型是 `BAAI/bge-reranker-base`，但 `--rerank-enabled` 才会启用；也可以显式切到 DashScope rerank。
 - 持久化向量索引默认关闭；设置 `LOCAL_VECTOR_INDEX_PERSIST=true` 后会把 Chroma index 写到 `LOCAL_VECTOR_INDEX_PATH`（默认 `data/vector_index`，已 gitignore），按 corpus + embedding provider + model 指纹复用 collection。
@@ -230,6 +230,23 @@ Answer judge：
 - `none`：默认，public eval 只产 artifacts，不做 answer-quality scoring。
 - `heuristic`：本地无 key answer judge，只检查 ground-truth 字符串是否出现在答案里。
 - `deepseek`：可选 LLM answer judge，使用 DeepSeek JSON mode，默认沿用生效的 DeepSeek 模型，也可用 CLI `--judge-model` 覆盖；需要 `DEEPSEEK_API_KEY`。这不是官方 LiveDRBench/Deep Research Bench judge。
+
+## Limitations / Future work
+
+当前完整测试结果：`py -3.11 -m pytest -q` 通过，`88 passed, 2 warnings in 70.04s`。warning 来自 FastAPI/Starlette 的 TestClient deprecation 和 OpenTelemetry metadata deprecation，未影响功能。
+
+实测口径需要严格区分：mock benchmark 只证明离线路径、trace、citation ID 和记录链路能跑，不能当真实性能、真实成本或真实答案质量成果；DeepSeek v4-flash + Wikipedia benchmark 是真实 provider 小样本，延迟包含网络/API 时间，citation retention 仍是 lexical checker 口径，不是语义级事实评分。
+
+当前主要限制：
+
+- 真实 LLM 路径主要实测 DeepSeek v4-flash；OpenAI-compatible adapter 只有 stub/路由测试，OpenAI/Anthropic 原生 provider 尚未实现。
+- Wikipedia adapter 能真实跑，但不是生产级搜索；Brave/Tavily 需要 API key，当前只做请求/解析单测；SearxNG 需要自建 endpoint。
+- Local hybrid retrieval 已实现并有 BEIR/scifact 检索评测，但 5 case 端到端小样本里 success_rate 低于 keyword baseline，不能包装成质量稳定提升。
+- DashScope embedding/rerank provider 已有 stub 测试，本机未配置 `DASHSCOPE_API_KEY`，所以没有真实百炼延迟、费用或质量数字。
+- Qdrant HTTP vector index 只有 stub HTTP 单测，没有真实 Qdrant live benchmark、索引生命周期、权限过滤或增量 reindex。
+- Citation checker 默认仍是 lexical grounding；heuristic/DeepSeek judge 是可选扩展，DeepSeek judge 尚未做 live benchmark，也不是官方 LiveDRBench/Deep Research Bench judge。
+- Run control 当前是 SQLite 单机版本；没有 Redis/Postgres/Celery worker pool、跨进程强制取消、权限系统或多人协作。
+- Report export 已支持 Markdown/HTML/JSON/PDF/DOCX/PPTX/WAV，但都是文本版交付；WAV 是 Windows SAPI 摘要，不是完整 podcast/TTS 制作系统。
 
 ## Project Layout
 
