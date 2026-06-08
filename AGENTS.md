@@ -230,3 +230,26 @@ open_deep_research、DeerFlow v1 均为 MIT。保持本仓库是自己重写的�
 3. 接 P4 的 citation grounding，使端到端评测能解释“错在哪里”。
 4. 做 P3 的动态 planning loop，让系统从一次性 pipeline 接近真实 deep research agent。
 5. 再做 P2/P5/P6/P7/P8/P9，分别补工具生态、审核体验、生产控制面、私有知识库、多模型和内容交付。
+
+---
+
+## 10. 当前有界清理任务（2026-06-08）
+
+本节记录一次面向 portfolio 质量的有界清理改动。执行前必须先读 `README.md`、`AGENTS.md`、`pyproject.toml`，以及 `src/deepresearch_agent/` 下的 `rag.py`、`cost.py`、`api.py`、`orchestrator.py`、`search.py`，理解现状后再动手。
+
+全局约束：
+
+- 改动小而精准；不做重构，不引入新的运行时依赖，不改变现有 CLI / HTTP API 行为，除非任务明确要求。
+- 每处改动必须有对应测试；完成后 `pytest -q` 必须全绿。
+- 保持诚实口径，不把 mock / 小样本数字包装成成果。
+- 小步提交，每个任务一个 commit，沿用 `feat/fix/docs/chore` 风格。
+
+必做任务：
+
+1. 本地检索 graceful fallback：默认仍为 `hybrid`，但当 Chroma、embedding provider、vector index build/search 任一环节不可用时，自动降级到 keyword-only；返回的 `Source.metadata` 必须包含 `retrieval_degraded=True` 和 `degrade_reason`，`LocalRagRetriever` 需要暴露最近一次降级状态和原因，并用 `logging.warning` 记录；Chroma 正常时不能误降级。
+2. 文档校正：用真实 `pytest -q` 结果替换所有 `20 passed`；把 `REVIEW_PACKAGE_README.md` 里的限制、未实测项和实测结果整理进正式 `README.md` 的 `Limitations / Future work` 小节；确认无引用后删除 `REVIEW_PACKAGE_README.md` 和 `PACKAGE_INFO.md` 这类交接/打包文件。
+3. 成本计价修正：`cost.py` 只保留核对过官方价格的 `deepseek-v4-flash`，删除把 `deepseek-chat`、`deepseek-reasoner` 映射到 v4-flash 价格的 alias；未知模型继续显式抛 `ValueError`，新增测试覆盖。
+
+可选任务：
+
+- API 复用昂贵本地 RAG 构建：如果能在不破坏每请求 provider / 模型 / 检索参数覆盖的前提下干净实现，可以用 FastAPI lifespan 共享 provider-independent 的 `LocalRagRetriever`；如果会引入复杂状态或改变对外行为，就跳过并报告原因。
