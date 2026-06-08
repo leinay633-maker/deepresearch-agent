@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from deepresearch_agent.citation import CitationChecker
 from deepresearch_agent.cost import CostTracker, deepseek_usage_cost_usd
 from deepresearch_agent.dedup import SourceDeduplicator
@@ -107,3 +109,14 @@ def test_deepseek_v4_flash_usage_cost_uses_cache_buckets() -> None:
     assert input_tokens == 1000
     assert output_tokens == 200
     assert cost == (250 * 0.0028 + 750 * 0.14 + 200 * 0.28) / 1_000_000
+
+
+def test_deepseek_usage_cost_rejects_unpriced_model_aliases() -> None:
+    with pytest.raises(ValueError, match="pricing is not configured"):
+        deepseek_usage_cost_usd(
+            "deepseek-chat",
+            {
+                "prompt_tokens": 1000,
+                "completion_tokens": 200,
+            },
+        )

@@ -37,8 +37,8 @@ def test_deepseek_provider_sends_stage_specific_models(monkeypatch) -> None:
     provider = RecordingDeepSeekProvider(
         model="deepseek-v4-flash",
         stage_models={
-            "brief_generation": "deepseek-chat",
-            "planning": "deepseek-reasoner",
+            "brief_generation": "deepseek-v4-flash",
+            "planning": "deepseek-v4-flash",
             "synthesis": "deepseek-v4-flash",
         },
     )
@@ -63,8 +63,8 @@ def test_deepseek_provider_sends_stage_specific_models(monkeypatch) -> None:
     asyncio.run(provider.synthesize(brief, plan, [finding], [source], cost))
 
     assert provider.requested_models == [
-        "deepseek-chat",
-        "deepseek-reasoner",
+        "deepseek-v4-flash",
+        "deepseek-v4-flash",
         "deepseek-v4-flash",
     ]
     assert [record.model for record in cost.records] == provider.requested_models

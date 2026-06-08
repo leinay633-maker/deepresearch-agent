@@ -233,7 +233,7 @@ Answer judge：
 
 ## Limitations / Future work
 
-当前完整测试结果：`py -3.11 -m pytest -q` 通过，`88 passed, 2 warnings in 70.04s`。warning 来自 FastAPI/Starlette 的 TestClient deprecation 和 OpenTelemetry metadata deprecation，未影响功能。
+当前完整测试结果：`py -3.11 -m pytest -q` 通过，`89 passed, 2 warnings in 69.53s`。warning 来自 FastAPI/Starlette 的 TestClient deprecation 和 OpenTelemetry metadata deprecation，未影响功能。
 
 实测口径需要严格区分：mock benchmark 只证明离线路径、trace、citation ID 和记录链路能跑，不能当真实性能、真实成本或真实答案质量成果；DeepSeek v4-flash + Wikipedia benchmark 是真实 provider 小样本，延迟包含网络/API 时间，citation retention 仍是 lexical checker 口径，不是语义级事实评分。
 

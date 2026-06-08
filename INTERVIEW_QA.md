@@ -59,7 +59,7 @@
 [状态: 待消化]
 标签：LLM Provider / 选型
 检索关键词：DeepSeek, JSON mode, provider decision
-回答：我需要一个真实 provider 来验证 structured output、usage 解析和成本归因，但又不能让默认运行依赖 API key。DeepSeek 的 API 兼容 OpenAI Chat Completions，支持 JSON Output，足够验证 brief、planner、synthesis 这些结构化输出；默认仍保留 mock，只有显式传 `--llm-provider deepseek` 才走真实模型。现在默认真实模型已切到显式 `deepseek-v4-flash`，legacy alias 只为兼容旧配置保留。后面我又补了 `openai-compatible` 通用 adapter，但它目前只做了 stub 单测，还没有 live benchmark。
+回答：我需要一个真实 provider 来验证 structured output、usage 解析和成本归因，但又不能让默认运行依赖 API key。DeepSeek 的 API 兼容 OpenAI Chat Completions，支持 JSON Output，足够验证 brief、planner、synthesis 这些结构化输出；默认仍保留 mock，只有显式传 `--llm-provider deepseek` 才走真实模型。现在默认真实模型已切到显式 `deepseek-v4-flash`；价格表也只保留官方核对过的 v4-flash，未配置价格的旧模型名会直接报错，避免静默用错成本。后面我又补了 `openai-compatible` 通用 adapter，但它目前只做了 stub 单测，还没有 live benchmark。
 关联模块：`llm.py`, `config.py`, `KNOWLEDGE_BASE.md`
 可追问：
 1. 为什么不用 OpenAI？
