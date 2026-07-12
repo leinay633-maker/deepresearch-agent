@@ -23,6 +23,7 @@ from deepresearch_agent.benchmark import (
     mark_live_judge_nondeterminism,
     portable_artifact_path,
     refresh_replayed_case_result,
+    sanitized_settings_snapshot,
 )
 from deepresearch_agent.config import load_settings
 from deepresearch_agent.eval_judge import build_eval_judge_provider
@@ -162,7 +163,7 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
         "fallback_policy": fallback_policy,
         "official_judge_score": "not_run",
         "settings": {
-            **asdict(effective_settings),
+            **sanitized_settings_snapshot(effective_settings),
             "llm_model": effective_llm_model,
             "stage_models": stage_models,
             "max_results": args.max_results,

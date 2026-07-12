@@ -26,6 +26,7 @@ class ResearchStageArtifacts:
     raw_search_count: int
     fallback_count: int
     degraded_count: int
+    budget_exhausted_count: int
     all_sources: list[Source]
     sources: list[Source]
 
@@ -131,6 +132,11 @@ class ResearchExecutionEngine:
         fallback_count = sum(1 for _, outcome in research_results if outcome.fallback_used)
         degraded_count = sum(1 for _, outcome in research_results if outcome.degraded)
         preliminary_findings = [finding for finding, _ in research_results]
+        budget_exhausted_count = sum(
+            1
+            for finding in preliminary_findings
+            if finding.research is not None and finding.research.budget_exhausted
+        )
 
         stage_start = trace.now()
         all_sources = [source for finding in preliminary_findings for source in finding.sources]
@@ -153,6 +159,7 @@ class ResearchExecutionEngine:
             raw_search_count=raw_search_count,
             fallback_count=fallback_count,
             degraded_count=degraded_count,
+            budget_exhausted_count=budget_exhausted_count,
             all_sources=all_sources,
             sources=sources,
         )

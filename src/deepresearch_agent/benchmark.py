@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import subprocess
 import time
 from dataclasses import asdict, replace
@@ -48,6 +49,21 @@ SUCCESS_SEMANTICS = (
     "deprecated alias of execution_success; answer quality requires an explicit judge"
 )
 PROMPT_VERSION = "source-bundle-v1"
+_SECRET_SETTING_NAMES = {"otel_exporter_otlp_headers", "mcp_args"}
+_SECRET_SETTING_SUFFIXES = ("_password", "_secret", "_api_token", "_access_token")
+
+
+def sanitized_settings_snapshot(settings: Any) -> dict[str, Any]:
+    """Serialize settings without persisting credential-bearing values."""
+
+    snapshot = asdict(settings)
+    for key in list(snapshot):
+        lowered = key.lower()
+        if lowered in _SECRET_SETTING_NAMES or lowered.endswith(
+            _SECRET_SETTING_SUFFIXES
+        ):
+            snapshot[key] = "<redacted>" if snapshot[key] else ""
+    return snapshot
 
 
 def build_benchmark_manifest(
@@ -68,7 +84,7 @@ def build_benchmark_manifest(
 ) -> dict[str, Any]:
     """Build a self-contained, secret-free identity for one benchmark run."""
 
-    git_commit_sha, git_dirty = _git_metadata(root)
+    git_commit_sha, git_dirty, git_worktree_hash = _git_metadata(root)
     prompt_bundle_hash = _prompt_bundle_hash(root)
     dataset_version = f"sha256:{_sha256_json(cases)}"
     normalized_replay_dir = portable_artifact_path(replay_dir, root) if replay_dir else None
@@ -101,6 +117,8 @@ def build_benchmark_manifest(
     identity = {
         "schema_version": "1.0",
         "git_commit_sha": git_commit_sha,
+        "git_dirty": git_dirty,
+        "git_worktree_hash": git_worktree_hash,
         "benchmark_name": benchmark_name,
         "dataset_name": dataset_name,
         "dataset_version": dataset_version,
@@ -149,6 +167,7 @@ def build_case_evaluation_metrics(
             "citation_grounding": None,
             "citation_coverage": None,
             "unsupported_claim_rate": None,
+            "claim_extraction_valid": False,
             "source_quality": None,
             "tool_failure_attempted": failure_attempted,
             "tool_failure_recovered": 0.0 if failure_attempted else None,
@@ -193,6 +212,7 @@ def build_case_evaluation_metrics(
         "citation_precision": _round_optional(report.citation_check.citation_precision),
         "citation_coverage": _round_optional(citation_coverage),
         "unsupported_claim_rate": _round_optional(unsupported_claim_rate),
+        "claim_extraction_valid": report.citation_check.claim_extraction_valid,
         "source_quality": _round_optional(source_quality),
         "tool_failure_attempted": failure_attempted,
         "tool_failure_recovered": failure_recovered,
@@ -240,6 +260,7 @@ def refresh_replayed_case_result(
         "citation_coverage": citation_check.citation_coverage,
         "unsupported_claim_rate": citation_check.unsupported_claim_rate,
         "citation_retention_rate": citation_check.retention_rate,
+        "claim_extraction_valid": citation_check.claim_extraction_valid,
     }
     report = report.model_copy(
         update={"citation_check": citation_check, "metrics": report_metrics}
@@ -266,6 +287,9 @@ def evaluation_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     unsupported_claim_rate = _present_numbers(records, "unsupported_claim_rate")
     source_quality = _present_numbers(records, "source_quality")
     tool_failure_recovery = _present_numbers(records, "tool_failure_recovery")
+    claim_extraction_valid_count = sum(
+        1 for record in records if record.get("claim_extraction_valid") is True
+    )
     case_count = len(records)
     return {
         "execution_success_count": execution_success_count,
@@ -282,6 +306,12 @@ def evaluation_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         "citation_precision_avg": _average(citation_precision),
         "citation_coverage_avg": _average(citation_coverage),
         "unsupported_claim_rate_avg": _average(unsupported_claim_rate),
+        "claim_extraction_valid_count": claim_extraction_valid_count,
+        "claim_extraction_valid_rate": round(
+            claim_extraction_valid_count / case_count, 4
+        )
+        if case_count
+        else 0.0,
         "source_quality_avg": _average(source_quality),
         "tool_failure_recovery_applicable_count": len(tool_failure_recovery),
         "tool_failure_recovery_avg": _average(tool_failure_recovery),
@@ -370,7 +400,14 @@ def _prompt_bundle_hash(root: Path) -> str:
     return f"sha256:{digest.hexdigest()}"
 
 
-def _git_metadata(root: Path) -> tuple[str | None, bool | None]:
+def _git_metadata(root: Path) -> tuple[str | None, bool | None, str | None]:
+    """Return commit and a content hash that distinguishes dirty worktrees.
+
+    The hash covers staged/unstaged tracked changes plus untracked, non-ignored
+    files. Only the digest is stored, so local source or secret contents never
+    enter benchmark artifacts.
+    """
+
     try:
         sha = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -380,15 +417,47 @@ def _git_metadata(root: Path) -> tuple[str | None, bool | None]:
             text=True,
         ).stdout.strip()
         status = subprocess.run(
-            ["git", "status", "--porcelain"],
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
             cwd=root,
             check=True,
             capture_output=True,
-            text=True,
         ).stdout
     except (OSError, subprocess.CalledProcessError):
-        return None, None
-    return sha or None, bool(status.strip())
+        return None, None, None
+    if not status:
+        return sha or None, False, None
+
+    try:
+        tracked_diff = subprocess.run(
+            ["git", "diff", "--binary", "HEAD", "--"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+        ).stdout
+        untracked_output = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return sha or None, True, None
+
+    digest = hashlib.sha256()
+    digest.update(b"tracked-diff\0")
+    digest.update(tracked_diff)
+    for raw_path in sorted(path for path in untracked_output.split(b"\0") if path):
+        digest.update(b"untracked\0")
+        digest.update(len(raw_path).to_bytes(8, "big"))
+        digest.update(raw_path)
+        path = root / os.fsdecode(raw_path)
+        try:
+            content = path.read_bytes()
+        except OSError:
+            content = b"<unreadable-or-removed>"
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return sha or None, True, f"sha256:{digest.hexdigest()}"
 
 
 async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
@@ -457,7 +526,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         citation_judge_model=getattr(args, "citation_judge_model", None)
         or settings.citation_judge_model,
     )
-    settings_snapshot = asdict(effective_settings)
+    settings_snapshot = sanitized_settings_snapshot(effective_settings)
     settings_snapshot["llm_model"] = effective_llm_model
     settings_snapshot["stage_models"] = stage_models
     settings_snapshot["max_results"] = args.max_results
@@ -805,6 +874,7 @@ def _summarize(
                 "citation_precision": record.get("citation_precision"),
                 "citation_coverage": record.get("citation_coverage"),
                 "unsupported_claim_rate": record.get("unsupported_claim_rate"),
+                "claim_extraction_valid": record.get("claim_extraction_valid", False),
                 "source_quality": record.get("source_quality"),
                 "tool_failure_recovery": record.get("tool_failure_recovery"),
                 "tool_failure_attempted": record.get("tool_failure_attempted", False),

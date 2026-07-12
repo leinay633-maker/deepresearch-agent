@@ -19,6 +19,7 @@ def build_execution_metrics(
     deduped_source_count: int,
     fallback_count: int,
     degraded_count: int,
+    budget_exhausted_count: int,
     sources: list[Source],
     citation_report: CitationCheckReport,
 ) -> dict[str, Any]:
@@ -36,6 +37,7 @@ def build_execution_metrics(
         "deduped_source_count": deduped_source_count,
         "fallback_count": fallback_count,
         "degraded_count": degraded_count,
+        "budget_exhausted_count": budget_exhausted_count,
         "citation_retention_rate": citation_report.retention_rate,
         "execution_success": True,
         "task_format_valid": None,
@@ -44,6 +46,7 @@ def build_execution_metrics(
         "citation_precision": citation_report.citation_precision,
         "citation_coverage": citation_report.citation_coverage,
         "unsupported_claim_rate": citation_report.unsupported_claim_rate,
+        "claim_extraction_valid": citation_report.claim_extraction_valid,
         "source_quality": source_quality,
         "tool_failure_recovery": failure_recovery,
         # Kept for existing clients; this is no longer a quality verdict.

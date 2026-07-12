@@ -313,6 +313,12 @@ def test_timed_out_search_still_consumes_agent_tool_budget() -> None:
     assert research is not None
     assert research.tool_calls == 1
     assert research.termination_reason == "deadline"
+    assert research.budget_exhausted is True
+    assert report.metrics["degraded_count"] == 1
+    assert report.metrics["budget_exhausted_count"] == 1
+    assert next(
+        event for event in report.trace_events if event.stage == "run" and event.status == "success"
+    ).payload["degraded"] is True
 
 
 def test_research_deadline_covers_rag_and_decision() -> None:
@@ -362,6 +368,9 @@ def test_research_deadline_covers_rag_and_decision() -> None:
     assert rag_research is not None and rag_research.termination_reason == "deadline"
     assert decision_research is not None and decision_research.termination_reason == "deadline"
     assert rag_research.tool_calls == decision_research.tool_calls == 1
+    assert rag_research.budget_exhausted is True
+    # The decision call timed out only after one grounded item met the minimum.
+    assert decision_research.budget_exhausted is False
 
 
 def test_search_fallback_policy_can_degrade_or_fail_without_mock_pollution() -> None:

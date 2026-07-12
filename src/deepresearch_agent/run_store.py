@@ -130,6 +130,9 @@ class RunStore:
         expected_statuses: set[str],
         expected_worker_id: str | None = None,
         require_unleased: bool = False,
+        event_stage: str | None = None,
+        event_status: str | None = None,
+        event_payload: dict[str, Any] | None = None,
         **fields: Any,
     ) -> AgentRun | None:
         """Conditionally update one run and return ``None`` when the CAS loses.
@@ -176,6 +179,16 @@ class RunStore:
                 f"WHERE run_id = ? AND {' AND '.join(where)}",
                 values,
             )
+            if cursor.rowcount == 1 and event_stage is not None:
+                if event_status is None:
+                    raise ValueError("event_status is required with event_stage")
+                self._insert_event(
+                    connection,
+                    run_id=run_id,
+                    stage=event_stage,
+                    status=event_status,
+                    payload=event_payload,
+                )
         if cursor.rowcount != 1:
             return None
         return self.require_run(run_id)
@@ -188,6 +201,9 @@ class RunStore:
         expected_lease_expires_at: datetime,
         reason: str,
         now: datetime | None = None,
+        event_stage: str | None = None,
+        event_status: str | None = None,
+        event_payload: dict[str, Any] | None = None,
     ) -> AgentRun | None:
         """Fence one exact expired lease so a concurrent heartbeat wins safely."""
 
@@ -210,6 +226,16 @@ class RunStore:
                     _dt(current_time),
                 ),
             )
+            if cursor.rowcount == 1 and event_stage is not None:
+                if event_status is None:
+                    raise ValueError("event_status is required with event_stage")
+                self._insert_event(
+                    connection,
+                    run_id=run_id,
+                    stage=event_stage,
+                    status=event_status,
+                    payload=event_payload,
+                )
         if cursor.rowcount != 1:
             return None
         return self.require_run(run_id)
@@ -222,6 +248,9 @@ class RunStore:
         result_json: dict[str, Any],
         total_tokens: int,
         total_cost: float,
+        event_stage: str | None = None,
+        event_status: str | None = None,
+        event_payload: dict[str, Any] | None = None,
     ) -> AgentRun | None:
         """Commit success only while the run is active and still owned by this worker."""
 
@@ -245,6 +274,16 @@ class RunStore:
                     worker_id,
                 ),
             )
+            if cursor.rowcount == 1 and event_stage is not None:
+                if event_status is None:
+                    raise ValueError("event_status is required with event_stage")
+                self._insert_event(
+                    connection,
+                    run_id=run_id,
+                    stage=event_stage,
+                    status=event_status,
+                    payload=event_payload,
+                )
         if cursor.rowcount != 1:
             return None
         return self.require_run(run_id)
@@ -472,14 +511,14 @@ class RunStore:
     ) -> AgentEvent:
         now = utc_now()
         with self._connect() as connection:
-            cursor = connection.execute(
-                """
-                INSERT INTO agent_events (run_id, stage, status, payload_json, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (run_id, stage, status, _json_dumps(payload or {}), _dt(now)),
+            event_id = self._insert_event(
+                connection,
+                run_id=run_id,
+                stage=stage,
+                status=status,
+                payload=payload,
+                created_at=now,
             )
-            event_id = int(cursor.lastrowid)
         return AgentEvent(
             event_id=event_id,
             run_id=run_id,
@@ -488,6 +527,26 @@ class RunStore:
             payload=payload or {},
             created_at=now,
         )
+
+    def _insert_event(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        stage: str,
+        status: str,
+        payload: dict[str, Any] | None,
+        created_at: Any | None = None,
+    ) -> int:
+        timestamp = created_at or utc_now()
+        cursor = connection.execute(
+            """
+            INSERT INTO agent_events (run_id, stage, status, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (run_id, stage, status, _json_dumps(payload or {}), _dt(timestamp)),
+        )
+        return int(cursor.lastrowid)
 
     def list_events(self, run_id: str, after_event_id: int | None = None) -> list[AgentEvent]:
         sql = "SELECT * FROM agent_events WHERE run_id = ?"

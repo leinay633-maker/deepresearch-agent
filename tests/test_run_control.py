@@ -7,6 +7,7 @@ import threading
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from deepresearch_agent.config import load_settings
@@ -354,6 +355,72 @@ def test_running_cancel_does_not_become_failed(tmp_path, monkeypatch) -> None:
     assert store.require_run(run.run_id).status == "cancelled"
 
 
+def test_terminal_state_and_event_commit_atomically(tmp_path) -> None:
+    store = RunStore(tmp_path / "runs.sqlite")
+    run_id = "atomic-terminal-event"
+    store.create_run(
+        run_id=run_id,
+        query="How should terminal events be committed?",
+        require_approval=False,
+    )
+    with store._connect() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_cancel_event
+            BEFORE INSERT ON agent_events
+            WHEN NEW.status = 'cancelled'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected terminal event failure');
+            END
+            """
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="terminal event failure"):
+        RunController(store=store).cancel(run_id)
+
+    assert store.require_run(run_id).status == "queued"
+    assert not any(event.status == "cancelled" for event in store.list_events(run_id))
+
+
+def test_waiting_approval_state_and_event_commit_atomically(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _client(tmp_path, monkeypatch)
+    store = RunStore(tmp_path / "runs.sqlite")
+    with store._connect() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_waiting_approval_event
+            BEFORE INSERT ON agent_events
+            WHEN NEW.status = 'waiting_approval'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected approval event failure');
+            END
+            """
+        )
+
+    result = asyncio.run(
+        RunController(store=store, settings=load_settings()).create_run(
+            CreateRunRequest(
+                query="How should approval events be committed?",
+                llm_provider="mock",
+                search_provider="mock",
+                max_researchers=1,
+                max_results_per_researcher=1,
+                require_approval=True,
+            )
+        )
+    )
+
+    run = store.list_runs()[0]
+    assert result.status == "failed"
+    assert run.status != "waiting_approval"
+    assert not any(
+        event.status == "waiting_approval" for event in store.list_events(run.run_id)
+    )
+
+
 def test_retry_failed_run_reuses_planner_checkpoint(tmp_path, monkeypatch) -> None:
     client, store = _client(tmp_path, monkeypatch)
     run_id = client.post("/runs", json=_run_body("How should retry work?")).json()["run_id"]
@@ -624,6 +691,45 @@ def test_sse_replay_uses_last_event_id(tmp_path, monkeypatch) -> None:
     assert replay.status_code == 200
     assert replay_ids
     assert min(replay_ids) > first_ids[1]
+
+
+def test_sse_drains_event_committed_between_event_and_terminal_reads(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    client, store = _client(tmp_path, monkeypatch)
+    run_id = "terminal-drain-race"
+    store.create_run(
+        run_id=run_id,
+        query="How should SSE drain a terminal event?",
+        require_approval=False,
+    )
+    store.transition_run(
+        run_id,
+        expected_statuses={"queued"},
+        status="succeeded",
+        current_stage="completed",
+        event_stage="run",
+        event_status="succeeded",
+        event_payload={"attempt": 1, "retryable": False, "degraded": False},
+    )
+    original_events = RunController.events
+    calls = 0
+
+    def first_read_lags(self, selected_run_id, after_event_id=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return []
+        return original_events(self, selected_run_id, after_event_id)
+
+    monkeypatch.setattr(RunController, "events", first_read_lags)
+
+    response = client.get(f"/runs/{run_id}/events")
+
+    assert response.status_code == 200
+    assert "event: run.succeeded" in response.text
+    assert calls == 2
 
 
 def _client(tmp_path: Path, monkeypatch) -> tuple[TestClient, RunStore]:

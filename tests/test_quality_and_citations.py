@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
+from deepresearch_agent.benchmark import build_case_evaluation_metrics
 from deepresearch_agent.citation import CitationChecker
 from deepresearch_agent.cost import CostTracker, deepseek_usage_cost_usd
 from deepresearch_agent.dedup import SourceDeduplicator
@@ -77,6 +80,29 @@ def test_citation_checker_marks_missing_source_unverifiable() -> None:
     assert report.assessments[0].support_level == "unverifiable"
     assert report.assessments[0].evidence_quotes == []
     assert report.assessments[0].missing_citation_ids == ["S9"]
+
+
+def test_empty_claims_do_not_receive_perfect_citation_scores() -> None:
+    report = CitationChecker().check([], [])
+
+    assert report.total_claims == 0
+    assert report.claim_extraction_valid is False
+    assert report.retention_rate == 0.0
+    assert report.citation_grounding == 0.0
+    assert report.citation_coverage == 0.0
+
+    case_metrics = build_case_evaluation_metrics(
+        {"expected_format": "text"},
+        SimpleNamespace(
+            citation_check=report,
+            sources=[],
+            answer="Answer without extracted claims.",
+            metrics={},
+            cost=SimpleNamespace(total_tokens=0, total_estimated_cost_usd=0.0),
+        ),
+    )
+    assert case_metrics["claim_extraction_valid"] is False
+    assert case_metrics["unsupported_claim_rate"] is None
 
 
 def test_citation_checker_does_not_hide_missing_ids_behind_valid_citation() -> None:

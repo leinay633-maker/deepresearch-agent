@@ -118,6 +118,9 @@ class RunController:
 
     def reject(self, run_id: str, request: RejectRunRequest) -> AgentRun:
         self._require_status(run_id, {"waiting_approval"})
+        event_payload = self._event_payload(
+            "approval", "rejected", {"reason": request.reason}
+        )
         cancelled = self.store.transition_run(
             run_id,
             expected_statuses={"waiting_approval"},
@@ -128,19 +131,24 @@ class RunController:
             leased_by=None,
             heartbeat_at=None,
             lease_expires_at=None,
+            event_stage="approval",
+            event_status="rejected",
+            event_payload=event_payload,
         )
         if cancelled is None:
             current = self.store.require_run(run_id)
             raise ValueError(
                 f"run {run_id} status is {current.status}; rejection lost a concurrent transition"
             )
-        self._event(run_id, "approval", "rejected", {"reason": request.reason})
         return cancelled
 
     def cancel(self, run_id: str) -> AgentRun:
         run = self.store.require_run(run_id)
         if run.status in TERMINAL_STATUSES:
             return run
+        event_payload = self._event_payload(
+            "run", "cancelled", {"previous_status": run.status}
+        )
         cancelled = self.store.transition_run(
             run_id,
             expected_statuses={run.status},
@@ -150,13 +158,15 @@ class RunController:
             leased_by=None,
             heartbeat_at=None,
             lease_expires_at=None,
+            event_stage="run",
+            event_status="cancelled",
+            event_payload=event_payload,
         )
         if cancelled is None:
             current = self.store.require_run(run_id)
             if current.status in TERMINAL_STATUSES:
                 return current
             raise ValueError(f"run {run_id} changed while cancellation was being applied")
-        self._event(run_id, "run", "cancelled", {"previous_status": run.status})
         return cancelled
 
     async def retry(self, run_id: str) -> AgentRun:
@@ -265,21 +275,23 @@ class RunController:
         for run in self.store.list_stale_runs():
             if run.leased_by is None or run.lease_expires_at is None:
                 continue
+            event_payload = self._event_payload(
+                "lease",
+                "stale_recovered",
+                {"reason": request.reason, "leased_by": run.leased_by},
+            )
             recovered_run = self.store.recover_stale_run(
                 run.run_id,
                 expected_worker_id=run.leased_by,
                 expected_lease_expires_at=run.lease_expires_at,
                 reason=request.reason,
+                event_stage="lease",
+                event_status="stale_recovered",
+                event_payload=event_payload,
             )
             if recovered_run is None:
                 continue
             self._step(run.run_id, run.current_stage, "failed", error=request.reason)
-            self._event(
-                run.run_id,
-                "lease",
-                "stale_recovered",
-                {"reason": request.reason, "leased_by": run.leased_by},
-            )
             recovered.append(recovered_run)
         return recovered
 
@@ -409,22 +421,24 @@ class RunController:
             self._check_execution_active(run_id)
             raise RuntimeError("planner checkpoint rejected because execution ownership was lost")
         if request.require_approval:
+            approval_payload = self._event_payload(
+                "approval",
+                "waiting_approval",
+                self.approval_payload_data(plan_state),
+            )
             waiting = self.store.transition_run(
                 run_id,
                 expected_statuses={"running"},
                 expected_worker_id=self.worker_id,
                 status="waiting_approval",
                 current_stage="approval",
+                event_stage="approval",
+                event_status="waiting_approval",
+                event_payload=approval_payload,
             )
             if waiting is None:
                 self._check_execution_active(run_id)
                 raise RuntimeError("approval transition rejected because execution ownership was lost")
-            self._event(
-                run_id,
-                "approval",
-                "waiting_approval",
-                self.approval_payload_data(plan_state),
-            )
             return self._release_execution_lease(waiting.run_id)
         return await self._continue_from_plan(self.store.require_run(run_id), retry_count=retry_count)
 
@@ -586,6 +600,11 @@ class RunController:
             deduped_source_count=len(sources),
             fallback_count=fallback_count,
             degraded_count=degraded_count,
+            budget_exhausted_count=sum(
+                1
+                for finding in findings
+                if finding.research is not None and finding.research.budget_exhausted
+            ),
             sources=sources,
             citation_report=citation_report,
         )
@@ -609,18 +628,17 @@ class RunController:
             result_json=report.model_dump(mode="json"),
             total_tokens=total_cost.total_tokens,
             total_cost=total_cost.total_estimated_cost_usd,
+            event_stage="run",
+            event_status="succeeded",
+            event_payload=self._event_payload(
+                "run", "succeeded", {**metrics, "retry_count": retry_count}
+            ),
         )
         if completed is None:
             current = self.store.require_run(run_id)
             if current.status == "cancelled":
                 raise RunCancelledError("run cancelled before final commit")
             raise RuntimeError("run final commit rejected because execution ownership was lost")
-        self._event(
-            run_id,
-            "run",
-            "succeeded",
-            {**metrics, "retry_count": retry_count},
-        )
         return self._release_execution_lease(run_id)
 
     async def _run_researcher_stage(
@@ -886,6 +904,20 @@ class RunController:
         status: str,
         payload: dict[str, Any] | None = None,
     ) -> AgentEvent:
+        event_payload = self._event_payload(stage, status, payload)
+        return self.store.add_event(
+            run_id=run_id,
+            stage=stage,
+            status=status,
+            payload=event_payload,
+        )
+
+    def _event_payload(
+        self,
+        stage: str,
+        status: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         event_payload = dict(payload or {})
         retry_count = event_payload.get("retry_count", 0)
         if not isinstance(retry_count, int) or retry_count < 0:
@@ -904,12 +936,7 @@ class RunController:
             or bool(event_payload.get("fallback_count", 0))
             or bool(event_payload.get("degraded_count", 0)),
         )
-        return self.store.add_event(
-            run_id=run_id,
-            stage=stage,
-            status=status,
-            payload=event_payload,
-        )
+        return event_payload
 
     def _next_retry_count(self, run_id: str) -> int:
         step_counts = [step.retry_count for step in self.store.list_steps(run_id)]
@@ -1062,6 +1089,9 @@ class RunController:
             return run
         if run.status in TERMINAL_STATUSES:
             return run
+        event_payload = self._event_payload(
+            "run", "cancelled", {"previous_status": run.status}
+        )
         cancelled = self.store.transition_run(
             run_id,
             expected_statuses={run.status},
@@ -1073,10 +1103,12 @@ class RunController:
             leased_by=None,
             heartbeat_at=None,
             lease_expires_at=None,
+            event_stage="run",
+            event_status="cancelled",
+            event_payload=event_payload,
         )
         if cancelled is None:
             return self.store.require_run(run_id)
-        self._event(run_id, "run", "cancelled", {"previous_status": run.status})
         return cancelled
 
     def _fail_run(
@@ -1092,6 +1124,11 @@ class RunController:
         if current.leased_by != self.worker_id:
             return current
         message = str(exc)
+        event_payload = self._event_payload(
+            stage,
+            "failed",
+            {"error": message, "retry_count": retry_count},
+        )
         failed = self.store.transition_run(
             run_id,
             expected_statuses={"queued", "running"},
@@ -1106,6 +1143,9 @@ class RunController:
             leased_by=None,
             heartbeat_at=None,
             lease_expires_at=None,
+            event_stage=stage,
+            event_status="failed",
+            event_payload=event_payload,
         )
         if failed is None:
             return self.store.require_run(run_id)
@@ -1115,12 +1155,6 @@ class RunController:
             "failed",
             error=message,
             retry_count=retry_count,
-        )
-        self._event(
-            run_id,
-            stage,
-            "failed",
-            {"error": message, "retry_count": retry_count},
         )
         return failed
 

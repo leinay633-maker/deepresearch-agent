@@ -10,6 +10,7 @@ from fastapi import Header, HTTPException
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse
 
+from deepresearch_agent.execution import is_retryable_error
 from deepresearch_agent.orchestrator import DeepResearchOrchestrator
 from deepresearch_agent.run_control import TERMINAL_STATUSES, RunController
 from deepresearch_agent.run_models import (
@@ -63,7 +64,7 @@ async def research_stream(request: ResearchRequest) -> StreamingResponse:
                         "data": {
                             "message": str(exc),
                             "attempt": 1,
-                            "retryable": True,
+                            "retryable": is_retryable_error(exc),
                             "degraded": False,
                         },
                     }
@@ -184,6 +185,13 @@ async def run_events(
                 yield _run_sse(event.model_dump(mode="json"))
             run = controller.get_run(run_id)
             if run.status in TERMINAL_STATUSES or run.status == "waiting_approval":
+                # The event query and status query use separate SQLite reads.
+                # A terminal transaction may commit between them, so drain once
+                # more before closing the stream to avoid losing its final event.
+                final_events = controller.events(run_id, after_event_id=seen_event_id)
+                for event in final_events:
+                    seen_event_id = event.event_id
+                    yield _run_sse(event.model_dump(mode="json"))
                 break
             await asyncio.sleep(0.5)
 

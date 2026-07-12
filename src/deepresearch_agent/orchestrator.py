@@ -218,6 +218,7 @@ class DeepResearchOrchestrator:
             deduped_source_count=len(sources),
             fallback_count=research.fallback_count,
             degraded_count=research.degraded_count,
+            budget_exhausted_count=research.budget_exhausted_count,
             sources=sources,
             citation_report=citation_report,
         )
@@ -450,6 +451,16 @@ class DeepResearchOrchestrator:
                     break
                 query = decision.follow_up_query or f"{subquestion.question} {decision.evidence_gap or 'additional evidence'}"
 
+            budget_exhausted = (
+                termination_reason in {"deadline", "max_rounds", "max_tool_calls"}
+                and len(evidence) < budget.min_evidence_items
+            )
+            if budget_exhausted:
+                degraded = True
+                gaps.append(
+                    f"research budget ended with {len(evidence)} of "
+                    f"{budget.min_evidence_items} required evidence items"
+                )
             research_result = ResearchResult(
                 rounds=rounds,
                 evidence=evidence,
@@ -457,6 +468,7 @@ class DeepResearchOrchestrator:
                 conflicts=list(dict.fromkeys(conflicts)),
                 tool_calls=tool_calls,
                 termination_reason=termination_reason,
+                budget_exhausted=budget_exhausted,
             )
             summary = self._summarize_evidence(research_result)
             finding = Finding(
@@ -480,6 +492,7 @@ class DeepResearchOrchestrator:
                 "tool_calls": tool_calls,
                 "provider_tool_attempts": provider_tool_attempts,
                 "termination_reason": termination_reason,
+                "budget_exhausted": budget_exhausted,
             }
             await self._record(trace, stage, status, payload, stage_start, emit)
             return finding, SearchOutcome(
@@ -732,7 +745,8 @@ class DeepResearchOrchestrator:
             "degraded",
             status == "fallback"
             or bool(event_payload.get("fallback_used"))
-            or bool(event_payload.get("degraded")),
+            or bool(event_payload.get("degraded"))
+            or bool(event_payload.get("degraded_count", 0)),
         )
         event = trace.record(stage=stage, status=status, payload=event_payload, start=start)
         if emit is not None:

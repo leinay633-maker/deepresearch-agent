@@ -109,6 +109,7 @@ class ResearchResult(BaseModel):
     conflicts: list[str] = Field(default_factory=list)
     tool_calls: int = 0
     termination_reason: str = "completed"
+    budget_exhausted: bool = False
 
 
 class Finding(BaseModel):
@@ -156,6 +157,7 @@ class CitationCheckReport(BaseModel):
     citation_coverage: float = 0.0
     unsupported_claim_rate: float = 0.0
     citation_precision: float = 0.0
+    claim_extraction_valid: bool = True
 
 
 class CostRecord(BaseModel):

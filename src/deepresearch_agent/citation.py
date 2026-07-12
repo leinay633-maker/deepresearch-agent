@@ -97,7 +97,7 @@ class CitationChecker:
             assessments.append(assessment)
         supported_count = sum(1 for item in assessments if item.supported)
         total = len(assessments)
-        retention = supported_count / total if total else 1.0
+        retention = supported_count / total if total else 0.0
         claims_with_valid_citation = sum(
             1
             for item in assessments
@@ -128,8 +128,8 @@ class CitationChecker:
             unsupported_claims=total - supported_count,
             retention_rate=round(retention, 4),
             assessments=assessments,
-            citation_grounding=round(supported_count / total, 4) if total else 1.0,
-            citation_coverage=round(claims_with_valid_citation / total, 4) if total else 1.0,
+            citation_grounding=round(supported_count / total, 4) if total else 0.0,
+            citation_coverage=round(claims_with_valid_citation / total, 4) if total else 0.0,
             unsupported_claim_rate=round((total - supported_count) / total, 4)
             if total
             else 0.0,
@@ -138,6 +138,7 @@ class CitationChecker:
             )
             if citation_reference_count
             else 0.0,
+            claim_extraction_valid=total > 0,
         )
 
     def minimum_overlap_for_claim(self, claim: str) -> float:

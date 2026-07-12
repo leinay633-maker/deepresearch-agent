@@ -375,3 +375,7 @@ def test_refresh_replay_preserves_metrics_snapshot() -> None:
         "custom_recorded": 7,
     }
     assert refreshed["recorded_metrics"] is not refreshed["metrics"]
+    assert (
+        refreshed["report"]["metrics"]["claim_extraction_valid"]
+        is refreshed["citation_check"]["claim_extraction_valid"]
+    )
