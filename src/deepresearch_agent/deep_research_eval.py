@@ -14,9 +14,24 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
+from deepresearch_agent.benchmark import (
+    SUCCESS_SEMANTICS,
+    attach_answer_quality,
+    build_benchmark_manifest,
+    build_case_evaluation_metrics,
+    evaluation_summary,
+    mark_live_judge_nondeterminism,
+    portable_artifact_path,
+    refresh_replayed_case_result,
+)
 from deepresearch_agent.config import load_settings
 from deepresearch_agent.eval_judge import build_eval_judge_provider
 from deepresearch_agent.orchestrator import DeepResearchOrchestrator
+from deepresearch_agent.replay import (
+    load_case_result_records,
+    replay_case_result,
+    validate_replay_case_ids,
+)
 from deepresearch_agent.schemas import ResearchRequest, StructuredReport
 
 LIVE_DR_BENCH_DATASET = "microsoft/LiveDRBench"
@@ -33,7 +48,17 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
     logs_dir.mkdir(exist_ok=True)
     results_dir.mkdir(exist_ok=True)
 
-    cases = load_eval_cases(args)
+    replay_records = (
+        load_case_result_records(args.replay_dir)
+        if getattr(args, "replay_dir", None)
+        else None
+    )
+    if replay_records is not None and not args.cases:
+        cases = _cases_from_replay_records(replay_records, args.benchmark_name)
+    else:
+        cases = load_eval_cases(args)
+    if replay_records is not None:
+        validate_replay_case_ids(cases, replay_records)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     raw_path = Path(args.raw_log) if args.raw_log else logs_dir / f"deep-research-eval-{timestamp}.jsonl"
     summary_path = (
@@ -57,6 +82,11 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
     reflection_enabled = getattr(args, "reflection_enabled", False)
     max_reflection_rounds = getattr(args, "max_reflection_rounds", 1)
     reflection_min_sources = getattr(args, "reflection_min_sources", 4)
+    max_rounds = getattr(args, "max_rounds", 1)
+    max_tool_calls = getattr(args, "max_tool_calls", 1)
+    deadline_seconds = getattr(args, "deadline_seconds", None)
+    min_evidence_items = getattr(args, "min_evidence_items", 1)
+    fallback_policy = getattr(args, "fallback_policy", "fail")
     effective_settings = replace(
         settings,
         llm_provider=effective_llm_provider,
@@ -125,6 +155,11 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
         "citation_judge_model": effective_settings.citation_judge_model,
         "judge_provider": judge_provider,
         "judge_model": effective_judge_model,
+        "max_rounds": max_rounds,
+        "max_tool_calls": max_tool_calls,
+        "deadline_seconds": deadline_seconds,
+        "min_evidence_items": min_evidence_items,
+        "fallback_policy": fallback_policy,
         "official_judge_score": "not_run",
         "settings": {
             **asdict(effective_settings),
@@ -133,21 +168,65 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
             "max_results": args.max_results,
         },
     }
-
+    dataset_name = (
+        portable_artifact_path(args.cases, root)
+        if args.cases
+        else f"replay:{portable_artifact_path(args.replay_dir, root)}"
+        if replay_records is not None
+        else args.dataset
+    )
+    manifest = build_benchmark_manifest(
+        root=root,
+        benchmark_name=args.benchmark_name,
+        dataset_name=dataset_name,
+        cases=cases,
+        config_snapshot=config_snapshot,
+        llm_provider=effective_settings.llm_provider,
+        llm_model=effective_llm_model,
+        search_provider=effective_settings.search_provider,
+        seed=args.seed,
+        dataset_config=_dataset_config_name(args),
+        dataset_split=args.split,
+        replay_dir=getattr(args, "replay_dir", None),
+        cassette_id=getattr(args, "cassette_id", None),
+    )
+    mark_live_judge_nondeterminism(
+        manifest,
+        citation_judge_provider=effective_settings.citation_judge_provider,
+        answer_judge_provider=judge_provider,
+    )
     records: list[dict[str, Any]] = []
     predictions: list[dict[str, Any]] = []
     with raw_path.open("w", encoding="utf-8") as file:
-        file.write(json.dumps({"type": "config", "config": config_snapshot}, ensure_ascii=False) + "\n")
-        for case in cases:
-            record = await _run_case(
-                case,
-                args,
-                effective_settings,
-                effective_llm_model,
-                stage_models,
+        file.write(
+            json.dumps(
+                {"type": "config", "config": config_snapshot, "manifest": manifest},
+                ensure_ascii=False,
             )
-            if answer_judge is not None:
+            + "\n"
+        )
+        for case in cases:
+            if replay_records is not None:
+                record = replay_case_result(
+                    case,
+                    replay_records,
+                    manifest_id=manifest["manifest_id"],
+                )
+                record = refresh_replayed_case_result(case, record)
+            else:
+                record = await _run_case(
+                    case,
+                    args,
+                    effective_settings,
+                    effective_llm_model,
+                    stage_models,
+                )
+            record["manifest_id"] = manifest["manifest_id"]
+            if answer_judge is not None and replay_records is None:
                 record["answer_judgment"] = asdict(answer_judge.judge(case, record))
+                attach_answer_quality(record, record["answer_judgment"])
+            elif answer_judge is not None and record.get("answer_judgment"):
+                attach_answer_quality(record, record["answer_judgment"])
             records.append(record)
             predictions.append(
                 {
@@ -158,7 +237,14 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     predictions_path.write_text(json.dumps(predictions, ensure_ascii=False, indent=2), encoding="utf-8")
-    summary = _summarize(records, config_snapshot, raw_path, predictions_path)
+    summary = _summarize(
+        records,
+        config_snapshot,
+        raw_path,
+        predictions_path,
+        manifest,
+        root=root,
+    )
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary
 
@@ -178,6 +264,27 @@ def load_eval_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
         cases = cases[: args.limit]
     if not cases:
         raise ValueError("no eval cases loaded")
+    return cases
+
+
+def _cases_from_replay_records(
+    records: dict[str, dict[str, Any]],
+    benchmark_name: str,
+) -> list[dict[str, Any]]:
+    cases: list[dict[str, Any]] = []
+    for case_id, record in records.items():
+        metadata = record.get("metadata") or record.get("case_metadata") or {}
+        cases.append(
+            {
+                "id": case_id,
+                "query": str(record.get("query") or ""),
+                "category": record.get("category"),
+                "benchmark_name": record.get("benchmark_name") or benchmark_name,
+                "metadata": metadata if isinstance(metadata, dict) else {},
+            }
+        )
+    if any(not case["query"] for case in cases):
+        raise ValueError("replay artifact contains a case_result without query")
     return cases
 
 
@@ -248,57 +355,61 @@ async def _run_case(
         reflection_min_sources=getattr(args, "reflection_min_sources", 4),
         citation_judge_provider=settings.citation_judge_provider,
         citation_judge_model=settings.citation_judge_model,
+        max_rounds=getattr(args, "max_rounds", 1),
+        max_tool_calls=getattr(args, "max_tool_calls", 1),
+        deadline_seconds=getattr(args, "deadline_seconds", None),
+        min_evidence_items=getattr(args, "min_evidence_items", 1),
+        fallback_policy=getattr(args, "fallback_policy", "fail"),
     )
     try:
         report = await DeepResearchOrchestrator(settings=settings).run(request)
         return _case_success_record(case, report)
     except Exception as exc:  # pragma: no cover - exercised by integration failures.
         latency_ms = round((time.perf_counter() - started) * 1000, 3)
+        case_metrics = build_case_evaluation_metrics(case, None, latency_ms=latency_ms)
         return {
             "type": "case_result",
             "case_id": case["id"],
             "query": case["query"],
             "category": case.get("category"),
             "benchmark_name": case.get("benchmark_name"),
-            "latency_ms": latency_ms,
-            "success": False,
+            **case_metrics,
             "error": repr(exc),
             "answer": "",
             "claims": [],
             "sources": [],
             "citation_check": None,
             "cost": None,
-            "metrics": {"latency_ms": latency_ms, "success": False},
+            "metrics": case_metrics,
             "trace_events": [],
             "metadata": case.get("metadata", {}),
         }
 
 
 def _case_success_record(case: dict[str, Any], report: StructuredReport) -> dict[str, Any]:
+    case_metrics = build_case_evaluation_metrics(case, report)
     return {
         "type": "case_result",
         "case_id": case["id"],
         "query": case["query"],
         "category": case.get("category"),
         "benchmark_name": case.get("benchmark_name"),
-        "latency_ms": report.metrics["latency_ms"],
-        "total_tokens": report.cost.total_tokens,
-        "estimated_cost_usd": report.cost.total_estimated_cost_usd,
+        **case_metrics,
         "deduped_source_count": report.metrics["deduped_source_count"],
         "source_provider_count": report.metrics["source_provider_count"],
         "source_domain_count": report.metrics["source_domain_count"],
         "raw_search_result_count": report.metrics["raw_search_result_count"],
         "citation_retention_rate": report.metrics["citation_retention_rate"],
         "fallback_count": report.metrics["fallback_count"],
-        "success": report.metrics["success"],
         "run_id": report.run_id,
         "answer": report.answer,
         "claims": report.claims,
         "sources": [source.model_dump(mode="json") for source in report.sources],
         "citation_check": report.citation_check.model_dump(mode="json"),
         "cost": report.cost.model_dump(mode="json"),
-        "metrics": report.metrics,
+        "metrics": {**report.metrics, **case_metrics},
         "trace_events": [event.model_dump(mode="json") for event in report.trace_events],
+        "report": report.model_dump(mode="json"),
         "metadata": case.get("metadata", {}),
     }
 
@@ -371,6 +482,9 @@ def _summarize(
     config_snapshot: dict[str, Any],
     raw_path: Path,
     predictions_path: Path,
+    manifest: dict[str, Any] | None = None,
+    *,
+    root: Path | None = None,
 ) -> dict[str, Any]:
     latencies = [record["latency_ms"] for record in records]
     tokens = [record.get("total_tokens", 0) for record in records]
@@ -387,7 +501,7 @@ def _summarize(
         for record in records
         if record.get("answer_judgment") and record["answer_judgment"].get("score") is not None
     ]
-    success_count = sum(1 for record in records if record["success"])
+    split_metrics = evaluation_summary(records)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "benchmark_kind": "public_deep_research_artifact_eval",
@@ -400,13 +514,19 @@ def _summarize(
             "without an official judge score, this is an artifact-producing evaluation run",
             "citation_retention_rate still uses the current lexical checker",
             "live search or LLM providers can vary across runs",
+            "success_rate is a deprecated execution-success alias, not answer quality",
         ],
-        "raw_log": str(raw_path),
-        "predictions_output": str(predictions_path),
+        "raw_log": portable_artifact_path(raw_path, root) if root else str(raw_path),
+        "predictions_output": (
+            portable_artifact_path(predictions_path, root)
+            if root
+            else str(predictions_path)
+        ),
         "config": config_snapshot,
+        "manifest": manifest,
+        "deterministic": manifest.get("deterministic") if manifest else None,
         "case_count": len(records),
-        "success_count": success_count,
-        "success_rate": round(success_count / len(records), 4) if records else 0.0,
+        **split_metrics,
         "latency_ms": {
             "p50": round(median(latencies), 3) if latencies else 0.0,
             "p90": round(_percentile(latencies, 90), 3) if latencies else 0.0,
@@ -421,7 +541,7 @@ def _summarize(
         ),
         "citation_retention_rate_avg": round(sum(retentions) / len(retentions), 4)
         if retentions
-        else 0.0,
+        else None,
         "deduped_source_count_avg": round(sum(source_counts) / len(source_counts), 3)
         if source_counts
         else 0.0,
@@ -464,6 +584,20 @@ def _summarize(
                 "case_id": record["case_id"],
                 "query": record["query"],
                 "success": record["success"],
+                "execution_success": record.get("execution_success", record["success"]),
+                "task_format_valid": record.get("task_format_valid", False),
+                "answer_quality": record.get("answer_quality"),
+                "citation_grounding": record.get("citation_grounding"),
+                "citation_precision": record.get("citation_precision"),
+                "citation_coverage": record.get("citation_coverage"),
+                "unsupported_claim_rate": record.get("unsupported_claim_rate"),
+                "source_quality": record.get("source_quality"),
+                "tool_failure_recovery": record.get("tool_failure_recovery"),
+                "tool_failure_attempted": record.get("tool_failure_attempted", False),
+                "tool_failure_recovered": record.get("tool_failure_recovered"),
+                "final_result_usable": record.get("final_result_usable", False),
+                "legacy_report_success": record.get("legacy_report_success"),
+                "success_semantics": record.get("success_semantics", SUCCESS_SEMANTICS),
                 "latency_ms": record["latency_ms"],
                 "total_tokens": record.get("total_tokens", 0),
                 "estimated_cost_usd": record.get("estimated_cost_usd", 0.0),
@@ -505,7 +639,7 @@ def _effective_stage_models(args: argparse.Namespace, settings: Any) -> dict[str
 
 
 def _dataset_config_name(args: argparse.Namespace) -> str | None:
-    if args.cases:
+    if args.cases or getattr(args, "replay_dir", None):
         return None
     return LIVE_DR_BENCH_CONFIGS.get(args.dataset)
 
@@ -554,6 +688,15 @@ def main() -> None:
     parser.add_argument("--local-retrieval-mode", choices=["keyword", "hybrid"], default="keyword")
     parser.add_argument("--max-researchers", type=int, default=2)
     parser.add_argument("--max-results", type=int, default=3)
+    parser.add_argument("--max-rounds", type=int, default=1)
+    parser.add_argument("--max-tool-calls", type=int, default=1)
+    parser.add_argument("--deadline-seconds", type=float, default=None)
+    parser.add_argument("--min-evidence-items", type=int, default=1)
+    parser.add_argument(
+        "--fallback-policy",
+        choices=["mock", "degraded", "fail"],
+        default="fail",
+    )
     parser.add_argument("--request-timeout-seconds", type=float, default=8.0)
     parser.add_argument("--reflection-enabled", action="store_true")
     parser.add_argument("--max-reflection-rounds", type=int, default=1)
@@ -588,6 +731,12 @@ def main() -> None:
     parser.add_argument("--raw-log", default=None)
     parser.add_argument("--summary-output", default=None)
     parser.add_argument("--predictions-output", default=None)
+    parser.add_argument(
+        "--replay-dir",
+        default=None,
+        help="Optional case-result JSONL file or single-artifact directory for offline replay.",
+    )
+    parser.add_argument("--cassette-id", default=None)
     args = parser.parse_args()
     summary = asyncio.run(run_public_deep_research_eval(args))
     print(json.dumps(summary, ensure_ascii=False, indent=2))

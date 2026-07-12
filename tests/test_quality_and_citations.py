@@ -76,6 +76,49 @@ def test_citation_checker_marks_missing_source_unverifiable() -> None:
     assert report.unsupported_claims == 1
     assert report.assessments[0].support_level == "unverifiable"
     assert report.assessments[0].evidence_quotes == []
+    assert report.assessments[0].missing_citation_ids == ["S9"]
+
+
+def test_citation_checker_does_not_hide_missing_ids_behind_valid_citation() -> None:
+    source = Source(
+        id="S1",
+        title="Trace source",
+        url="https://example.local/trace",
+        content="Structured trace logs explain latency and cost by stage.",
+        provider="mock",
+        query="trace",
+    )
+
+    report = CitationChecker().check(
+        ["Structured trace logs explain latency [S1] [S999]"],
+        [source],
+    )
+
+    assessment = report.assessments[0]
+    assert assessment.support_level == "partial"
+    assert assessment.supported is False
+    assert assessment.missing_citation_ids == ["S999"]
+    assert report.citation_precision == 0.5
+
+
+def test_snippet_only_citation_is_unverifiable() -> None:
+    source = Source(
+        id="S1",
+        title="Search snippet",
+        url="https://example.com/snippet",
+        content="Structured trace logs explain latency and cost by stage.",
+        provider="search",
+        query="trace",
+        metadata={"snippet_only": True, "extract_status": "snippet"},
+    )
+
+    report = CitationChecker().check(
+        ["Structured trace logs explain latency and cost by stage [S1]"],
+        [source],
+    )
+
+    assert report.assessments[0].support_level == "unverifiable"
+    assert report.citation_grounding == 0.0
 
 
 def test_cost_tracker_can_record_provider_usage() -> None:

@@ -1,5 +1,24 @@
-{"id":"case-001","query":"How does a supervisor-researcher deep research agent differ from normal RAG?"}
-{"id":"case-002","query":"How should citation faithfulness checks reduce hallucination in agent reports?"}
-{"id":"case-003","query":"What failure handling is needed when an agent search tool times out?"}
-{"id":"case-004","query":"Why track token and cost by stage in a multi-agent research pipeline?"}
-{"id":"case-005","query":"How can a benchmark harness make deep research results reproducible?"}
+{"id":"fact-en-001","query":"What role does a planner play in a supervisor-researcher agent architecture?","category":"single_fact","language":"en","expected_format":"text","scenario":"normal"}
+{"id":"fact-en-002","query":"What does HTTP status code 429 indicate to a search-tool client?","category":"single_fact","language":"en","expected_format":"text","scenario":"normal"}
+{"id":"fact-zh-001","query":"在多智能体研究系统中，Verifier 的核心职责是什么？","category":"single_fact","language":"zh-CN","expected_format":"text","scenario":"normal"}
+{"id":"fact-zh-002","query":"为什么研究报告中的引用必须能回溯到具体来源？","category":"single_fact","language":"zh-CN","expected_format":"text","scenario":"normal"}
+{"id":"compare-en-001","query":"Compare a supervisor-researcher deep research agent with conventional single-pass RAG.","category":"comparison","language":"en","expected_format":"markdown","scenario":"normal"}
+{"id":"compare-en-002","query":"Compare lexical citation checking with an optional LLM citation judge, including their tradeoffs.","category":"comparison","language":"en","expected_format":"markdown","scenario":"normal"}
+{"id":"compare-zh-001","query":"对比关键词检索与混合检索在本地 RAG 中的优缺点。","category":"comparison","language":"zh-CN","expected_format":"markdown","scenario":"normal"}
+{"id":"compare-zh-002","query":"对比同步研究请求与可恢复长任务控制面的适用场景。","category":"comparison","language":"zh-CN","expected_format":"markdown","scenario":"normal"}
+{"id":"multihop-en-001","query":"Explain how search retries, fallback sources, and trace events work together to make a research run diagnosable.","category":"multi_hop","language":"en","expected_format":"markdown","scenario":"normal"}
+{"id":"multihop-en-002","query":"Trace how a user query becomes a cited report through planning, parallel research, deduplication, synthesis, and verification.","category":"multi_hop","language":"en","expected_format":"markdown","scenario":"normal"}
+{"id":"multihop-zh-001","query":"说明从子问题拆解、证据收集到逐条引用校验的完整数据流，并指出每一步的失败风险。","category":"multi_hop","language":"zh-CN","expected_format":"markdown","scenario":"normal"}
+{"id":"multihop-zh-002","query":"解释 checkpoint、重试和幂等性如何共同避免长任务重复执行已完成阶段。","category":"multi_hop","language":"zh-CN","expected_format":"markdown","scenario":"normal"}
+{"id":"conflict-en-001","query":"Two sources disagree about whether multi-agent research always improves answer quality. Present both claims and explain how the system should report the conflict without inventing a resolution.","category":"citation_conflict","language":"en","expected_format":"markdown","scenario":"conflicting_sources"}
+{"id":"conflict-en-002","query":"A report cites an existing source ID whose text does not support the associated claim. Explain how that case should be classified and surfaced.","category":"citation_conflict","language":"en","expected_format":"text","scenario":"unsupported_citation"}
+{"id":"conflict-zh-001","query":"两个来源对同一技术方案的成本结论相反，请保留双方证据并说明系统应如何标记冲突。","category":"citation_conflict","language":"zh-CN","expected_format":"markdown","scenario":"conflicting_sources"}
+{"id":"failure-en-001","query":"Describe the expected retry, backoff, degradation, and audit behavior when a web-search tool times out.","category":"tool_failure","language":"en","expected_format":"markdown","scenario":"timeout","failure_injection":"search_timeout"}
+{"id":"failure-en-002","query":"Describe how a research run should behave when a search provider returns HTTP 429 repeatedly.","category":"tool_failure","language":"en","expected_format":"markdown","scenario":"rate_limit","failure_injection":"search_rate_limit"}
+{"id":"failure-zh-001","query":"当检索工具返回空结果时，研究系统应如何停止、降级并向评测记录暴露这一事实？","category":"tool_failure","language":"zh-CN","expected_format":"markdown","scenario":"empty_results","failure_injection":"empty_search_results"}
+{"id":"json-en-001","query":"Return a JSON object with keys stages, failure_modes, and observability for a deep research pipeline.","category":"structured_output","language":"en","expected_format":"json","scenario":"normal"}
+{"id":"json-en-002","query":"Return a JSON array of three benchmark metrics; each item must contain name, meaning, and limitation.","category":"structured_output","language":"en","expected_format":"json","scenario":"normal"}
+{"id":"json-zh-001","query":"用 JSON 对象返回研究任务的 execution_success、citation_coverage 和 answer_quality 三个字段的含义。","category":"structured_output","language":"zh-CN","expected_format":"json","scenario":"normal"}
+{"id":"quality-en-001","query":"What source signals can a verifier use to reject low-quality evidence before synthesis?","category":"source_quality","language":"en","expected_format":"text","scenario":"normal"}
+{"id":"quality-zh-001","query":"如何区分只有搜索摘要的来源与已成功抓取正文的来源，并在报告中保留降级信息？","category":"source_quality","language":"zh-CN","expected_format":"markdown","scenario":"snippet_only"}
+{"id":"replay-en-001","query":"Explain which artifacts must be recorded so a live LLM and search run can later be replayed and audited offline.","category":"reproducibility","language":"en","expected_format":"markdown","scenario":"replay"}

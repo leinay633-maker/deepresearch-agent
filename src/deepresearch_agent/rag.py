@@ -17,6 +17,7 @@ from deepresearch_agent.config import Settings, load_settings
 from deepresearch_agent.embeddings import EmbeddingProvider, build_embedding_provider
 from deepresearch_agent.rerankers import RerankProvider, build_rerank_provider
 from deepresearch_agent.schemas import Source
+from deepresearch_agent.text_utils import tokenize
 
 logger = logging.getLogger(__name__)
 
@@ -604,4 +605,4 @@ def _qdrant_points_count(info: dict[str, Any] | None) -> int | None:
 
 
 def _tokens(text: str) -> set[str]:
-    return {token.lower() for token in re.findall(r"[a-zA-Z0-9_]+", text)}
+    return tokenize(text)

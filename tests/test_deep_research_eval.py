@@ -195,7 +195,17 @@ def test_run_public_eval_with_mock_writes_artifacts(tmp_path: Path) -> None:
     assert summary["config"]["judge_provider"] == "heuristic"
     assert summary["answer_judge"]["scored_count"] == 1
     assert summary["answer_judge"]["score_avg"] == 1.0
+    assert summary["answer_quality_scored_count"] == 1
+    assert summary["answer_quality_avg"] == 1.0
+    assert summary["execution_success_rate"] == 1.0
+    assert summary["success_semantics"].startswith("deprecated alias")
     assert summary["config"]["settings"]["local_retrieval_mode"] == "keyword"
+    assert summary["manifest"]["git_commit_sha"]
+    assert summary["manifest"]["dataset_version"].startswith("sha256:")
+    assert summary["manifest"]["prompt_bundle_hash"].startswith("sha256:")
+    assert summary["manifest"]["llm_provider"] == "mock"
+    assert summary["manifest"]["deterministic"] is True
+    assert summary["deterministic"] is True
     assert raw_log.exists()
     assert summary_output.exists()
     predictions = json.loads(predictions_output.read_text(encoding="utf-8"))
@@ -206,6 +216,159 @@ def test_run_public_eval_with_mock_writes_artifacts(tmp_path: Path) -> None:
         if line.strip()
     ]
     assert raw_lines[0]["type"] == "config"
+    assert raw_lines[0]["manifest"]["manifest_id"] == summary["manifest"]["manifest_id"]
     assert raw_lines[1]["type"] == "case_result"
     assert raw_lines[1]["sources"]
     assert raw_lines[1]["answer_judgment"]["verdict"] == "pass"
+    assert raw_lines[1]["answer_quality"] == 1.0
+
+
+def test_mock_eval_without_judge_never_infers_answer_quality_from_citations(
+    tmp_path: Path,
+) -> None:
+    cases_path = tmp_path / "cases.jsonl"
+    raw_log = tmp_path / "raw.jsonl"
+    summary_output = tmp_path / "summary.json"
+    predictions_output = tmp_path / "predictions.json"
+    cases_path.write_text(
+        json.dumps(
+            {
+                "id": "case-no-judge",
+                "query": "How should citation checking reduce unsupported claims?",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        cases=str(cases_path),
+        dataset="livedrbench-preview",
+        benchmark_name="no-judge-smoke",
+        split="test",
+        offset=0,
+        limit=None,
+        search_provider="mock",
+        llm_provider="mock",
+        llm_model=None,
+        embedding_provider="local",
+        local_retrieval_mode="keyword",
+        max_researchers=1,
+        max_results=1,
+        request_timeout_seconds=4.0,
+        seed=20260607,
+        judge_provider="none",
+        raw_log=str(raw_log),
+        summary_output=str(summary_output),
+        predictions_output=str(predictions_output),
+    )
+
+    summary = asyncio.run(run_public_deep_research_eval(args))
+    raw_lines = [
+        json.loads(line)
+        for line in raw_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    record = raw_lines[1]
+
+    assert record["citation_retention_rate"] >= 0.8
+    assert record["answer_quality"] is None
+    assert record["metrics"]["answer_quality"] is None
+    assert record["success"] is record["execution_success"] is True
+    assert summary["answer_quality_scored_count"] == 0
+    assert summary["answer_quality_avg"] is None
+    assert summary["answer_judge"]["scored_count"] == 0
+    assert summary["answer_judge"]["pass_rate"] is None
+    assert "answer_quality_success_rate" not in summary
+
+
+def test_fixed_benchmark_cases_cover_required_offline_scenarios() -> None:
+    cases_path = Path(__file__).resolve().parents[1] / "data" / "benchmark_cases.jsonl"
+    cases = [
+        json.loads(line)
+        for line in cases_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert len(cases) == 24
+    assert {case["language"] for case in cases} == {"en", "zh-CN"}
+    assert {"text", "markdown", "json"} <= {case["expected_format"] for case in cases}
+    assert {
+        "single_fact",
+        "comparison",
+        "multi_hop",
+        "citation_conflict",
+        "tool_failure",
+        "structured_output",
+    } <= {case["category"] for case in cases}
+    assert all("answer_quality" not in case for case in cases)
+
+
+def test_public_eval_replay_is_offline_and_does_not_reinvoke_live_judge(
+    tmp_path: Path,
+) -> None:
+    cases_path = tmp_path / "cases.jsonl"
+    first_raw = tmp_path / "first.jsonl"
+    cases_path.write_text(
+        json.dumps(
+            {
+                "id": "replay-case",
+                "query": "How should replay preserve evaluation artifacts?",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    common = {
+        "dataset": "livedrbench-preview",
+        "benchmark_name": "replay-smoke",
+        "split": "test",
+        "offset": 0,
+        "limit": None,
+        "search_provider": "mock",
+        "llm_provider": "mock",
+        "llm_model": None,
+        "embedding_provider": "local",
+        "local_retrieval_mode": "keyword",
+        "max_researchers": 1,
+        "max_results": 1,
+        "request_timeout_seconds": 4.0,
+        "seed": 20260607,
+        "judge_model": None,
+    }
+    first_args = argparse.Namespace(
+        **common,
+        cases=str(cases_path),
+        judge_provider="none",
+        raw_log=str(first_raw),
+        summary_output=str(tmp_path / "first-summary.json"),
+        predictions_output=str(tmp_path / "first-predictions.json"),
+        replay_dir=None,
+        cassette_id=None,
+    )
+    asyncio.run(run_public_deep_research_eval(first_args))
+
+    replay_raw = tmp_path / "replay.jsonl"
+    replay_args = argparse.Namespace(
+        **common,
+        cases=None,
+        judge_provider="deepseek",
+        raw_log=str(replay_raw),
+        summary_output=str(tmp_path / "replay-summary.json"),
+        predictions_output=str(tmp_path / "replay-predictions.json"),
+        replay_dir=str(first_raw),
+        cassette_id=None,
+    )
+    summary = asyncio.run(run_public_deep_research_eval(replay_args))
+    rows = [
+        json.loads(line)
+        for line in replay_raw.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert summary["case_count"] == 1
+    assert summary["deterministic"] is True
+    assert summary["manifest"]["replay_kind"] == "benchmark_snapshot"
+    assert summary["manifest"]["replay_artifact_id"].startswith("sha256:")
+    assert summary["manifest"]["cassette_id"].startswith("sha256:")
+    assert rows[1]["replayed"] is True
+    assert rows[1].get("answer_judgment") is None

@@ -10,7 +10,15 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from deepresearch_agent.cost import CostTracker, deepseek_usage_cost_usd
-from deepresearch_agent.schemas import Finding, ResearchBrief, ResearchRequest, Source, SubQuestion
+from deepresearch_agent.schemas import (
+    EvidenceItem,
+    Finding,
+    ResearchBrief,
+    ResearchDecision,
+    ResearchRequest,
+    Source,
+    SubQuestion,
+)
 
 DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-flash"
 
@@ -47,11 +55,21 @@ class LLMProvider(Protocol):
     ) -> tuple[str, list[str]]:
         ...
 
+    async def decide_research(
+        self,
+        subquestion: SubQuestion,
+        evidence: list[EvidenceItem],
+        min_evidence_items: int,
+        round_index: int,
+        cost: CostTracker,
+    ) -> ResearchDecision:
+        ...
+
 
 class MockLLMProvider:
     name = "mock"
     supports_structured_output = True
-    supports_tool_calling = True
+    supports_tool_calling = False
 
     def __init__(
         self,
@@ -148,7 +166,15 @@ class MockLLMProvider:
         ]
         for finding in findings:
             citation = f"[{finding.source_ids[0]}]" if finding.source_ids else "[missing]"
-            claim = f"{finding.subquestion} {finding.summary} {citation}"
+            research_note = ""
+            if finding.research is not None:
+                notes = [
+                    *[f"Evidence gap: {gap}" for gap in finding.research.gaps],
+                    *[f"Conflict: {conflict}" for conflict in finding.research.conflicts],
+                    f"Termination: {finding.research.termination_reason}",
+                ]
+                research_note = " " + " ".join(notes)
+            claim = f"{finding.subquestion} {finding.summary}{research_note} {citation}"
             claims.append(claim)
             sections.append(f"- {claim}")
 
@@ -165,6 +191,37 @@ class MockLLMProvider:
         )
         return answer, claims
 
+    async def decide_research(
+        self,
+        subquestion: SubQuestion,
+        evidence: list[EvidenceItem],
+        min_evidence_items: int,
+        round_index: int,
+        cost: CostTracker,
+    ) -> ResearchDecision:
+        if len(evidence) >= min_evidence_items:
+            decision = ResearchDecision(
+                action="stop",
+                reason="minimum verified evidence coverage reached",
+            )
+        else:
+            gap = f"need {min_evidence_items - len(evidence)} additional independent evidence items"
+            decision = ResearchDecision(
+                action="need_follow_up",
+                reason="verified evidence coverage is below the configured minimum",
+                evidence_gap=gap,
+                follow_up_query=(
+                    f"{subquestion.question} independent primary evidence round {round_index + 1}"
+                ),
+            )
+        cost.add(
+            "research_decision",
+            json.dumps([item.model_dump() for item in evidence], ensure_ascii=False),
+            decision.model_dump_json(),
+            model=self._model_for_stage("research_decision"),
+        )
+        return decision
+
     def _model_for_stage(self, stage: str) -> str:
         return self.stage_models.get(stage) or self.model
 
@@ -173,7 +230,7 @@ class DeepSeekLLMProvider:
     name = "deepseek"
     provider_label = "DeepSeek"
     supports_structured_output = True
-    supports_tool_calling = True
+    supports_tool_calling = False
 
     def __init__(
         self,
@@ -280,6 +337,16 @@ class DeepSeekLLMProvider:
                 "subquestion": finding.subquestion,
                 "summary": finding.summary,
                 "source_ids": finding.source_ids,
+                "research": (
+                    {
+                        "gaps": finding.research.gaps,
+                        "conflicts": finding.research.conflicts,
+                        "termination_reason": finding.research.termination_reason,
+                        "rounds": [round.model_dump(mode="json") for round in finding.research.rounds],
+                    }
+                    if finding.research is not None
+                    else None
+                ),
             }
             for finding in findings
         ]
@@ -311,6 +378,7 @@ class DeepSeekLLMProvider:
                         '{"answer":"markdown report with citations like [S1]","claims":["claim text [S1]"]}. '
                         "Every factual claim must cite one or more supplied source IDs. "
                         "Use only source IDs present in the input json. Do not invent citations."
+                        " Preserve evidence gaps, conflicts, and budget termination reasons in a limitations section."
                     ),
                 },
                 {
@@ -336,14 +404,51 @@ class DeepSeekLLMProvider:
         self._add_usage_cost(cost, "synthesis", result)
         return answer, claims
 
+    async def decide_research(
+        self,
+        subquestion: SubQuestion,
+        evidence: list[EvidenceItem],
+        min_evidence_items: int,
+        round_index: int,
+        cost: CostTracker,
+    ) -> ResearchDecision:
+        result = await self._chat_json_result(
+            stage="research_decision",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Decide whether bounded research has enough evidence. Return strict JSON only: "
+                        '{"action":"continue|stop|need_follow_up|conflict_found",'
+                        '"reason":"...","evidence_gap":null,"follow_up_query":null}. '
+                        "Use stop when evidence is sufficient; otherwise provide a concrete searchable follow_up_query."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "subquestion": subquestion.model_dump(),
+                            "round_index": round_index,
+                            "min_evidence_items": min_evidence_items,
+                            "evidence": [item.model_dump() for item in evidence],
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            max_tokens=500,
+        )
+        decision = ResearchDecision.model_validate(result.parsed)
+        self._add_usage_cost(cost, "research_decision", result)
+        return decision
+
     async def _chat_json(
         self,
         stage: str,
         messages: list[dict[str, str]],
         max_tokens: int,
     ) -> dict:
-        import asyncio
-
         result = await self._chat_json_result(stage, messages, max_tokens)
         return result.parsed
 

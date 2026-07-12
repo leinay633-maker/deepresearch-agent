@@ -30,6 +30,11 @@ async def _run(args: argparse.Namespace) -> int:
         reflection_min_sources=args.reflection_min_sources,
         citation_judge_provider=args.citation_judge_provider,
         citation_judge_model=args.citation_judge_model,
+        max_rounds=args.max_rounds,
+        max_tool_calls=args.max_tool_calls,
+        deadline_seconds=args.deadline_seconds,
+        min_evidence_items=args.min_evidence_items,
+        fallback_policy=args.fallback_policy,
     )
     report = await DeepResearchOrchestrator(settings=settings).run(request)
     if args.json:
@@ -128,6 +133,16 @@ def main() -> None:
     parser.add_argument("--crawler-max-chars", type=int, default=None)
     parser.add_argument("--max-researchers", type=int, default=3)
     parser.add_argument("--max-results", type=int, default=4)
+    parser.add_argument("--max-rounds", type=int, default=1)
+    parser.add_argument("--max-tool-calls", type=int, default=1)
+    parser.add_argument("--deadline-seconds", type=float, default=None)
+    parser.add_argument("--min-evidence-items", type=int, default=1)
+    parser.add_argument(
+        "--fallback-policy",
+        choices=["mock", "degraded", "fail"],
+        default=None,
+        help="Defaults to mock for mock search and degraded for live search.",
+    )
     parser.add_argument("--reflection-enabled", action="store_true")
     parser.add_argument("--max-reflection-rounds", type=int, default=1)
     parser.add_argument("--reflection-min-sources", type=int, default=4)

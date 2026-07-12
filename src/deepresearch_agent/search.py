@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import json
 import os
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any, Awaitable, Callable, Protocol
 from urllib.parse import quote_plus, urlencode
@@ -15,6 +17,7 @@ from urllib.request import Request, urlopen
 from deepresearch_agent.config import Settings
 from deepresearch_agent.mcp_tools import McpServerConfig, McpToolSearchAdapter, build_mcp_client
 from deepresearch_agent.schemas import Source
+from deepresearch_agent.text_utils import tokenize
 
 
 class SearchError(RuntimeError):
@@ -40,7 +43,9 @@ class SearchOutcome:
     sources: list[Source]
     provider: str
     fallback_used: bool = False
+    degraded: bool = False
     error: str | None = None
+    tool_attempts: int = 0
 
 
 class MockSearchAdapter:
@@ -164,7 +169,13 @@ class WikipediaSearchAdapter:
                     provider=self.name,
                     query=original_query,
                     score=float(overlap * 10 + rank_bonus),
-                    metadata={"pageid": page_id, "search_query": search_query},
+                    metadata={
+                        "pageid": page_id,
+                        "search_query": search_query,
+                        "snippet_only": True,
+                        "extract_status": "snippet",
+                        "content_type": "text/plain",
+                    },
                 )
             )
         if not sources:
@@ -412,7 +423,10 @@ class SearxngSearchAdapter:
             content = snippet
             if self.crawler is not None and url:
                 try:
-                    content = await self.crawler.crawl(url, timeout)
+                    crawled = await self.crawler.crawl(url, timeout)
+                    if not crawled.strip():
+                        raise SearchError("crawler returned empty content")
+                    content = crawled
                 except Exception as exc:
                     crawler_error = str(exc)
                     content = snippet
@@ -426,9 +440,21 @@ class SearxngSearchAdapter:
                 "engines": row.get("engines"),
                 "snippet": snippet,
                 "crawler": self.crawler.name if self.crawler is not None else "none",
+                "snippet_only": self.crawler is None,
+                "extract_status": "snippet" if self.crawler is None else "ok",
+                "content_type": "text/plain",
             }
             if crawler_error:
-                metadata["crawler_error"] = crawler_error
+                metadata.update(
+                    {
+                        "crawler_error": crawler_error,
+                        "snippet_only": True,
+                        "extract_status": "crawl_failed",
+                        "degrade_reason": crawler_error,
+                    }
+                )
+            elif self.crawler is not None:
+                metadata["snippet_only"] = False
             sources.append(
                 Source(
                     title=html.unescape(title),
@@ -528,6 +554,8 @@ class SearchService:
         settings: Settings,
         rate_limiter: SearchRateLimiter | None = None,
         retry_sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+        crawler: WebCrawler | None = None,
+        fallback_policy: str = "mock",
     ) -> None:
         self.primary = primary
         self.fallback = fallback
@@ -536,6 +564,10 @@ class SearchService:
             settings.search_rate_limit_per_second
         )
         self.retry_sleep = retry_sleep
+        self.crawler = crawler
+        self.fallback_policy = fallback_policy.strip().lower()
+        if self.fallback_policy not in {"mock", "degraded", "fail"}:
+            raise ValueError(f"unknown fallback policy: {fallback_policy}")
         self.breaker = CircuitBreaker(
             settings.circuit_breaker_failure_threshold,
             settings.circuit_breaker_cooldown_seconds,
@@ -544,19 +576,59 @@ class SearchService:
     async def search(self, query: str, max_results: int) -> SearchOutcome:
         if self.primary.name == self.fallback.name:
             sources = await self.fallback.search(query, max_results, self.settings.request_timeout_seconds)
-            return SearchOutcome(sources=sources, provider=self.fallback.name)
+            return SearchOutcome(
+                sources=enrich_source_metadata(sources),
+                provider=self.fallback.name,
+                tool_attempts=1,
+            )
 
         last_error: str | None = None
+        tool_attempts = 0
         if self.breaker.allow():
             for attempt in range(self.settings.max_retries + 1):
                 try:
                     await self.rate_limiter.wait()
+                    tool_attempts += 1
                     sources = await asyncio.wait_for(
                         self.primary.search(query, max_results, self.settings.request_timeout_seconds),
                         timeout=self.settings.request_timeout_seconds + 0.5,
                     )
+                    if not sources:
+                        raise SearchError(f"{self.primary.name} returned no results")
                     self.breaker.record_success()
-                    return SearchOutcome(sources=sources, provider=self.primary.name)
+                    tool_attempts += self._crawl_attempt_count(sources)
+                    sources = await self._crawl_sources(sources)
+                    crawl_errors = [
+                        str(source.metadata.get("degrade_reason"))
+                        for source in sources
+                        if source.metadata.get("extract_status") == "crawl_failed"
+                        and source.metadata.get("degrade_reason")
+                    ]
+                    if crawl_errors:
+                        error = "; ".join(dict.fromkeys(crawl_errors))
+                        extracted_sources = [
+                            source
+                            for source in sources
+                            if not source.metadata.get("snippet_only", False)
+                        ]
+                        if self.fallback_policy == "fail":
+                            if not extracted_sources:
+                                raise SearchError(f"crawler extraction failed: {error}")
+                            sources = extracted_sources
+                        elif self.fallback_policy == "mock" and not extracted_sources:
+                            raise SearchError(f"crawler extraction failed: {error}")
+                        return SearchOutcome(
+                            sources=enrich_source_metadata(sources),
+                            provider=self.primary.name,
+                            degraded=True,
+                            error=error,
+                            tool_attempts=tool_attempts,
+                        )
+                    return SearchOutcome(
+                        sources=enrich_source_metadata(sources),
+                        provider=self.primary.name,
+                        tool_attempts=tool_attempts,
+                    )
                 except Exception as exc:
                     last_error = str(exc)
                     self.breaker.record_failure()
@@ -565,15 +637,85 @@ class SearchService:
         else:
             last_error = "circuit breaker open"
 
+        if self.fallback_policy == "fail":
+            raise SearchError(last_error or f"{self.primary.name} search failed")
+        if self.fallback_policy == "degraded":
+            return SearchOutcome(
+                sources=[],
+                provider=self.primary.name,
+                degraded=True,
+                error=last_error,
+                tool_attempts=tool_attempts,
+            )
+
+        tool_attempts += 1
         fallback_sources = await self.fallback.search(
             query, max_results, self.settings.request_timeout_seconds
         )
         return SearchOutcome(
-            sources=fallback_sources,
+            sources=enrich_source_metadata(
+                fallback_sources,
+                fallback_used=True,
+                degrade_reason=last_error,
+            ),
             provider=self.fallback.name,
             fallback_used=True,
             error=last_error,
+            tool_attempts=tool_attempts,
         )
+
+    def _crawl_attempt_count(self, sources: list[Source]) -> int:
+        if self.crawler is None:
+            return 0
+        return sum(
+            1
+            for source in sources
+            if source.provider != "mock"
+            and source.url.startswith(("http://", "https://"))
+            and source.metadata.get("crawler") in {None, "", "none"}
+        )
+
+    async def _crawl_sources(self, sources: list[Source]) -> list[Source]:
+        if self.crawler is None:
+            return sources
+
+        async def crawl_one(source: Source) -> Source:
+            if (
+                source.provider == "mock"
+                or not source.url.startswith(("http://", "https://"))
+                or source.metadata.get("crawler") not in {None, "", "none"}
+            ):
+                return source
+            metadata = dict(source.metadata)
+            metadata.setdefault("search_snippet", source.content)
+            metadata["crawler"] = self.crawler.name
+            try:
+                content = await self.crawler.crawl(
+                    source.url,
+                    self.settings.request_timeout_seconds,
+                )
+                if not content.strip():
+                    raise SearchError("crawler returned empty content")
+                metadata.update(
+                    {
+                        "extract_status": "ok",
+                        "content_type": "text/plain",
+                        "snippet_only": False,
+                    }
+                )
+                return source.model_copy(update={"content": content, "metadata": metadata})
+            except Exception as exc:  # noqa: BLE001 - crawler errors degrade to the snippet.
+                metadata.update(
+                    {
+                        "extract_status": "crawl_failed",
+                        "crawler_error": str(exc),
+                        "degrade_reason": str(exc),
+                        "snippet_only": True,
+                    }
+                )
+                return source.model_copy(update={"metadata": metadata})
+
+        return list(await asyncio.gather(*(crawl_one(source) for source in sources)))
 
     async def _retry_backoff(self, attempt: int) -> None:
         base_delay = self.settings.search_retry_backoff_seconds
@@ -582,11 +724,60 @@ class SearchService:
         await self.retry_sleep(base_delay * (2**attempt))
 
 
-def build_search_service(settings: Settings, provider: str | None = None) -> SearchService:
+def enrich_source_metadata(
+    sources: list[Source],
+    *,
+    fallback_used: bool = False,
+    degrade_reason: str | None = None,
+) -> list[Source]:
+    retrieved_at = datetime.now(timezone.utc).isoformat()
+    enriched: list[Source] = []
+    for source in sources:
+        web_search_provider = source.provider in {
+            "wikipedia",
+            "searxng",
+            "jina",
+            "brave",
+            "tavily",
+            "mcp",
+        }
+        default_extract_status = "snippet" if web_search_provider else (
+            "ok" if source.content.strip() else "empty"
+        )
+        metadata = {
+            **source.metadata,
+            "retrieved_at": source.metadata.get("retrieved_at", retrieved_at),
+            "content_hash": hashlib.sha256(source.content.encode("utf-8")).hexdigest(),
+            "content_type": source.metadata.get("content_type", "text/plain"),
+            "extract_status": source.metadata.get(
+                "extract_status", default_extract_status
+            ),
+            "snippet_only": source.metadata.get(
+                "snippet_only", web_search_provider
+            ),
+            "fallback_used": source.metadata.get("fallback_used", fallback_used),
+            "degrade_reason": degrade_reason or source.metadata.get("degrade_reason"),
+            "published_at": source.metadata.get("published_at"),
+        }
+        enriched.append(source.model_copy(update={"metadata": metadata}))
+    return enriched
+
+
+def build_search_service(
+    settings: Settings,
+    provider: str | None = None,
+    fallback_policy: str = "mock",
+) -> SearchService:
     selected = (provider or settings.search_provider).strip().lower()
     fallback = MockSearchAdapter()
     primary = build_search_adapter(settings, selected, fallback)
-    return SearchService(primary=primary, fallback=fallback, settings=settings)
+    return SearchService(
+        primary=primary,
+        fallback=fallback,
+        settings=settings,
+        crawler=build_crawler(settings),
+        fallback_policy=fallback_policy,
+    )
 
 
 def build_search_adapter(
@@ -664,7 +855,7 @@ def _normalize_content(text: str, max_chars: int) -> str:
 
 
 def _tokens(text: str) -> set[str]:
-    return {token.lower() for token in re.findall(r"[a-zA-Z0-9_]+", text)}
+    return tokenize(text)
 
 
 def _jina_rows(raw: str) -> list[dict[str, Any]]:
@@ -731,7 +922,13 @@ def _rows_to_sources(
                 provider=provider,
                 query=query,
                 score=float(overlap * 5 + rank_bonus),
-                metadata=dict(metadata),
+                metadata={
+                    **metadata,
+                    "snippet_only": metadata.get("snippet_only", True),
+                    "extract_status": metadata.get("extract_status", "snippet"),
+                    "content_type": metadata.get("content_type", "text/plain"),
+                    "published_at": row.get("published_at") or row.get("published") or row.get("date"),
+                },
             )
         )
     return sources

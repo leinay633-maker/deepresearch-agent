@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 import sqlite3
+import threading
 from datetime import timedelta
 from pathlib import Path
 
@@ -32,6 +33,10 @@ def test_create_run_persists_waiting_approval(tmp_path, monkeypatch) -> None:
     assert any(step.stage == "planner" and step.status == "succeeded" for step in steps)
     assert any(event.status == "planner_done" for event in events)
     assert any(event.status == "waiting_approval" for event in events)
+    assert all(
+        {"attempt", "retryable", "degraded"} <= event.payload.keys()
+        for event in events
+    )
 
 
 def test_run_review_ui_and_run_list(tmp_path, monkeypatch) -> None:
@@ -403,6 +408,9 @@ def test_retry_reuses_researcher_checkpoint_after_later_stage_failure(
                 llm_provider="mock",
                 max_researchers=1,
                 max_results_per_researcher=1,
+                reflection_enabled=True,
+                max_reflection_rounds=1,
+                reflection_min_sources=4,
                 require_approval=False,
             )
         )
@@ -410,8 +418,14 @@ def test_retry_reuses_researcher_checkpoint_after_later_stage_failure(
     retried = asyncio.run(controller.retry(failed.run_id))
 
     assert failed.status == "failed"
+    assert failed.current_stage == "synthesizer"
     assert retried.status == "succeeded"
     assert calls == {"researcher": 1, "synthesizer": 2}
+    assert retried.result_json is not None
+    assert [item["id"] for item in retried.result_json["plan"]] == [
+        item["subquestion_id"] for item in retried.result_json["findings"]
+    ]
+    assert any(record["stage"] == "research_decision" for record in retried.result_json["cost"]["records"])
     researcher_steps = [
         step for step in store.list_steps(failed.run_id) if step.stage == "researcher"
     ]
@@ -420,6 +434,180 @@ def test_retry_reuses_researcher_checkpoint_after_later_stage_failure(
         event.stage == "researcher" and event.status == "checkpoint_reused"
         for event in store.list_events(failed.run_id)
     )
+    synthesis_failure = next(
+        event
+        for event in store.list_events(failed.run_id)
+        if event.stage == "synthesizer" and event.status == "failed"
+    )
+    assert synthesis_failure.payload["attempt"] == 1
+    assert synthesis_failure.payload["retryable"] is True
+
+
+def test_verifier_failure_is_attributed_to_verifier(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "runs.sqlite"
+    monkeypatch.setenv("RUN_STORE_PATH", str(db_path))
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("SEARCH_PROVIDER", "mock")
+    monkeypatch.setenv("LOCAL_RETRIEVAL_MODE", "keyword")
+    store = RunStore(db_path)
+
+    async def failing_verifier(self, *args, **kwargs):
+        raise RuntimeError("synthetic verifier failure")
+
+    monkeypatch.setattr(RunController, "_run_verifier_stage", failing_verifier)
+    failed = asyncio.run(
+        RunController(store=store, settings=load_settings()).create_run(
+            CreateRunRequest(
+                query="How should verifier failures be attributed?",
+                search_provider="mock",
+                llm_provider="mock",
+                max_researchers=1,
+                max_results_per_researcher=1,
+                require_approval=False,
+            )
+        )
+    )
+
+    assert failed.status == "failed"
+    assert failed.current_stage == "verifier"
+    assert any(
+        step.stage == "verifier" and step.status == "failed"
+        for step in store.list_steps(failed.run_id)
+    )
+    assert any(
+        event.stage == "verifier" and event.status == "failed"
+        for event in store.list_events(failed.run_id)
+    )
+
+
+def test_cancel_after_verifier_cannot_be_overwritten_by_success(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "runs.sqlite"
+    monkeypatch.setenv("RUN_STORE_PATH", str(db_path))
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("SEARCH_PROVIDER", "mock")
+    monkeypatch.setenv("LOCAL_RETRIEVAL_MODE", "keyword")
+    store = RunStore(db_path)
+    original_verifier = RunController._run_verifier_stage
+
+    async def cancelling_verifier(self, run_id, *args, **kwargs):
+        report = await original_verifier(self, run_id, *args, **kwargs)
+        self.cancel(run_id)
+        return report
+
+    monkeypatch.setattr(RunController, "_run_verifier_stage", cancelling_verifier)
+    run = asyncio.run(
+        RunController(store=store, settings=load_settings()).create_run(
+            CreateRunRequest(
+                query="How should final commit respect cancellation?",
+                search_provider="mock",
+                llm_provider="mock",
+                max_researchers=1,
+                max_results_per_researcher=1,
+                require_approval=False,
+            )
+        )
+    )
+
+    assert run.status == "cancelled"
+    assert not any(event.status == "succeeded" and event.stage == "run" for event in store.list_events(run.run_id))
+    assert store.require_run(run.run_id).status == "cancelled"
+
+
+def test_concurrent_approve_and_retry_are_single_claim(tmp_path, monkeypatch) -> None:
+    client, store = _client(tmp_path, monkeypatch)
+    approval_id = client.post(
+        "/runs", json=_run_body("How should concurrent approval be fenced?")
+    ).json()["run_id"]
+    barrier = threading.Barrier(2)
+    approval_results: list[str] = []
+
+    def approve_once() -> None:
+        controller = RunController(store=RunStore(store.path), settings=load_settings())
+        barrier.wait()
+        try:
+            asyncio.run(controller.approve(approval_id))
+            approval_results.append("ok")
+        except ValueError:
+            approval_results.append("conflict")
+
+    threads = [threading.Thread(target=approve_once) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(approval_results) == ["conflict", "ok"]
+    assert sum(
+        event.stage == "approval" and event.status == "approved"
+        for event in store.list_events(approval_id)
+    ) == 1
+
+    retry_id = "concurrent-retry"
+    store.create_run(
+        run_id=retry_id,
+        query="How should concurrent retry be fenced?",
+        require_approval=False,
+        request_json={
+            "query": "How should concurrent retry be fenced?",
+            "llm_provider": "mock",
+            "search_provider": "mock",
+            "max_researchers": 1,
+            "max_results_per_researcher": 1,
+            "require_approval": False,
+            "defer_execution": False,
+        },
+    )
+    store.update_run(retry_id, status="failed")
+    retry_barrier = threading.Barrier(2)
+    retry_results: list[str] = []
+
+    def retry_once() -> None:
+        controller = RunController(store=RunStore(store.path), settings=load_settings())
+        retry_barrier.wait()
+        try:
+            asyncio.run(controller.retry(retry_id))
+            retry_results.append("ok")
+        except ValueError:
+            retry_results.append("conflict")
+
+    retry_threads = [threading.Thread(target=retry_once) for _ in range(2)]
+    for thread in retry_threads:
+        thread.start()
+    for thread in retry_threads:
+        thread.join()
+
+    assert sorted(retry_results) == ["conflict", "ok"]
+    assert sum(event.status == "retrying" for event in store.list_events(retry_id)) == 1
+
+
+def test_stale_recovery_cas_loses_to_heartbeat(tmp_path, monkeypatch) -> None:
+    client, store = _client(tmp_path, monkeypatch)
+    del client
+    run_id = "stale-heartbeat-race"
+    store.create_run(
+        run_id=run_id,
+        query="How should stale recovery respect heartbeat?",
+        require_approval=False,
+    )
+    store.update_run(run_id, status="running", current_stage="researcher")
+    stale = store.acquire_lease(
+        run_id,
+        worker_id="worker-a",
+        lease_seconds=1,
+        now=utc_now() - timedelta(seconds=10),
+    )
+    assert stale is not None and stale.lease_expires_at is not None
+    assert store.heartbeat_lease(run_id, worker_id="worker-a", lease_seconds=60) is not None
+
+    recovered = store.recover_stale_run(
+        run_id,
+        expected_worker_id="worker-a",
+        expected_lease_expires_at=stale.lease_expires_at,
+        reason="stale snapshot",
+    )
+
+    assert recovered is None
+    assert store.require_run(run_id).status == "running"
 
 
 def test_sse_replay_uses_last_event_id(tmp_path, monkeypatch) -> None:

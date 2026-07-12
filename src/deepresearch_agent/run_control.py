@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import asyncio
 import time
 import uuid
 from typing import Any
 
 from deepresearch_agent.config import Settings, load_settings
 from deepresearch_agent.cost import CostTracker
+from deepresearch_agent.execution import ResearchExecutionEngine, is_retryable_error
 from deepresearch_agent.orchestrator import DeepResearchOrchestrator
+from deepresearch_agent.report_metrics import build_execution_metrics
 from deepresearch_agent.run_models import (
     AgentEvent,
     AgentRun,
@@ -17,7 +18,6 @@ from deepresearch_agent.run_models import (
     RecoverStaleRunsRequest,
     RejectRunRequest,
     RunLeaseRequest,
-    RunActionResponse,
     RunTrace,
 )
 from deepresearch_agent.run_store import RunStore
@@ -32,7 +32,6 @@ from deepresearch_agent.schemas import (
     SubQuestion,
 )
 from deepresearch_agent.search import build_search_service
-from deepresearch_agent.source_metrics import source_diversity_metrics
 from deepresearch_agent.tracing import TraceLogger, build_trace_exporter
 
 
@@ -72,7 +71,20 @@ class RunController:
             return self._fail_run(run_id, "planner", exc)
 
     async def approve(self, run_id: str) -> AgentRun:
-        run = self._require_status(run_id, {"waiting_approval"})
+        self._require_status(run_id, {"waiting_approval"})
+        run = self.store.transition_run(
+            run_id,
+            expected_statuses={"waiting_approval"},
+            require_unleased=True,
+            status="queued",
+            current_stage="researcher",
+            error_message=None,
+        )
+        if run is None:
+            current = self.store.require_run(run_id)
+            raise ValueError(
+                f"run {run_id} status is {current.status}; approval was already claimed"
+            )
         self._event(run_id, "approval", "approved", {})
         return await self._continue_from_plan(run)
 
@@ -82,53 +94,97 @@ class RunController:
         plan_state["subquestions"] = [
             item.model_dump(mode="json") for item in request.subquestions
         ]
-        self.store.update_run(run_id, plan_json=plan_state)
+        claimed = self.store.transition_run(
+            run_id,
+            expected_statuses={"waiting_approval"},
+            require_unleased=True,
+            status="queued",
+            current_stage="researcher",
+            plan_json=plan_state,
+            error_message=None,
+        )
+        if claimed is None:
+            current = self.store.require_run(run_id)
+            raise ValueError(
+                f"run {run_id} status is {current.status}; edit was already claimed"
+            )
         self._event(
             run_id,
             "approval",
             "edited",
             {"subquestion_count": len(request.subquestions)},
         )
-        return await self._continue_from_plan(self.store.require_run(run_id))
+        return await self._continue_from_plan(claimed)
 
     def reject(self, run_id: str, request: RejectRunRequest) -> AgentRun:
         self._require_status(run_id, {"waiting_approval"})
-        self._event(run_id, "approval", "rejected", {"reason": request.reason})
-        self.store.update_run(
+        cancelled = self.store.transition_run(
             run_id,
+            expected_statuses={"waiting_approval"},
+            require_unleased=True,
             status="cancelled",
             current_stage="completed",
             error_message=request.reason,
+            leased_by=None,
+            heartbeat_at=None,
+            lease_expires_at=None,
         )
-        return self.store.clear_lease(run_id)
+        if cancelled is None:
+            current = self.store.require_run(run_id)
+            raise ValueError(
+                f"run {run_id} status is {current.status}; rejection lost a concurrent transition"
+            )
+        self._event(run_id, "approval", "rejected", {"reason": request.reason})
+        return cancelled
 
     def cancel(self, run_id: str) -> AgentRun:
         run = self.store.require_run(run_id)
         if run.status in TERMINAL_STATUSES:
             return run
-        self._event(run_id, "run", "cancelled", {"previous_status": run.status})
-        self.store.update_run(
+        cancelled = self.store.transition_run(
             run_id,
+            expected_statuses={run.status},
             status="cancelled",
             current_stage="completed",
             error_message="run cancelled",
+            leased_by=None,
+            heartbeat_at=None,
+            lease_expires_at=None,
         )
-        return self.store.clear_lease(run_id)
+        if cancelled is None:
+            current = self.store.require_run(run_id)
+            if current.status in TERMINAL_STATUSES:
+                return current
+            raise ValueError(f"run {run_id} changed while cancellation was being applied")
+        self._event(run_id, "run", "cancelled", {"previous_status": run.status})
+        return cancelled
 
     async def retry(self, run_id: str) -> AgentRun:
         run = self._require_status(run_id, {"failed"})
-        self._event(run_id, "run", "retrying", {})
-        self.store.update_run(run_id, status="queued", error_message=None)
-        run = self.store.require_run(run_id)
+        retry_count = self._next_retry_count(run_id)
+        claimed = self.store.transition_run(
+            run_id,
+            expected_statuses={"failed"},
+            require_unleased=True,
+            status="queued",
+            error_message=None,
+        )
+        if claimed is None:
+            current = self.store.require_run(run_id)
+            raise ValueError(
+                f"run {run_id} status is {current.status}; retry was already claimed"
+            )
+        self._event(run_id, "run", "retrying", {"retry_count": retry_count})
+        run = claimed
         if run.plan_json is not None:
-            return await self._continue_from_plan(run, retry_count=1)
+            return await self._continue_from_plan(run, retry_count=retry_count)
         request = self._request_from_run(run, require_approval=False)
         try:
-            return await self._run_planner(run_id, request, retry_count=1)
+            return await self._run_planner(run_id, request, retry_count=retry_count)
         except RunCancelledError:
             return self._cancelled_run(run_id)
         except Exception as exc:  # noqa: BLE001
-            return self._fail_run(run_id, "planner", exc, retry_count=1)
+            return self._fail_run(run_id, "planner", exc, retry_count=retry_count)
 
     async def process_next_queued(self) -> AgentRun | None:
         run = self.store.claim_next_queued_run(
@@ -207,6 +263,16 @@ class RunController:
     def recover_stale_runs(self, request: RecoverStaleRunsRequest) -> list[AgentRun]:
         recovered: list[AgentRun] = []
         for run in self.store.list_stale_runs():
+            if run.leased_by is None or run.lease_expires_at is None:
+                continue
+            recovered_run = self.store.recover_stale_run(
+                run.run_id,
+                expected_worker_id=run.leased_by,
+                expected_lease_expires_at=run.lease_expires_at,
+                reason=request.reason,
+            )
+            if recovered_run is None:
+                continue
             self._step(run.run_id, run.current_stage, "failed", error=request.reason)
             self._event(
                 run.run_id,
@@ -214,12 +280,7 @@ class RunController:
                 "stale_recovered",
                 {"reason": request.reason, "leased_by": run.leased_by},
             )
-            self.store.update_run(
-                run.run_id,
-                status="failed",
-                error_message=request.reason,
-            )
-            recovered.append(self.store.clear_lease(run.run_id))
+            recovered.append(recovered_run)
         return recovered
 
     def steps(self, run_id: str):
@@ -271,8 +332,22 @@ class RunController:
         retry_count: int = 0,
     ) -> AgentRun:
         self._acquire_execution_lease(run_id)
-        self.store.update_run(run_id, status="running", current_stage="planner")
-        self._event(run_id, "planner", "started", {"query": request.query})
+        running = self.store.transition_run(
+            run_id,
+            expected_statuses={"queued", "running"},
+            expected_worker_id=self.worker_id,
+            status="running",
+            current_stage="planner",
+        )
+        if running is None:
+            self._check_execution_active(run_id)
+            raise RuntimeError("planner transition rejected because execution ownership was lost")
+        self._event(
+            run_id,
+            "planner",
+            "started",
+            {"query": request.query, "retry_count": retry_count},
+        )
         started_at = time.perf_counter()
         self._step(
             run_id,
@@ -282,12 +357,18 @@ class RunController:
             retry_count=retry_count,
         )
         orchestrator = DeepResearchOrchestrator(settings=self.settings)
+        engine = ResearchExecutionEngine(orchestrator)
         llm = orchestrator._build_llm_provider(request)
         cost = self._new_cost_tracker(llm)
-        brief = await llm.create_brief(request, cost)
+        brief = await engine.run_clarify_stage(request=request, llm=llm, cost=cost)
         self._raise_if_cancelled(run_id)
         max_researchers = min(request.max_researchers, self.settings.max_researchers)
-        plan = await llm.plan(brief, max_researchers=max_researchers, cost=cost)
+        plan = await engine.run_planner_stage(
+            brief=brief,
+            max_researchers=max_researchers,
+            llm=llm,
+            cost=cost,
+        )
         self._raise_if_cancelled(run_id)
         cost_summary = cost.summary()
         plan_state = {
@@ -313,26 +394,36 @@ class RunController:
             run_id,
             "planner",
             "planner_done",
-            {"subquestion_count": len(plan)},
+            {"subquestion_count": len(plan), "retry_count": retry_count},
         )
-        self.store.update_run(
+        saved = self.store.transition_run(
             run_id,
+            expected_statuses={"running"},
+            expected_worker_id=self.worker_id,
             plan_json=plan_state,
             total_tokens=cost_summary.total_tokens,
             total_cost=cost_summary.total_estimated_cost_usd,
             error_message=None,
         )
+        if saved is None:
+            self._check_execution_active(run_id)
+            raise RuntimeError("planner checkpoint rejected because execution ownership was lost")
         if request.require_approval:
+            waiting = self.store.transition_run(
+                run_id,
+                expected_statuses={"running"},
+                expected_worker_id=self.worker_id,
+                status="waiting_approval",
+                current_stage="approval",
+            )
+            if waiting is None:
+                self._check_execution_active(run_id)
+                raise RuntimeError("approval transition rejected because execution ownership was lost")
             self._event(
                 run_id,
                 "approval",
                 "waiting_approval",
                 self.approval_payload_data(plan_state),
-            )
-            waiting = self.store.update_run(
-                run_id,
-                status="waiting_approval",
-                current_stage="approval",
             )
             return self._release_execution_lease(waiting.run_id)
         return await self._continue_from_plan(self.store.require_run(run_id), retry_count=retry_count)
@@ -362,7 +453,18 @@ class RunController:
         except RunCancelledError:
             return self._cancelled_run(run.run_id)
         except Exception as exc:  # noqa: BLE001
-            return self._fail_run(run.run_id, "researcher", exc, retry_count=retry_count)
+            current_stage = self.store.require_run(run.run_id).current_stage
+            failure_stage = (
+                current_stage
+                if current_stage in {"researcher", "synthesizer", "verifier"}
+                else "researcher"
+            )
+            return self._fail_run(
+                run.run_id,
+                failure_stage,
+                exc,
+                retry_count=retry_count,
+            )
 
     async def _execute_research_flow(
         self,
@@ -381,7 +483,11 @@ class RunController:
             trace_dir=self.settings.trace_dir,
             exporter=build_trace_exporter(self.settings),
         )
-        search_service = build_search_service(self.settings, request.search_provider)
+        search_service = build_search_service(
+            self.settings,
+            request.search_provider,
+            orchestrator._fallback_policy(request),
+        )
         max_researchers = min(request.max_researchers, self.settings.max_researchers)
 
         researcher_checkpoint = (
@@ -389,13 +495,7 @@ class RunController:
         )
         if researcher_checkpoint is None:
             self._raise_if_cancelled(run_id)
-            (
-                findings,
-                raw_search_count,
-                fallback_count,
-                all_sources,
-                sources,
-            ) = await self._run_researcher_stage(
+            researcher_output = await self._run_researcher_stage(
                 run_id,
                 request,
                 plan,
@@ -403,12 +503,42 @@ class RunController:
                 search_service,
                 trace,
                 max_researchers,
+                llm,
+                cost,
                 retry_count,
             )
+            if len(researcher_output) == 5:
+                # Backward compatibility for custom stage implementations written
+                # before degraded_count became a first-class metric.
+                (
+                    findings,
+                    raw_search_count,
+                    fallback_count,
+                    all_sources,
+                    sources,
+                ) = researcher_output
+                degraded_count = 0
+            else:
+                (
+                    findings,
+                    raw_search_count,
+                    fallback_count,
+                    degraded_count,
+                    all_sources,
+                    sources,
+                ) = researcher_output
         else:
             self._heartbeat_execution_lease(run_id)
-            self.store.update_run(run_id, status="running", current_stage="researcher")
-            findings, raw_search_count, fallback_count, all_sources, sources = researcher_checkpoint
+            self._set_owned_stage(run_id, "researcher")
+            self._restore_researcher_cost(run_id, cost)
+            (
+                findings,
+                raw_search_count,
+                fallback_count,
+                degraded_count,
+                all_sources,
+                sources,
+            ) = researcher_checkpoint
             self._event(
                 run_id,
                 "researcher",
@@ -421,18 +551,21 @@ class RunController:
             )
 
         self._raise_if_cancelled(run_id)
+        self._set_owned_stage(run_id, "synthesizer")
         answer, claims, _synthesis_cost = await self._run_synthesizer_stage(
             run_id,
             brief,
             plan,
             findings,
             sources,
+            orchestrator,
             llm,
             cost,
             retry_count,
         )
 
         self._raise_if_cancelled(run_id)
+        self._set_owned_stage(run_id, "verifier")
         citation_report = await self._run_verifier_stage(
             run_id,
             request,
@@ -442,19 +575,20 @@ class RunController:
             cost,
             retry_count,
         )
+        self._check_execution_active(run_id)
 
         total_cost = _merge_costs(planner_cost, cost.summary())
         latency_ms = sum(step.latency_ms or 0.0 for step in self.store.list_steps(run_id))
-        metrics = {
-            "latency_ms": round(latency_ms, 3),
-            "raw_search_result_count": raw_search_count,
-            "verified_source_count": len(all_sources),
-            "deduped_source_count": len(sources),
-            "fallback_count": fallback_count,
-            "citation_retention_rate": citation_report.retention_rate,
-            "success": citation_report.retention_rate >= 0.8 and len(sources) > 0,
-            **source_diversity_metrics(sources),
-        }
+        metrics = build_execution_metrics(
+            latency_ms=latency_ms,
+            raw_search_result_count=raw_search_count,
+            verified_source_count=len(all_sources),
+            deduped_source_count=len(sources),
+            fallback_count=fallback_count,
+            degraded_count=degraded_count,
+            sources=sources,
+            citation_report=citation_report,
+        )
         report = StructuredReport(
             run_id=run_id,
             query=request.query,
@@ -469,15 +603,23 @@ class RunController:
             metrics=metrics,
             trace_events=trace.events,
         )
-        self._event(run_id, "run", "succeeded", metrics)
-        self.store.update_run(
+        completed = self.store.complete_run_if_owned(
             run_id,
-            status="succeeded",
-            current_stage="completed",
+            worker_id=self.worker_id,
             result_json=report.model_dump(mode="json"),
             total_tokens=total_cost.total_tokens,
             total_cost=total_cost.total_estimated_cost_usd,
-            error_message=None,
+        )
+        if completed is None:
+            current = self.store.require_run(run_id)
+            if current.status == "cancelled":
+                raise RunCancelledError("run cancelled before final commit")
+            raise RuntimeError("run final commit rejected because execution ownership was lost")
+        self._event(
+            run_id,
+            "run",
+            "succeeded",
+            {**metrics, "retry_count": retry_count},
         )
         return self._release_execution_lease(run_id)
 
@@ -490,11 +632,18 @@ class RunController:
         search_service,
         trace: TraceLogger,
         max_researchers: int,
+        llm,
+        cost: CostTracker,
         retry_count: int,
-    ) -> tuple[list[Finding], int, int, list[Source], list[Source]]:
+    ) -> tuple[list[Finding], int, int, int, list[Source], list[Source]]:
         self._heartbeat_execution_lease(run_id)
-        self.store.update_run(run_id, status="running", current_stage="researcher")
-        self._event(run_id, "researcher", "started", {"subquestion_count": len(plan)})
+        self._set_owned_stage(run_id, "researcher")
+        self._event(
+            run_id,
+            "researcher",
+            "started",
+            {"subquestion_count": len(plan), "retry_count": retry_count},
+        )
         started_at = time.perf_counter()
         self._step(
             run_id,
@@ -503,39 +652,44 @@ class RunController:
             input_json={"subquestions": [item.model_dump(mode="json") for item in plan]},
             retry_count=retry_count,
         )
-        semaphore = asyncio.Semaphore(max_researchers)
-        research_results = await asyncio.gather(
-            *[
-                orchestrator._research_one(
-                    subquestion,
-                    request,
-                    search_service,
-                    semaphore,
-                    trace,
-                    emit=None,
-                )
-                for subquestion in plan
-            ]
-        )
-        research_results = await orchestrator._run_reflection_rounds(
+        before_summary = cost.summary()
+        before_record_count = len(before_summary.records)
+        research = await ResearchExecutionEngine(orchestrator).run_research_stage(
             plan=plan,
-            research_results=list(research_results),
             request=request,
             search_service=search_service,
-            semaphore=semaphore,
             trace=trace,
+            llm=llm,
+            cost=cost,
+            max_researchers=max_researchers,
             emit=None,
+            cancel_check=lambda: self._check_execution_active(run_id),
         )
-        raw_search_count = sum(len(outcome.sources) for _, outcome in research_results)
-        fallback_count = sum(1 for _, outcome in research_results if outcome.fallback_used)
-        preliminary_findings = [finding for finding, _ in research_results]
-        all_sources = [
-            source for finding in preliminary_findings for source in finding.sources
-        ]
-        deduped_sources = orchestrator.deduper.dedup(all_sources)
-        sources = orchestrator._assign_source_ids(deduped_sources)
-        source_by_key = {orchestrator.deduper.key(source): source for source in sources}
-        findings = orchestrator._remap_findings(preliminary_findings, source_by_key)
+        plan_state = self._plan_state(self.store.require_run(run_id))
+        plan_state["subquestions"] = [item.model_dump(mode="json") for item in plan]
+        updated_plan = self.store.transition_run(
+            run_id,
+            expected_statuses={"running"},
+            expected_worker_id=self.worker_id,
+            plan_json=plan_state,
+        )
+        if updated_plan is None:
+            self._check_execution_active(run_id)
+            raise RuntimeError("researcher plan checkpoint rejected because ownership was lost")
+        findings = research.findings
+        raw_search_count = research.raw_search_count
+        fallback_count = research.fallback_count
+        degraded_count = research.degraded_count
+        all_sources = research.all_sources
+        sources = research.sources
+        after_summary = cost.summary()
+        researcher_cost_records = after_summary.records[before_record_count:]
+        researcher_tokens = after_summary.total_tokens - before_summary.total_tokens
+        researcher_cost = round(
+            after_summary.total_estimated_cost_usd
+            - before_summary.total_estimated_cost_usd,
+            8,
+        )
         self._step(
             run_id,
             "researcher",
@@ -550,18 +704,39 @@ class RunController:
                     "sources": [source.model_dump(mode="json") for source in sources],
                     "raw_search_result_count": raw_search_count,
                     "fallback_count": fallback_count,
+                    "degraded_count": degraded_count,
+                    "plan": [item.model_dump(mode="json") for item in plan],
+                    "cost_records": [
+                        record.model_dump(mode="json")
+                        for record in researcher_cost_records
+                    ],
                 },
             },
             latency_ms=_elapsed_ms(started_at),
+            token_usage=researcher_tokens,
+            cost=researcher_cost,
             retry_count=retry_count,
         )
         self._event(
             run_id,
             "researcher",
             "succeeded",
-            {"finding_count": len(findings), "source_count": len(sources)},
+            {
+                "finding_count": len(findings),
+                "source_count": len(sources),
+                "fallback_count": fallback_count,
+                "degraded_count": degraded_count,
+                "retry_count": retry_count,
+            },
         )
-        return findings, raw_search_count, fallback_count, all_sources, sources
+        return (
+            findings,
+            raw_search_count,
+            fallback_count,
+            degraded_count,
+            all_sources,
+            sources,
+        )
 
     async def _run_synthesizer_stage(
         self,
@@ -570,13 +745,19 @@ class RunController:
         plan: list[SubQuestion],
         findings: list[Finding],
         sources: list[Source],
+        orchestrator: DeepResearchOrchestrator,
         llm,
         cost: CostTracker,
         retry_count: int,
     ) -> tuple[str, list[str], CostSummary]:
         self._heartbeat_execution_lease(run_id)
-        self.store.update_run(run_id, status="running", current_stage="synthesizer")
-        self._event(run_id, "synthesizer", "started", {"source_count": len(sources)})
+        self._set_owned_stage(run_id, "synthesizer")
+        self._event(
+            run_id,
+            "synthesizer",
+            "started",
+            {"source_count": len(sources), "retry_count": retry_count},
+        )
         started_at = time.perf_counter()
         self._step(
             run_id,
@@ -587,7 +768,15 @@ class RunController:
         )
         before_tokens = cost.summary().total_tokens
         before_cost = cost.summary().total_estimated_cost_usd
-        answer, claims = await llm.synthesize(brief, plan, findings, sources, cost)
+        answer, claims = await ResearchExecutionEngine(orchestrator).run_synthesizer_stage(
+            brief=brief,
+            plan=plan,
+            findings=findings,
+            sources=sources,
+            llm=llm,
+            cost=cost,
+        )
+        self._check_execution_active(run_id)
         summary = cost.summary()
         self._step(
             run_id,
@@ -599,7 +788,12 @@ class RunController:
             cost=round(summary.total_estimated_cost_usd - before_cost, 8),
             retry_count=retry_count,
         )
-        self._event(run_id, "synthesizer", "succeeded", {"claim_count": len(claims)})
+        self._event(
+            run_id,
+            "synthesizer",
+            "succeeded",
+            {"claim_count": len(claims), "retry_count": retry_count},
+        )
         return answer, claims, summary
 
     async def _run_verifier_stage(
@@ -613,8 +807,13 @@ class RunController:
         retry_count: int,
     ):
         self._heartbeat_execution_lease(run_id)
-        self.store.update_run(run_id, status="running", current_stage="verifier")
-        self._event(run_id, "verifier", "started", {"claim_count": len(claims)})
+        self._set_owned_stage(run_id, "verifier")
+        self._event(
+            run_id,
+            "verifier",
+            "started",
+            {"claim_count": len(claims), "retry_count": retry_count},
+        )
         started_at = time.perf_counter()
         self._step(
             run_id,
@@ -623,25 +822,37 @@ class RunController:
             input_json={"claim_count": len(claims), "source_count": len(sources)},
             retry_count=retry_count,
         )
-        citation_report = orchestrator.citation_checker.check(
-            claims,
-            sources,
-            judge_provider=orchestrator._build_citation_judge_provider(request),
+        before_summary = cost.summary()
+        citation_report = ResearchExecutionEngine(orchestrator).run_verifier_stage(
+            request=request,
+            claims=claims,
+            sources=sources,
             cost=cost,
         )
+        self._check_execution_active(run_id)
+        after_summary = cost.summary()
         self._step(
             run_id,
             "verifier",
             "succeeded",
             output_json=citation_report.model_dump(mode="json"),
             latency_ms=_elapsed_ms(started_at),
+            token_usage=after_summary.total_tokens - before_summary.total_tokens,
+            cost=round(
+                after_summary.total_estimated_cost_usd
+                - before_summary.total_estimated_cost_usd,
+                8,
+            ),
             retry_count=retry_count,
         )
         self._event(
             run_id,
             "verifier",
             "succeeded",
-            {"retention_rate": citation_report.retention_rate},
+            {
+                "retention_rate": citation_report.retention_rate,
+                "retry_count": retry_count,
+            },
         )
         return citation_report
 
@@ -675,12 +886,39 @@ class RunController:
         status: str,
         payload: dict[str, Any] | None = None,
     ) -> AgentEvent:
+        event_payload = dict(payload or {})
+        retry_count = event_payload.get("retry_count", 0)
+        if not isinstance(retry_count, int) or retry_count < 0:
+            retry_count = 0
+        event_payload.setdefault("attempt", retry_count + 1)
+        event_payload.setdefault(
+            "retryable",
+            status == "failed"
+            and stage in {"planner", "researcher", "synthesizer", "verifier"}
+            and is_retryable_error(event_payload.get("error")),
+        )
+        event_payload.setdefault(
+            "degraded",
+            status == "fallback"
+            or bool(event_payload.get("fallback_used"))
+            or bool(event_payload.get("fallback_count", 0))
+            or bool(event_payload.get("degraded_count", 0)),
+        )
         return self.store.add_event(
             run_id=run_id,
             stage=stage,
             status=status,
-            payload=payload or {},
+            payload=event_payload,
         )
+
+    def _next_retry_count(self, run_id: str) -> int:
+        step_counts = [step.retry_count for step in self.store.list_steps(run_id)]
+        event_counts = [
+            int(event.payload.get("retry_count", 0))
+            for event in self.store.list_events(run_id)
+            if isinstance(event.payload.get("retry_count", 0), int)
+        ]
+        return max([0, *step_counts, *event_counts]) + 1
 
     def _plan_state(self, run: AgentRun) -> dict[str, Any]:
         if run.plan_json is None:
@@ -690,7 +928,7 @@ class RunController:
     def _load_researcher_checkpoint(
         self,
         run_id: str,
-    ) -> tuple[list[Finding], int, int, list[Source], list[Source]] | None:
+    ) -> tuple[list[Finding], int, int, int, list[Source], list[Source]] | None:
         for step in reversed(self.store.list_steps(run_id)):
             if step.stage != "researcher" or step.status != "succeeded":
                 continue
@@ -713,12 +951,37 @@ class RunController:
                 ]
                 raw_search_count = int(checkpoint.get("raw_search_result_count", 0))
                 fallback_count = int(checkpoint.get("fallback_count", 0))
+                degraded_count = int(checkpoint.get("degraded_count", 0))
             except Exception:  # noqa: BLE001
                 return None
-            if not findings or not sources:
+            if not findings or "sources" not in checkpoint:
                 return None
-            return findings, raw_search_count, fallback_count, all_sources, sources
+            return (
+                findings,
+                raw_search_count,
+                fallback_count,
+                degraded_count,
+                all_sources,
+                sources,
+            )
         return None
+
+    def _restore_researcher_cost(self, run_id: str, cost: CostTracker) -> None:
+        for step in reversed(self.store.list_steps(run_id)):
+            if step.stage != "researcher" or step.status != "succeeded":
+                continue
+            checkpoint = (step.output_json or {}).get("checkpoint") or {}
+            for raw_record in checkpoint.get("cost_records", []):
+                record = CostRecord.model_validate(raw_record)
+                cost.add_usage(
+                    stage=record.stage,
+                    input_tokens=record.input_tokens,
+                    output_tokens=record.output_tokens,
+                    estimated_cost_usd=record.estimated_cost_usd,
+                    provider=record.provider,
+                    model=record.model,
+                )
+            return
 
     def _require_status(self, run_id: str, statuses: set[str]) -> AgentRun:
         run = self.store.require_run(run_id)
@@ -744,6 +1007,27 @@ class RunController:
     def _raise_if_cancelled(self, run_id: str) -> None:
         if self.store.require_run(run_id).status == "cancelled":
             raise RunCancelledError("run cancelled")
+
+    def _check_execution_active(self, run_id: str) -> None:
+        self._raise_if_cancelled(run_id)
+        self._heartbeat_execution_lease(run_id)
+
+    def _set_owned_stage(self, run_id: str, stage: str) -> AgentRun:
+        updated = self.store.transition_run(
+            run_id,
+            expected_statuses={"running", "queued"},
+            expected_worker_id=self.worker_id,
+            status="running",
+            current_stage=stage,
+        )
+        if updated is not None:
+            return updated
+        current = self.store.require_run(run_id)
+        if current.status == "cancelled":
+            raise RunCancelledError("run cancelled")
+        raise RuntimeError(
+            f"run {run_id} stage transition to {stage} rejected because ownership was lost"
+        )
 
     def _acquire_execution_lease(self, run_id: str) -> AgentRun:
         run = self.store.acquire_lease(
@@ -774,15 +1058,26 @@ class RunController:
 
     def _cancelled_run(self, run_id: str) -> AgentRun:
         run = self.store.require_run(run_id)
-        if run.status != "cancelled":
-            self._event(run_id, "run", "cancelled", {"previous_status": run.status})
-            self.store.update_run(
-                run_id,
-                status="cancelled",
-                current_stage="completed",
-                error_message="run cancelled",
-            )
-        return self.store.clear_lease(run_id)
+        if run.status == "cancelled":
+            return run
+        if run.status in TERMINAL_STATUSES:
+            return run
+        cancelled = self.store.transition_run(
+            run_id,
+            expected_statuses={run.status},
+            expected_worker_id=self.worker_id if run.leased_by == self.worker_id else None,
+            require_unleased=run.leased_by is None,
+            status="cancelled",
+            current_stage="completed",
+            error_message="run cancelled",
+            leased_by=None,
+            heartbeat_at=None,
+            lease_expires_at=None,
+        )
+        if cancelled is None:
+            return self.store.require_run(run_id)
+        self._event(run_id, "run", "cancelled", {"previous_status": run.status})
+        return cancelled
 
     def _fail_run(
         self,
@@ -791,7 +1086,29 @@ class RunController:
         exc: Exception,
         retry_count: int = 0,
     ) -> AgentRun:
+        current = self.store.require_run(run_id)
+        if current.status in TERMINAL_STATUSES:
+            return current
+        if current.leased_by != self.worker_id:
+            return current
         message = str(exc)
+        failed = self.store.transition_run(
+            run_id,
+            expected_statuses={"queued", "running"},
+            expected_worker_id=self.worker_id,
+            status="failed",
+            current_stage=(
+                stage
+                if stage in {"planner", "researcher", "synthesizer", "verifier"}
+                else "completed"
+            ),
+            error_message=message,
+            leased_by=None,
+            heartbeat_at=None,
+            lease_expires_at=None,
+        )
+        if failed is None:
+            return self.store.require_run(run_id)
         self._step(
             run_id,
             stage,
@@ -799,14 +1116,13 @@ class RunController:
             error=message,
             retry_count=retry_count,
         )
-        self._event(run_id, stage, "failed", {"error": message})
-        self.store.update_run(
+        self._event(
             run_id,
-            status="failed",
-            current_stage=stage if stage in {"planner", "researcher", "synthesizer", "verifier"} else "completed",
-            error_message=message,
+            stage,
+            "failed",
+            {"error": message, "retry_count": retry_count},
         )
-        return self.store.clear_lease(run_id)
+        return failed
 
     def approval_payload_data(self, plan_state: dict[str, Any]) -> dict[str, Any]:
         return {

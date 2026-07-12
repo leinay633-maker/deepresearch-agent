@@ -7,7 +7,7 @@ name = "deepresearch-agent"
 version = "0.1.0"
 description = "A scoped, observable DeepResearch Agent for agent backend interviews."
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "certifi>=2024.0.0",
     "chromadb>=0.5.0,<2.0.0",
@@ -25,12 +25,14 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
     "httpx>=0.27.0",
+    "ruff>=0.12.0",
 ]
 
 [project.scripts]
 deepresearch = "deepresearch_agent.cli:main"
 deepresearch-api = "deepresearch_agent.api:main"
 deepresearch-benchmark = "deepresearch_agent.benchmark:main"
+deepresearch-cassette = "deepresearch_agent.replay:main"
 deepresearch-ingest-corpus = "deepresearch_agent.ingest_corpus:main"
 deepresearch-public-eval = "deepresearch_agent.deep_research_eval:main"
 deepresearch-retrieval-eval = "deepresearch_agent.retrieval_eval:main"
@@ -43,3 +45,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100

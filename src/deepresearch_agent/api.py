@@ -50,14 +50,24 @@ async def research_stream(request: ResearchRequest) -> StreamingResponse:
         queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
 
         async def emit(event: dict[str, Any]) -> None:
-            await queue.put(event)
+            await queue.put(_with_stream_compatibility_fields(event))
 
         async def run() -> None:
             try:
                 report = await DeepResearchOrchestrator().run(request, emit=emit)
                 await queue.put({"event": "final", "data": report.model_dump(mode="json")})
             except Exception as exc:
-                await queue.put({"event": "error", "data": {"message": str(exc)}})
+                await queue.put(
+                    {
+                        "event": "error",
+                        "data": {
+                            "message": str(exc),
+                            "attempt": 1,
+                            "retryable": True,
+                            "degraded": False,
+                        },
+                    }
+                )
             finally:
                 await queue.put(None)
 
@@ -191,6 +201,23 @@ def _run_sse(event: dict[str, Any]) -> str:
         f"event: {event_name}\n"
         f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
     )
+
+
+def _with_stream_compatibility_fields(event: dict[str, Any]) -> dict[str, Any]:
+    """Add optional delivery metadata without changing the existing SSE envelope."""
+    if event.get("event") != "stage" or not isinstance(event.get("data"), dict):
+        return event
+    compatible = {**event, "data": dict(event["data"])}
+    payload = dict(compatible["data"].get("payload") or {})
+    payload.setdefault("attempt", 1)
+    payload.setdefault("retryable", False)
+    payload.setdefault(
+        "degraded",
+        compatible["data"].get("status") == "fallback"
+        or bool(payload.get("fallback_used")),
+    )
+    compatible["data"]["payload"] = payload
+    return compatible
 
 
 def _controller() -> RunController:

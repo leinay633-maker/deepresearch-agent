@@ -13,6 +13,7 @@ data/runs.sqlite-*
 data/vector_index/
 .env
 .env.*
+!.env.example
 
 dist/
 build/

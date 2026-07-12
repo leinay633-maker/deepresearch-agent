@@ -6,7 +6,7 @@ from deepresearch_agent.cost import CostTracker
 from deepresearch_agent.config import Settings
 from deepresearch_agent.llm import DeepSeekLLMProvider, OpenAICompatibleLLMProvider
 from deepresearch_agent.orchestrator import DeepResearchOrchestrator
-from deepresearch_agent.schemas import Finding, ResearchBrief, ResearchRequest, Source, SubQuestion
+from deepresearch_agent.schemas import Finding, ResearchRequest, Source
 
 
 def test_mock_orchestrator_records_stage_specific_models() -> None:

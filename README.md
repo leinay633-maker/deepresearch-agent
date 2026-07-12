@@ -6,12 +6,37 @@
 
 ## Quickstart
 
-```powershell
-py -3.11 -m pip install -e ".[dev]"
-py -3.11 -m deepresearch_agent.cli "How does citation checking reduce hallucination in agentic RAG?"
+推荐使用 uv，Python 版本固定在 3.11：
+
+```bash
+uv python install 3.11
+uv sync --extra dev --python 3.11
+uv run deepresearch "How does citation checking reduce hallucination in agentic RAG?"
 ```
 
+跨平台离线演示（不依赖 PowerShell，也不需要 API key）：
+
+```bash
+uv run python scripts/demo.py "How should a research agent recover from tool failures?"
+```
+
+Windows 也可以使用等价的 `py -3.11 -m pip install -e ".[dev]"` 和 `py -3.11 -m deepresearch_agent.cli ...`。
+
 启动 API：
+
+```bash
+uv run deepresearch-api --host 127.0.0.1 --port 8000
+```
+
+macOS/Linux 可直接请求：
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/research \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"How does a supervisor-researcher deep research agent differ from normal RAG?"}'
+```
+
+Windows PowerShell 等价命令：
 
 ```powershell
 py -3.11 -m deepresearch_agent.api --host 127.0.0.1 --port 8000
@@ -38,6 +63,14 @@ py -3.11 -m deepresearch_agent.cli "How should citation grounding work in a rese
 ```
 
 默认不开启 reflection；开启后系统会先压缩已有 findings，再按启发式判断是否追加 1 个 follow-up subquestion，相关 `compression.roundN` 和 `reflection.roundN` 会进入 trace。
+
+Researcher 还支持有界证据循环。默认仍只执行一轮；需要演示预算停止时可以显式设置：
+
+```bash
+uv run deepresearch "How should citation grounding work?" --llm-provider mock --search-provider mock --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --max-rounds 3 --max-tool-calls 2 --min-evidence-items 3
+```
+
+`fallback-policy` 有 `mock`、`degraded`、`fail` 三种模式。离线演示用 `mock`；普通 `/research` 和 CLI 的 live search 默认是 `degraded`（保留弱结果并标记原因）；benchmark 的 live search 默认是 `fail`，避免把 mock 来源混入 live 结果。
 
 按阶段覆盖模型名：
 
@@ -155,7 +188,9 @@ $env:REQUEST_TIMEOUT_SECONDS="8"
 py -3.11 -m deepresearch_agent.benchmark --llm-provider deepseek --search-provider wikipedia --seed 20260607 --max-researchers 2 --max-results 3
 ```
 
-输出会写入 `logs/benchmark-*.jsonl` 和 `results/benchmark_summary.json`。
+输出会写入带 `manifest_id` 的 `logs/benchmark-<timestamp>-<manifest_id>.jsonl`、
+`results/benchmarks/<manifest_id>/summary.json`，并同步更新兼容路径
+`results/benchmark_summary.json`。后者是“最近一次运行”指针，不是不可变 baseline。
 
 运行公开 Deep Research 端到端评测 artifact：
 
@@ -191,7 +226,7 @@ LLM providers：
 Search providers：
 
 - `mock`：默认 search provider，离线可复现。
-- `wikipedia`：真实网络检索 adapter，调用 Wikipedia Search API；失败、超时或熔断时自动使用 mock fallback，并在 trace/metrics 里暴露 fallback。
+- `wikipedia`：真实网络检索 adapter，调用 Wikipedia Search API；失败、超时或熔断时按 `fallback-policy` 选择 mock fallback、显式 degraded 或 fail，并在 trace/metrics 里暴露原因。
 - `searxng`：真实 web search adapter，读取 `SEARXNG_BASE_URL` 或 CLI `--searxng-base-url` 指向自建/可访问 SearxNG 实例；可配 `WEB_CRAWLER_PROVIDER=jina` 把搜索结果 URL 交给 Jina Reader 抽正文。
 - `jina`：Jina Search adapter，调用 `https://s.jina.ai/`；如配置 `JINA_API_KEY` 会带 Bearer token，未配置时仍会尝试公开 endpoint，失败会走 mock fallback。
 - `brave`：Brave Search API adapter，调用 `https://api.search.brave.com/res/v1/web/search`，key 从 `BRAVE_SEARCH_API_KEY` 读。
@@ -231,9 +266,65 @@ Answer judge：
 - `heuristic`：本地无 key answer judge，只检查 ground-truth 字符串是否出现在答案里。
 - `deepseek`：可选 LLM answer judge，使用 DeepSeek JSON mode，默认沿用生效的 DeepSeek 模型，也可用 CLI `--judge-model` 覆盖；需要 `DEEPSEEK_API_KEY`。这不是官方 LiveDRBench/Deep Research Bench judge。
 
+## Interview-quality evaluation and replay
+
+`data/benchmark_cases.jsonl` 现在包含 24 条离线回归题，覆盖英文/中文、单事实、对比、多跳、引用冲突、工具失败和 JSON 输出。运行：
+
+```bash
+LLM_PROVIDER=mock SEARCH_PROVIDER=mock LOCAL_RETRIEVAL_MODE=keyword \
+  uv run deepresearch-benchmark --benchmark-name interview-baseline --max-researchers 1 --max-results 1
+```
+
+benchmark 会区分 `execution_success`、`task_format_valid`、`answer_quality`、`citation_grounding`、`citation_coverage`、`unsupported_claim_rate`、`source_quality`、`tool_failure_recovery`、延迟、token 和成本。没有显式 answer judge 时，`answer_quality` 保持 `null`；旧的 `success` 字段仅作为兼容性的执行成功别名，不代表答案正确。
+
+每次运行的 manifest 会记录 commit SHA、数据集 hash、prompt bundle hash、provider/model、配置快照、确定性说明和 replay 标识。可以用上一轮 JSONL case artifact 离线重放：
+
+```bash
+uv run deepresearch-benchmark --cases data/benchmark_cases.jsonl \
+  --replay-dir logs/previous-benchmark.jsonl
+```
+
+这个 `--replay-dir` 入口是严格的 case-result snapshot replay：它复用报告、来源和 claims，并重新计算当前版本可重算的评测指标；它不重新调用 LLM/search。
+
+这里有两种故意分开的 replay：
+
+- `--replay-dir` 是 benchmark snapshot replay。它读取一次运行保存的 case-result artifact，跳过 LLM/search，再用当前版本的格式和 citation evaluator 重算可重算指标；旧指标保留在 `recorded_*` 字段中，不能把它当成重新调用 provider。
+- provider cassette 是 `deepresearch_agent.replay` 中的 `CassetteLLMProvider` / `CassetteSearchAdapter`。它按严格的 kind、operation、request 顺序重新执行 orchestrator，未消费完或请求漂移都会失败；当前提供 fixture 和 `deepresearch-cassette` 检查命令，还没有自动录制真实 HTTP 流量的 recorder。
+
+当前离线 24-case baseline（manifest `80023836aa1d3f8e`）只用于冻结可靠性口径：执行成功率 `1.0`、结构化格式有效率 `0.875`、`answer_quality=null`（未配置 judge）、citation grounding `0.5417`、citation precision `0.5417`、citation coverage `1.0`、unsupported claim rate `0.4583`、source quality `0.9`、工具失败恢复适用 3 条且平均 `1.0`、fallback 总数 `3`。这是 deterministic mock/keyword plumbing 结果，不是真实答案质量提升；后续版本必须使用同一题集和同一 manifest 字段比较。
+
+产物位置：`results/benchmarks/80023836aa1d3f8e/summary.json` 和对应的
+`logs/benchmark-20260712T172209Z-80023836aa1d3f8e.jsonl`。
+
+## 五分钟面试演示路径
+
+1. 用上面的 `scripts/demo.py` 展示正常问题、plan、sources、citation 和 cost。
+2. 运行 `uv run python scripts/demo.py --scenario failure`，强制 search timeout，展示 retry 后的 `researcher.Q1=fallback`、`degraded_count=1` 和 trace；再跑 24-case benchmark 查看 3 条固定 failure-injection case。
+3. 启动 API，创建 `require_approval=true` 的 `/runs`，查看 planner step，编辑或 approve，再查看 `/runs/<run_id>/trace` 和 SSE events。
+4. 在报告 JSON 的 `citation_check.assessments[].evidence_quotes` 中展示 claim、source ID、quote、URL、抓取时间和 `extract_status`，同时查看 `cost.records`。
+5. 保存一次 summary 后，用同一命令的 `--replay-dir` 做 snapshot replay；如需演示真正重新跑主链，使用 provider cassette fixture，并明确它和 snapshot replay 的区别。没有第二个经过同一题集/口径生成的版本时，不宣称质量提升，只比较可靠性与可观测性。
+
+## 能力成熟度矩阵
+
+| 能力 | 当前状态 | 口径说明 |
+|---|---|---|
+| Mock/keyword 主链、24-case 回归 | replay-tested | CI、pytest 和 deterministic baseline 可离线重放 |
+| bounded researcher action contract、中文 citation | replay-tested | 有预算边界、evidence quote 和固定回归；不是原生 function calling |
+| provider cassette orchestrator replay | replay-tested | fixture 会重新执行 orchestrator，并严格检查请求顺序/消费完毕 |
+| snapshot benchmark replay | replay-tested | 复用已保存报告并按当前 evaluator 重算格式/citation 指标 |
+| DeepSeek + Wikipedia | live-tested | 历史小样本曾真实跑通；当前环境无 key，不把它当本轮新结果 |
+| Jina Reader / HTML crawler | live-tested / stub-tested | 有少量 URL smoke；没有生产级网页质量评测 |
+| Brave、Tavily、SearxNG、MCP | stub-tested | 请求、解析或 fake client 单测；没有稳定 live benchmark |
+| OpenAI-compatible、DashScope、Qdrant | stub-tested | adapter/HTTP contract 已测；真实 endpoint 未验证 |
+| SQLite run control、lease、SSE、checkpoint | replay-tested | 本地集成测试覆盖；不是分布式队列 |
+| citation judge、answer judge | stub-tested | heuristic/DeepSeek 请求和 schema 有测试；没有 live judge 结论 |
+| PDF/DOCX/PPTX/WAV 导出、`/ui` | optional/demo-only | 面试展示能力，非本阶段主线或生产级交付 |
+
+矩阵中的 `live-tested` 只表示至少有一次真实 provider/URL 路径运行记录，不表示 SLA、生产质量或安全性；`replay-tested`、`stub-tested` 和 `optional/demo-only` 都不应写成 live 成果。
+
 ## Limitations / Future work
 
-当前完整测试结果：`py -3.11 -m pytest -q` 通过，`89 passed, 2 warnings in 69.53s`。warning 来自 FastAPI/Starlette 的 TestClient deprecation 和 OpenTelemetry metadata deprecation，未影响功能。
+当前完整回归：`LLM_PROVIDER=mock SEARCH_PROVIDER=mock LOCAL_RETRIEVAL_MODE=keyword uv run pytest -q` 通过，`118 passed, 1 warning`。warning 来自 FastAPI/Starlette 的 TestClient deprecation，未影响功能。ruff、compileall、`uv lock --check --offline` 和 `git diff --check` 同样通过。默认 hybrid 需要首次下载本地 embedding 模型；CI 和离线演示显式使用 keyword，避免把模型下载耗时混入功能回归。
 
 实测口径需要严格区分：mock benchmark 只证明离线路径、trace、citation ID 和记录链路能跑，不能当真实性能、真实成本或真实答案质量成果；DeepSeek v4-flash + Wikipedia benchmark 是真实 provider 小样本，延迟包含网络/API 时间，citation retention 仍是 lexical checker 口径，不是语义级事实评分。
 
@@ -241,10 +332,12 @@ Answer judge：
 
 - 真实 LLM 路径主要实测 DeepSeek v4-flash；OpenAI-compatible adapter 只有 stub/路由测试，OpenAI/Anthropic 原生 provider 尚未实现。
 - Wikipedia adapter 能真实跑，但不是生产级搜索；Brave/Tavily 需要 API key，当前只做请求/解析单测；SearxNG 需要自建 endpoint。
-- Local hybrid retrieval 已实现并有 BEIR/scifact 检索评测，但 5 case 端到端小样本里 success_rate 低于 keyword baseline，不能包装成质量稳定提升。
+- Local hybrid retrieval 已实现并有 BEIR/scifact 检索评测，但历史 5-case 端到端小样本里旧 success_rate 低于 keyword baseline，不能包装成质量稳定提升，也不能与当前 24-case 指标横比。
 - DashScope embedding/rerank provider 已有 stub 测试，本机未配置 `DASHSCOPE_API_KEY`，所以没有真实百炼延迟、费用或质量数字。
 - Qdrant HTTP vector index 只有 stub HTTP 单测，没有真实 Qdrant live benchmark、索引生命周期、权限过滤或增量 reindex。
 - Citation checker 默认仍是 lexical grounding；heuristic/DeepSeek judge 是可选扩展，DeepSeek judge 尚未做 live benchmark，也不是官方 LiveDRBench/Deep Research Bench judge。
+- Researcher 的 bounded loop 使用结构化 action contract；当前 DeepSeek/Mock provider 都没有声明原生 function calling，不能把它描述成已经接入模型 tool-call loop。
+- snapshot replay 复用完整 case artifact；provider cassette fixture 能重新执行主链，但当前没有自动录制真实 LLM/search HTTP 流量的 recorder，live 输出仍可能受网络和模型版本影响。
 - Run control 当前是 SQLite 单机版本；没有 Redis/Postgres/Celery worker pool、跨进程强制取消、权限系统或多人协作。
 - Report export 已支持 Markdown/HTML/JSON/PDF/DOCX/PPTX/WAV，但都是文本版交付；WAV 是 Windows SAPI 摘要，不是完整 podcast/TTS 制作系统。
 
@@ -254,6 +347,7 @@ Answer judge：
 src/deepresearch_agent/
   api.py              FastAPI + SSE endpoints
   orchestrator.py     End-to-end research spine
+  execution.py        Shared clarify/planner/researcher/synthesis/verifier stage runner
   run_control.py      Run state machine, approval, cancel, retry
   run_store.py        SQLite run/step/event checkpoint store
   run_models.py       Pydantic models for run control API
@@ -267,6 +361,9 @@ src/deepresearch_agent/
   verifier.py         Source quality filtering
   source_metrics.py   Source provider/domain diversity metrics
   citation.py         Citation faithfulness check
+  text_utils.py       Multilingual tokenization and sentence splitting
+  report_metrics.py   Execution/quality metric separation
+  replay.py           Strict JSONL cassette and case-artifact replay helpers
   citation_judge.py   Optional heuristic and DeepSeek citation judge providers
   report_exporter.py  Markdown/HTML/JSON/PDF/DOCX/PPTX/WAV report exports
   tts.py              Optional Windows SAPI TTS provider

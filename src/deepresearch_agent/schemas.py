@@ -10,6 +10,13 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class ResearchBudget(BaseModel):
+    max_rounds: int = Field(default=1, ge=1, le=10)
+    max_tool_calls: int = Field(default=1, ge=1, le=50)
+    deadline_seconds: float | None = Field(default=None, gt=0, le=3600)
+    min_evidence_items: int = Field(default=1, ge=1, le=50)
+
+
 class ResearchRequest(BaseModel):
     query: str = Field(..., min_length=3)
     max_researchers: int = Field(default=3, ge=1, le=5)
@@ -26,6 +33,19 @@ class ResearchRequest(BaseModel):
     reflection_min_sources: int = Field(default=4, ge=1, le=20)
     citation_judge_provider: str | None = None
     citation_judge_model: str | None = None
+    max_rounds: int = Field(default=1, ge=1, le=10)
+    max_tool_calls: int = Field(default=1, ge=1, le=50)
+    deadline_seconds: float | None = Field(default=None, gt=0, le=3600)
+    min_evidence_items: int = Field(default=1, ge=1, le=50)
+    fallback_policy: Literal["mock", "degraded", "fail"] | None = None
+
+    def research_budget(self) -> ResearchBudget:
+        return ResearchBudget(
+            max_rounds=self.max_rounds,
+            max_tool_calls=self.max_tool_calls,
+            deadline_seconds=self.deadline_seconds,
+            min_evidence_items=self.min_evidence_items,
+        )
 
 
 class ResearchBrief(BaseModel):
@@ -55,12 +75,49 @@ class Source(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class EvidenceItem(BaseModel):
+    source_id: str = ""
+    source_title: str
+    source_url: str
+    quote: str
+    query: str
+    overlap_score: float = 0.0
+    retrieved_at: str | None = None
+
+
+class ResearchDecision(BaseModel):
+    action: Literal["continue", "stop", "need_follow_up", "conflict_found"]
+    reason: str
+    evidence_gap: str | None = None
+    follow_up_query: str | None = None
+
+
+class ResearchRoundResult(BaseModel):
+    round_index: int
+    query: str
+    source_count: int
+    evidence_count: int
+    tool_attempts: int = 0
+    fallback_used: bool = False
+    decision: ResearchDecision
+
+
+class ResearchResult(BaseModel):
+    rounds: list[ResearchRoundResult] = Field(default_factory=list)
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    gaps: list[str] = Field(default_factory=list)
+    conflicts: list[str] = Field(default_factory=list)
+    tool_calls: int = 0
+    termination_reason: str = "completed"
+
+
 class Finding(BaseModel):
     subquestion_id: str
     subquestion: str
     summary: str
     source_ids: list[str]
     sources: list[Source]
+    research: ResearchResult | None = None
 
 
 class EvidenceQuote(BaseModel):
@@ -68,11 +125,16 @@ class EvidenceQuote(BaseModel):
     source_title: str
     quote: str
     overlap_score: float
+    source_url: str | None = None
+    retrieved_at: str | None = None
+    extract_status: str | None = None
+    snippet_only: bool = False
 
 
 class CitationAssessment(BaseModel):
     claim: str
     citation_ids: list[str]
+    missing_citation_ids: list[str] = Field(default_factory=list)
     supported: bool
     support_level: Literal["supported", "partial", "unsupported", "unverifiable"] = "unsupported"
     reason: str
@@ -90,6 +152,10 @@ class CitationCheckReport(BaseModel):
     unsupported_claims: int
     retention_rate: float
     assessments: list[CitationAssessment]
+    citation_grounding: float = 0.0
+    citation_coverage: float = 0.0
+    unsupported_claim_rate: float = 0.0
+    citation_precision: float = 0.0
 
 
 class CostRecord(BaseModel):

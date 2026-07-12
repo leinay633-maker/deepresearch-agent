@@ -123,6 +123,132 @@ class RunStore:
             )
         return self.require_run(run_id)
 
+    def transition_run(
+        self,
+        run_id: str,
+        *,
+        expected_statuses: set[str],
+        expected_worker_id: str | None = None,
+        require_unleased: bool = False,
+        **fields: Any,
+    ) -> AgentRun | None:
+        """Conditionally update one run and return ``None`` when the CAS loses.
+
+        Status transitions must not be implemented as a read followed by an
+        unconditional ``update_run``: another API request may cancel, recover,
+        approve, or retry the run between those two operations.
+        """
+
+        allowed = {
+            "status",
+            "current_stage",
+            "require_approval",
+            "request_json",
+            "plan_json",
+            "result_json",
+            "total_tokens",
+            "total_cost",
+            "error_message",
+            "leased_by",
+            "heartbeat_at",
+            "lease_expires_at",
+        }
+        if not expected_statuses:
+            raise ValueError("expected_statuses must not be empty")
+        updates = {key: value for key, value in fields.items() if key in allowed}
+        if not updates:
+            raise ValueError("transition_run requires at least one update field")
+        updates["updated_at"] = utc_now()
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        placeholders = ", ".join("?" for _ in expected_statuses)
+        where = [f"status IN ({placeholders})"]
+        where_values: list[Any] = sorted(expected_statuses)
+        if expected_worker_id is not None:
+            where.append("leased_by = ?")
+            where_values.append(expected_worker_id)
+        elif require_unleased:
+            where.append("leased_by IS NULL")
+        values = [_db_value(key, value) for key, value in updates.items()]
+        values.extend([run_id, *where_values])
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"UPDATE agent_runs SET {assignments} "
+                f"WHERE run_id = ? AND {' AND '.join(where)}",
+                values,
+            )
+        if cursor.rowcount != 1:
+            return None
+        return self.require_run(run_id)
+
+    def recover_stale_run(
+        self,
+        run_id: str,
+        *,
+        expected_worker_id: str,
+        expected_lease_expires_at: datetime,
+        reason: str,
+        now: datetime | None = None,
+    ) -> AgentRun | None:
+        """Fence one exact expired lease so a concurrent heartbeat wins safely."""
+
+        current_time = now or utc_now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE agent_runs
+                SET status = 'failed', error_message = ?, leased_by = NULL,
+                    heartbeat_at = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE run_id = ? AND status = 'running' AND leased_by = ?
+                  AND lease_expires_at = ? AND lease_expires_at <= ?
+                """,
+                (
+                    reason,
+                    _dt(current_time),
+                    run_id,
+                    expected_worker_id,
+                    _dt(expected_lease_expires_at),
+                    _dt(current_time),
+                ),
+            )
+        if cursor.rowcount != 1:
+            return None
+        return self.require_run(run_id)
+
+    def complete_run_if_owned(
+        self,
+        run_id: str,
+        *,
+        worker_id: str,
+        result_json: dict[str, Any],
+        total_tokens: int,
+        total_cost: float,
+    ) -> AgentRun | None:
+        """Commit success only while the run is active and still owned by this worker."""
+
+        now = utc_now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE agent_runs
+                SET status = 'succeeded', current_stage = 'completed', result_json = ?,
+                    total_tokens = ?, total_cost = ?, error_message = NULL,
+                    leased_by = NULL, heartbeat_at = NULL, lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ? AND status = 'running' AND leased_by = ?
+                """,
+                (
+                    _json_dumps(result_json),
+                    total_tokens,
+                    total_cost,
+                    _dt(now),
+                    run_id,
+                    worker_id,
+                ),
+            )
+        if cursor.rowcount != 1:
+            return None
+        return self.require_run(run_id)
+
     def acquire_lease(
         self,
         run_id: str,

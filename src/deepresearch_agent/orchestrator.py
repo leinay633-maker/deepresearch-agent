@@ -6,42 +6,51 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from deepresearch_agent.citation import CitationChecker
+from deepresearch_agent.citation import CitationChecker, best_evidence_quote
 from deepresearch_agent.citation_judge import build_citation_judge_provider
 from deepresearch_agent.config import Settings, load_settings
 from deepresearch_agent.cost import CostTracker
 from deepresearch_agent.dedup import SourceDeduplicator
+from deepresearch_agent.execution import ResearchExecutionEngine, is_retryable_error
 from deepresearch_agent.llm import (
     DeepSeekLLMProvider,
     MockLLMProvider,
     OpenAICompatibleLLMProvider,
-    summarize_sources,
 )
 from deepresearch_agent.rag import LocalRagRetriever
+from deepresearch_agent.report_metrics import build_execution_metrics
 from deepresearch_agent.schemas import (
     Finding,
+    EvidenceItem,
     ResearchRequest,
+    ResearchResult,
+    ResearchRoundResult,
     Source,
     StructuredReport,
     SubQuestion,
     TraceEvent,
 )
-from deepresearch_agent.search import SearchOutcome, SearchService, build_search_service
-from deepresearch_agent.source_metrics import source_diversity_metrics
+from deepresearch_agent.search import (
+    SearchOutcome,
+    SearchService,
+    build_search_service,
+    enrich_source_metadata,
+)
 from deepresearch_agent.tracing import TraceLogger, build_trace_exporter
 from deepresearch_agent.verifier import SourceVerifier
 
 Emit = Callable[[dict[str, Any]], Awaitable[None]]
-
 
 class DeepResearchOrchestrator:
     def __init__(
         self,
         settings: Settings | None = None,
         search_service: SearchService | None = None,
+        llm_provider: Any | None = None,
     ) -> None:
         self.settings = settings or load_settings()
         self.search_service = search_service
+        self.llm_provider = llm_provider
         self.rag = LocalRagRetriever(settings=self.settings)
         self.deduper = SourceDeduplicator()
         self.verifier = SourceVerifier()
@@ -54,19 +63,31 @@ class DeepResearchOrchestrator:
             trace_dir=self.settings.trace_dir,
             exporter=build_trace_exporter(self.settings),
         )
-        llm = self._build_llm_provider(request)
+        llm = self.llm_provider or self._build_llm_provider(request)
         cost = CostTracker(
             provider=llm.name,
             model=llm.model,
             input_cost_per_1m=self.settings.mock_input_cost_per_1m_tokens,
             output_cost_per_1m=self.settings.mock_output_cost_per_1m_tokens,
         )
+        engine = ResearchExecutionEngine(self)
         run_start = time.perf_counter()
 
         await self._record(trace, "run", "start", {"query": request.query}, emit=emit)
 
         stage_start = trace.now()
-        brief = await llm.create_brief(request, cost)
+        try:
+            brief = await engine.run_clarify_stage(request=request, llm=llm, cost=cost)
+        except Exception as exc:
+            await self._record(
+                trace,
+                "clarify_normalize",
+                "error",
+                {"error": str(exc), "retryable": is_retryable_error(exc)},
+                stage_start,
+                emit,
+            )
+            raise
         await self._record(
             trace,
             "clarify_normalize",
@@ -78,7 +99,23 @@ class DeepResearchOrchestrator:
 
         stage_start = trace.now()
         max_researchers = min(request.max_researchers, self.settings.max_researchers)
-        plan = await llm.plan(brief, max_researchers=max_researchers, cost=cost)
+        try:
+            plan = await engine.run_planner_stage(
+                brief=brief,
+                max_researchers=max_researchers,
+                llm=llm,
+                cost=cost,
+            )
+        except Exception as exc:
+            await self._record(
+                trace,
+                "planner",
+                "error",
+                {"error": str(exc), "retryable": is_retryable_error(exc)},
+                stage_start,
+                emit,
+            )
+            raise
         await self._record(
             trace,
             "planner",
@@ -89,45 +126,54 @@ class DeepResearchOrchestrator:
         )
 
         search_service = self.search_service or build_search_service(
-            self.settings, request.search_provider
+            self.settings,
+            request.search_provider,
+            self._fallback_policy(request),
         )
-        semaphore = asyncio.Semaphore(max_researchers)
-        research_tasks = [
-            self._research_one(subquestion, request, search_service, semaphore, trace, emit)
-            for subquestion in plan
-        ]
-        research_results = await asyncio.gather(*research_tasks)
-        research_results = await self._run_reflection_rounds(
-            plan=plan,
-            research_results=list(research_results),
-            request=request,
-            search_service=search_service,
-            semaphore=semaphore,
-            trace=trace,
-            emit=emit,
-        )
-
-        raw_search_count = sum(len(outcome.sources) for _, outcome in research_results)
-        fallback_count = sum(1 for _, outcome in research_results if outcome.fallback_used)
-        preliminary_findings = [finding for finding, _ in research_results]
-
-        stage_start = trace.now()
-        all_sources = [source for finding in preliminary_findings for source in finding.sources]
-        deduped_sources = self.deduper.dedup(all_sources)
-        sources = self._assign_source_ids(deduped_sources)
-        source_by_key = {self.deduper.key(source): source for source in sources}
-        findings = self._remap_findings(preliminary_findings, source_by_key)
-        await self._record(
-            trace,
-            "source_dedup",
-            "success",
-            {"before": len(all_sources), "after": len(sources)},
-            stage_start,
-            emit,
-        )
+        try:
+            research = await engine.run_research_stage(
+                plan=plan,
+                request=request,
+                search_service=search_service,
+                trace=trace,
+                llm=llm,
+                cost=cost,
+                max_researchers=max_researchers,
+                emit=emit,
+                cancel_check=None,
+            )
+        except Exception as exc:
+            await self._record(
+                trace,
+                "researcher",
+                "error",
+                {"error": str(exc), "retryable": is_retryable_error(exc)},
+                emit=emit,
+            )
+            raise
+        findings = research.findings
+        sources = research.sources
 
         stage_start = trace.now()
-        answer, claims = await llm.synthesize(brief, plan, findings, sources, cost)
+        try:
+            answer, claims = await engine.run_synthesizer_stage(
+                brief=brief,
+                plan=plan,
+                findings=findings,
+                sources=sources,
+                llm=llm,
+                cost=cost,
+            )
+        except Exception as exc:
+            await self._record(
+                trace,
+                "synthesizer",
+                "error",
+                {"error": str(exc), "retryable": is_retryable_error(exc)},
+                stage_start,
+                emit,
+            )
+            raise
         await self._record(
             trace,
             "synthesizer",
@@ -138,12 +184,23 @@ class DeepResearchOrchestrator:
         )
 
         stage_start = trace.now()
-        citation_report = self.citation_checker.check(
-            claims,
-            sources,
-            judge_provider=self._build_citation_judge_provider(request),
-            cost=cost,
-        )
+        try:
+            citation_report = engine.run_verifier_stage(
+                request=request,
+                claims=claims,
+                sources=sources,
+                cost=cost,
+            )
+        except Exception as exc:
+            await self._record(
+                trace,
+                "verifier",
+                "error",
+                {"error": str(exc), "retryable": is_retryable_error(exc)},
+                stage_start,
+                emit,
+            )
+            raise
         await self._record(
             trace,
             "citation_check",
@@ -154,16 +211,16 @@ class DeepResearchOrchestrator:
         )
 
         latency_ms = round((time.perf_counter() - run_start) * 1000, 3)
-        metrics = {
-            "latency_ms": latency_ms,
-            "raw_search_result_count": raw_search_count,
-            "verified_source_count": len(all_sources),
-            "deduped_source_count": len(sources),
-            "fallback_count": fallback_count,
-            "citation_retention_rate": citation_report.retention_rate,
-            "success": citation_report.retention_rate >= 0.8 and len(sources) > 0,
-            **source_diversity_metrics(sources),
-        }
+        metrics = build_execution_metrics(
+            latency_ms=latency_ms,
+            raw_search_result_count=research.raw_search_count,
+            verified_source_count=len(research.all_sources),
+            deduped_source_count=len(sources),
+            fallback_count=research.fallback_count,
+            degraded_count=research.degraded_count,
+            sources=sources,
+            citation_report=citation_report,
+        )
         await self._record(trace, "run", "success", metrics, start=run_start, emit=emit)
 
         return StructuredReport(
@@ -224,6 +281,12 @@ class DeepResearchOrchestrator:
             model=request.citation_judge_model,
         )
 
+    def _fallback_policy(self, request: ResearchRequest) -> str:
+        if request.fallback_policy:
+            return request.fallback_policy
+        provider = (request.search_provider or self.settings.search_provider).strip().lower()
+        return "mock" if provider == "mock" else "degraded"
+
     async def _research_one(
         self,
         subquestion,
@@ -232,35 +295,237 @@ class DeepResearchOrchestrator:
         semaphore: asyncio.Semaphore,
         trace: TraceLogger,
         emit: Emit | None,
+        llm: Any,
+        cost: CostTracker,
+        cancel_check: Callable[[], None] | None = None,
     ) -> tuple[Finding, SearchOutcome]:
         async with semaphore:
             stage = f"researcher.{subquestion.id}"
             stage_start = trace.now()
-            outcome = await search_service.search(
-                subquestion.question,
-                max_results=request.max_results_per_researcher,
+            budget = request.research_budget()
+            started_at = time.perf_counter()
+            query = subquestion.question
+            tool_calls = 0
+            provider_tool_attempts = 0
+            raw_sources: list[Source] = []
+            rag_sources: list[Source] = []
+            verified: list[Source] = []
+            evidence: list[EvidenceItem] = []
+            rounds: list[ResearchRoundResult] = []
+            gaps: list[str] = []
+            conflicts: list[str] = []
+            fallback_used = False
+            degraded = False
+            errors: list[str] = []
+            provider = search_service.primary.name
+            termination_reason = "max_rounds"
+
+            async def await_with_deadline(awaitable):
+                if budget.deadline_seconds is None:
+                    return await awaitable
+                remaining_seconds = budget.deadline_seconds - (
+                    time.perf_counter() - started_at
+                )
+                if remaining_seconds <= 0:
+                    if hasattr(awaitable, "close"):
+                        awaitable.close()
+                    raise TimeoutError
+                return await asyncio.wait_for(awaitable, timeout=remaining_seconds)
+
+            for round_index in range(1, budget.max_rounds + 1):
+                await asyncio.sleep(0)  # explicit cancellation boundary
+                if cancel_check is not None:
+                    cancel_check()
+                if tool_calls >= budget.max_tool_calls:
+                    termination_reason = "max_tool_calls"
+                    break
+                # Count the agent-level search action before awaiting it so a
+                # timeout or provider exception still consumes budget. Internal
+                # SearchService retries/crawls are recorded separately as tool
+                # implementation details, not extra research-loop actions.
+                tool_calls += 1
+                try:
+                    search_call = search_service.search(
+                        query,
+                        max_results=request.max_results_per_researcher,
+                    )
+                    outcome = await await_with_deadline(search_call)
+                except TimeoutError:
+                    termination_reason = "deadline"
+                    errors.append("research deadline exceeded")
+                    break
+
+                if cancel_check is not None:
+                    cancel_check()
+                provider = outcome.provider
+                provider_tool_attempts += outcome.tool_attempts
+                fallback_used = fallback_used or outcome.fallback_used
+                degraded = degraded or outcome.degraded
+                if outcome.error:
+                    errors.append(outcome.error)
+                raw_sources.extend(outcome.sources)
+                try:
+                    round_rag_sources = enrich_source_metadata(
+                        await await_with_deadline(
+                            self.rag.retrieve(query, max_results=2)
+                        )
+                    )
+                except TimeoutError:
+                    termination_reason = "deadline"
+                    errors.append("research deadline exceeded during local retrieval")
+                    break
+                if cancel_check is not None:
+                    cancel_check()
+                degraded = degraded or any(
+                    bool(source.metadata.get("retrieval_degraded"))
+                    for source in round_rag_sources
+                )
+                rag_sources.extend(round_rag_sources)
+                combined = self.deduper.dedup([*raw_sources, *rag_sources])
+                verified = self.verifier.verify(combined)
+                evidence = self._evidence_items(subquestion.question, verified)
+                if (
+                    budget.deadline_seconds is not None
+                    and time.perf_counter() - started_at >= budget.deadline_seconds
+                ):
+                    termination_reason = "deadline"
+                    errors.append("research deadline exceeded")
+                    break
+                try:
+                    decision = await await_with_deadline(
+                        llm.decide_research(
+                            subquestion=subquestion,
+                            evidence=evidence,
+                            min_evidence_items=budget.min_evidence_items,
+                            round_index=round_index,
+                            cost=cost,
+                        )
+                    )
+                except TimeoutError:
+                    termination_reason = "deadline"
+                    errors.append("research deadline exceeded during evidence decision")
+                    break
+                if decision.action == "stop" and len(evidence) < budget.min_evidence_items:
+                    gap = (
+                        f"need {budget.min_evidence_items - len(evidence)} additional "
+                        "grounded evidence items"
+                    )
+                    decision = decision.model_copy(
+                        update={
+                            "action": "need_follow_up",
+                            "reason": (
+                                "model requested stop, but the Python executor rejected it "
+                                "because grounded evidence is below the configured minimum"
+                            ),
+                            "evidence_gap": gap,
+                            "follow_up_query": decision.follow_up_query
+                            or f"{subquestion.question} {gap}",
+                        }
+                    )
+                if cancel_check is not None:
+                    cancel_check()
+                if decision.evidence_gap:
+                    gaps.append(decision.evidence_gap)
+                if decision.action == "conflict_found":
+                    conflicts.append(decision.reason)
+                rounds.append(
+                    ResearchRoundResult(
+                        round_index=round_index,
+                        query=query,
+                        source_count=len(verified),
+                        evidence_count=len(evidence),
+                        tool_attempts=outcome.tool_attempts,
+                        fallback_used=outcome.fallback_used,
+                        decision=decision,
+                    )
+                )
+                if decision.action == "stop":
+                    termination_reason = "evidence_sufficient"
+                    break
+                if round_index >= budget.max_rounds:
+                    termination_reason = "max_rounds"
+                    break
+                if tool_calls >= budget.max_tool_calls:
+                    termination_reason = "max_tool_calls"
+                    break
+                query = decision.follow_up_query or f"{subquestion.question} {decision.evidence_gap or 'additional evidence'}"
+
+            research_result = ResearchResult(
+                rounds=rounds,
+                evidence=evidence,
+                gaps=list(dict.fromkeys(gaps)),
+                conflicts=list(dict.fromkeys(conflicts)),
+                tool_calls=tool_calls,
+                termination_reason=termination_reason,
             )
-            rag_sources = await self.rag.retrieve(subquestion.question, max_results=2)
-            combined = self.deduper.dedup([*outcome.sources, *rag_sources])
-            verified = self.verifier.verify(combined)
-            summary = summarize_sources(subquestion.question, verified)
+            summary = self._summarize_evidence(research_result)
             finding = Finding(
                 subquestion_id=subquestion.id,
                 subquestion=subquestion.question,
                 summary=summary,
                 source_ids=[],
                 sources=verified,
+                research=research_result,
             )
-            status = "fallback" if outcome.fallback_used else "success"
+            status = "fallback" if fallback_used or degraded else "success"
             payload = {
                 "subquestion": subquestion.question,
-                "provider": outcome.provider,
-                "fallback_used": outcome.fallback_used,
-                "error": outcome.error,
+                "provider": provider,
+                "fallback_used": fallback_used,
+                "degraded": degraded,
+                "error": "; ".join(dict.fromkeys(errors)) or None,
                 "source_count": len(verified),
+                "evidence_count": len(evidence),
+                "round_count": len(rounds),
+                "tool_calls": tool_calls,
+                "provider_tool_attempts": provider_tool_attempts,
+                "termination_reason": termination_reason,
             }
             await self._record(trace, stage, status, payload, stage_start, emit)
-            return finding, outcome
+            return finding, SearchOutcome(
+                sources=raw_sources,
+                provider=provider,
+                fallback_used=fallback_used,
+                degraded=degraded,
+                error=payload["error"],
+                tool_attempts=provider_tool_attempts,
+            )
+
+    def _evidence_items(
+        self, claim: str, sources: list[Source]
+    ) -> list[EvidenceItem]:
+        items: list[EvidenceItem] = []
+        for source in sources:
+            if source.metadata.get("snippet_only") or source.metadata.get(
+                "extract_status"
+            ) in {"snippet", "crawl_failed", "empty"}:
+                continue
+            quote, overlap = best_evidence_quote(claim, source)
+            if not quote or overlap < self.citation_checker.minimum_overlap_for_claim(claim):
+                continue
+            items.append(
+                EvidenceItem(
+                    source_id=source.id,
+                    source_title=source.title,
+                    source_url=source.url,
+                    quote=quote,
+                    query=source.query,
+                    overlap_score=round(overlap, 3),
+                    retrieved_at=source.metadata.get("retrieved_at"),
+                )
+            )
+        return items
+
+    def _summarize_evidence(self, result: ResearchResult) -> str:
+        if not result.evidence:
+            return "No verified evidence survived filtering for this subquestion."
+        excerpts = " | ".join(
+            f"{item.source_title}: {item.quote}" for item in result.evidence[:3]
+        )
+        return (
+            f"Collected {len(result.evidence)} verified evidence items across "
+            f"{len(result.rounds)} bounded research rounds. Evidence: {excerpts}"
+        )
 
     async def _run_reflection_rounds(
         self,
@@ -272,6 +537,9 @@ class DeepResearchOrchestrator:
         semaphore: asyncio.Semaphore,
         trace: TraceLogger,
         emit: Emit | None,
+        llm: Any,
+        cost: CostTracker,
+        cancel_check: Callable[[], None] | None = None,
     ) -> list[tuple[Finding, SearchOutcome]]:
         if not request.reflection_enabled or request.max_reflection_rounds <= 0:
             return research_results
@@ -310,7 +578,17 @@ class DeepResearchOrchestrator:
             subquestion = SubQuestion.model_validate(reflection["subquestion"])
             plan.append(subquestion)
             new_results = await asyncio.gather(
-                self._research_one(subquestion, request, search_service, semaphore, trace, emit)
+                self._research_one(
+                    subquestion,
+                    request,
+                    search_service,
+                    semaphore,
+                    trace,
+                    emit,
+                    llm,
+                    cost,
+                    cancel_check,
+                )
             )
             research_results.extend(new_results)
         return research_results
@@ -385,11 +663,51 @@ class DeepResearchOrchestrator:
                 mapped = source_by_key.get(self.deduper.key(source))
                 if mapped is not None:
                     mapped_sources.append(mapped)
+            research = finding.research
+            if research is not None:
+                mapped_evidence = []
+                mapped_by_url = {source.url: source for source in mapped_sources}
+                mapped_by_key = {self.deduper.key(source): source for source in mapped_sources}
+                for item in research.evidence:
+                    mapped = mapped_by_url.get(item.source_url)
+                    if mapped is None and item.source_url:
+                        evidence_source = Source(
+                            title=item.source_title,
+                            url=item.source_url,
+                            content=item.quote,
+                            provider="evidence",
+                            query=item.query,
+                        )
+                        mapped = mapped_by_key.get(self.deduper.key(evidence_source))
+                    if mapped is None:
+                        continue
+                    quote, overlap = best_evidence_quote(finding.subquestion, mapped)
+                    if (
+                        not quote
+                        or overlap
+                        < self.citation_checker.minimum_overlap_for_claim(finding.subquestion)
+                        or mapped.metadata.get("snippet_only")
+                    ):
+                        continue
+                    mapped_evidence.append(
+                        item.model_copy(
+                            update={
+                                "source_id": mapped.id,
+                                "source_title": mapped.title,
+                                "source_url": mapped.url,
+                                "quote": quote,
+                                "overlap_score": round(overlap, 3),
+                                "retrieved_at": mapped.metadata.get("retrieved_at"),
+                            }
+                        )
+                    )
+                research = research.model_copy(update={"evidence": mapped_evidence})
             remapped.append(
                 finding.model_copy(
                     update={
                         "source_ids": [source.id for source in mapped_sources],
                         "sources": mapped_sources,
+                        "research": research,
                     }
                 )
             )
@@ -404,7 +722,19 @@ class DeepResearchOrchestrator:
         start: float | None = None,
         emit: Emit | None = None,
     ) -> TraceEvent:
-        event = trace.record(stage=stage, status=status, payload=payload, start=start)
+        event_payload = dict(payload)
+        event_payload.setdefault("attempt", 1)
+        event_payload.setdefault(
+            "retryable",
+            status == "error" and is_retryable_error(event_payload.get("error")),
+        )
+        event_payload.setdefault(
+            "degraded",
+            status == "fallback"
+            or bool(event_payload.get("fallback_used"))
+            or bool(event_payload.get("degraded")),
+        )
+        event = trace.record(stage=stage, status=status, payload=event_payload, start=start)
         if emit is not None:
             await emit({"event": "stage", "data": event.model_dump(mode="json")})
         return event

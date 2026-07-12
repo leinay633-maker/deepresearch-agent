@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      LLM_PROVIDER: mock
+      SEARCH_PROVIDER: mock
+      LOCAL_RETRIEVAL_MODE: keyword
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install Python
+        run: uv python install 3.11
+      - name: Install dependencies
+        run: uv sync --extra dev --locked --python 3.11
+      - name: Lint
+        run: uv run ruff check src tests scripts
+      - name: Compile
+        run: uv run python -m compileall -q src tests scripts
+      - name: Test
+        run: uv run pytest -q
