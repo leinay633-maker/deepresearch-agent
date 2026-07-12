@@ -136,3 +136,31 @@ def test_untracked_manifest_hash_uses_unambiguous_path_content_boundaries(
     second = _manifest(tmp_path)
 
     assert first["git_worktree_hash"] != second["git_worktree_hash"]
+
+
+def test_untracked_symlink_hashes_link_target_without_following_it(tmp_path: Path) -> None:
+    _git(tmp_path, "init", "-q")
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("clean\n", encoding="utf-8")
+    _git(tmp_path, "add", "tracked.txt")
+    _git(
+        tmp_path,
+        "-c",
+        "user.name=Manifest Test",
+        "-c",
+        "user.email=manifest@example.com",
+        "commit",
+        "-q",
+        "-m",
+        "initial",
+    )
+    (tmp_path / "target-a").write_text("same", encoding="utf-8")
+    (tmp_path / "target-b").write_text("same", encoding="utf-8")
+    link = tmp_path / "artifact-link"
+    link.symlink_to("target-a")
+    first = _manifest(tmp_path)
+    link.unlink()
+    link.symlink_to("target-b")
+    second = _manifest(tmp_path)
+
+    assert first["git_worktree_hash"] != second["git_worktree_hash"]

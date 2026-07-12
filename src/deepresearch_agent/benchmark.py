@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import time
 from dataclasses import asdict, replace
@@ -452,9 +453,21 @@ def _git_metadata(root: Path) -> tuple[str | None, bool | None, str | None]:
         digest.update(raw_path)
         path = root / os.fsdecode(raw_path)
         try:
-            content = path.read_bytes()
+            mode = path.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                kind = b"symlink"
+                content = os.fsencode(os.readlink(path))
+            elif stat.S_ISREG(mode):
+                kind = b"regular"
+                content = path.read_bytes()
+            else:
+                kind = f"mode:{stat.S_IFMT(mode):o}".encode("ascii")
+                content = b""
         except OSError:
+            kind = b"unreadable-or-removed"
             content = b"<unreadable-or-removed>"
+        digest.update(len(kind).to_bytes(8, "big"))
+        digest.update(kind)
         digest.update(len(content).to_bytes(8, "big"))
         digest.update(content)
     return sha or None, True, f"sha256:{digest.hexdigest()}"
