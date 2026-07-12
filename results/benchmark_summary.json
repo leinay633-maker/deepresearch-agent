@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-12T17:22:09.185376+00:00",
+  "generated_at": "2026-07-12T17:24:44.740178+00:00",
   "benchmark_kind": "mock_plumbing_smoke_test",
   "interpretation": "These numbers validate that the local pipeline can run end to end. They are not real DeepResearch performance, cost, or answer-quality metrics.",
   "limitations": [
@@ -9,7 +9,7 @@
     "citation_retention_rate can be 1.0 because mock synthesis cites sources created inside the same pipeline",
     "success_rate is a deprecated execution-success alias, not an answer-quality score"
   ],
-  "raw_log": "logs/benchmark-20260712T172209Z-80023836aa1d3f8e.jsonl",
+  "raw_log": "logs/benchmark-20260712T172444Z-e515b3e6d8bca06f.jsonl",
   "config": {
     "seed": 20260606,
     "llm_provider": "mock",
@@ -130,7 +130,7 @@
   },
   "manifest": {
     "schema_version": "1.0",
-    "git_commit_sha": "bd36880e8ccc4146f883ec6b83030bf3bb9fca80",
+    "git_commit_sha": "269a289adb0dfe268ec67b3a53be569ec8c78667",
     "benchmark_name": "interview-baseline",
     "dataset_name": "data/benchmark_cases.jsonl",
     "dataset_version": "sha256:b0c69f1abd079b3f44638c05707f3365ba6c0050be90861ab1662159b91f3558",
@@ -266,9 +266,9 @@
       "min_evidence_items": 1,
       "fallback_policy": "mock"
     },
-    "manifest_id": "80023836aa1d3f8e",
-    "generated_at": "2026-07-12T17:22:09.143658+00:00",
-    "git_dirty": true,
+    "manifest_id": "e515b3e6d8bca06f",
+    "generated_at": "2026-07-12T17:24:44.699298+00:00",
+    "git_dirty": false,
     "deterministic": true,
     "determinism_reason": "both LLM and search providers are deterministic mocks"
   },
@@ -291,9 +291,9 @@
   "success_rate": 1.0,
   "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
   "latency_ms": {
-    "p50": 0.972,
-    "p90": 1.306,
-    "max": 4.144
+    "p50": 0.956,
+    "p90": 1.107,
+    "max": 4.422
   },
   "tokens": {
     "avg": 2121.917,
@@ -323,7 +323,7 @@
       "final_result_usable": true,
       "legacy_report_success": true,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 4.144,
+      "latency_ms": 4.422,
       "total_tokens": 2000,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -336,7 +336,7 @@
       "output_summary": "# Research Report: What role does a planner play in a supervisor-researcher agent architecture?\n\n## Executive Summary\n- What background and definitions are needed to answer: What role does a planner play in a supervisor-researcher agent arc",
       "answer_judgment": null,
       "error": null,
-      "run_id": "97dabbb9cc84"
+      "run_id": "17c457da28c0"
     },
     {
       "case_id": "fact-en-002",
@@ -356,7 +356,7 @@
       "final_result_usable": true,
       "legacy_report_success": true,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 1.194,
+      "latency_ms": 1.095,
       "total_tokens": 1890,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -369,7 +369,7 @@
       "output_summary": "# Research Report: What does HTTP status code 429 indicate to a search-tool client?\n\n## Executive Summary\n- What background and definitions are needed to answer: What does HTTP status code 429 indicate to a search-tool client? Collected 1 v",
       "answer_judgment": null,
       "error": null,
-      "run_id": "5a127af0ed64"
+      "run_id": "35a2c3975214"
     },
     {
       "case_id": "fact-zh-001",
@@ -389,7 +389,7 @@
       "final_result_usable": true,
       "legacy_report_success": false,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 0.943,
+      "latency_ms": 1.089,
       "total_tokens": 1692,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -402,7 +402,7 @@
       "output_summary": "# Research Report: 在多智能体研究系统中，Verifier 的核心职责是什么？?\n\n## Executive Summary\n- What background and definitions are needed to answer: 在多智能体研究系统中，Verifier 的核心职责是什么？? No verified evidence survived filtering for this subquestion. Evidence gap: need ",
       "answer_judgment": null,
       "error": null,
-      "run_id": "7ac70cbb9629"
+      "run_id": "a538a429d10d"
     },
     {
       "case_id": "fact-zh-002",
@@ -422,7 +422,7 @@
       "final_result_usable": true,
       "legacy_report_success": false,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 0.913,
+      "latency_ms": 0.922,
       "total_tokens": 1684,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -435,7 +435,7 @@
       "output_summary": "# Research Report: 为什么研究报告中的引用必须能回溯到具体来源？?\n\n## Executive Summary\n- What background and definitions are needed to answer: 为什么研究报告中的引用必须能回溯到具体来源？? No verified evidence survived filtering for this subquestion. Evidence gap: need 1 additional i",
       "answer_judgment": null,
       "error": null,
-      "run_id": "c3e943d13160"
+      "run_id": "05bf508a019b"
     },
     {
       "case_id": "compare-en-001",
@@ -455,7 +455,7 @@
       "final_result_usable": true,
       "legacy_report_success": true,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 0.969,
+      "latency_ms": 0.987,
       "total_tokens": 2432,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -468,7 +468,7 @@
       "output_summary": "# Research Report: Compare a supervisor-researcher deep research agent with conventional single-pass RAG.\n\n## Executive Summary\n- What background and definitions are needed to answer: Compare a supervisor-researcher deep research agent with",
       "answer_judgment": null,
       "error": null,
-      "run_id": "b2c9c059f443"
+      "run_id": "2d14cf7815a9"
     },
     {
       "case_id": "compare-en-002",
@@ -488,7 +488,7 @@
       "final_result_usable": true,
       "legacy_report_success": true,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 0.943,
+      "latency_ms": 0.912,
       "total_tokens": 2073,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -501,7 +501,7 @@
       "output_summary": "# Research Report: Compare lexical citation checking with an optional LLM citation judge, including their tradeoffs.\n\n## Executive Summary\n- What background and definitions are needed to answer: Compare lexical citation checking with an opt",
       "answer_judgment": null,
       "error": null,
-      "run_id": "91ecd764ad00"
+      "run_id": "6b3ecb869b62"
     },
     {
       "case_id": "compare-zh-001",
@@ -521,7 +521,7 @@
       "final_result_usable": true,
       "legacy_report_success": false,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 0.967,
+      "latency_ms": 0.94,
       "total_tokens": 1691,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -534,7 +534,7 @@
       "output_summary": "# Research Report: 对比关键词检索与混合检索在本地 RAG 中的优缺点。?\n\n## Executive Summary\n- What background and definitions are needed to answer: 对比关键词检索与混合检索在本地 RAG 中的优缺点。? No verified evidence survived filtering for this subquestion. Evidence gap: need 1 addi",
       "answer_judgment": null,
       "error": null,
-      "run_id": "d381dc18fda7"
+      "run_id": "7dfe6f45a582"
     },
     {
       "case_id": "compare-zh-002",
@@ -554,7 +554,7 @@
       "final_result_usable": true,
       "legacy_report_success": false,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 0.913,
+      "latency_ms": 0.95,
       "total_tokens": 1708,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -567,7 +567,7 @@
       "output_summary": "# Research Report: 对比同步研究请求与可恢复长任务控制面的适用场景。?\n\n## Executive Summary\n- What background and definitions are needed to answer: 对比同步研究请求与可恢复长任务控制面的适用场景。? No verified evidence survived filtering for this subquestion. Evidence gap: need 1 addition",
       "answer_judgment": null,
       "error": null,
-      "run_id": "5ab5ffe76555"
+      "run_id": "f477e6e1ea03"
     },
     {
       "case_id": "multihop-en-001",
@@ -587,7 +587,7 @@
       "final_result_usable": true,
       "legacy_report_success": true,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 1.054,
+      "latency_ms": 1.112,
       "total_tokens": 2903,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -600,7 +600,7 @@
       "output_summary": "# Research Report: Explain how search retries, fallback sources, and trace events work together to make a research run diagnosable.\n\n## Executive Summary\n- What background and definitions are needed to answer: Explain how search retries, fa",
       "answer_judgment": null,
       "error": null,
-      "run_id": "862cc69a308a"
+      "run_id": "67303a66078b"
     },
     {
       "case_id": "multihop-en-002",
@@ -620,7 +620,7 @@
       "final_result_usable": true,
       "legacy_report_success": true,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 1.038,
+      "latency_ms": 1.065,
       "total_tokens": 2948,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -633,7 +633,7 @@
       "output_summary": "# Research Report: Trace how a user query becomes a cited report through planning, parallel research, deduplication, synthesis, and verification.\n\n## Executive Summary\n- What background and definitions are needed to answer: Trace how a user",
       "answer_judgment": null,
       "error": null,
-      "run_id": "a8450c98eecc"
+      "run_id": "f12bda96ca93"
     },
     {
       "case_id": "multihop-zh-001",
@@ -653,7 +653,7 @@
       "final_result_usable": true,
       "legacy_report_success": false,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 0.875,
+      "latency_ms": 0.885,
       "total_tokens": 1895,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -666,7 +666,7 @@
       "output_summary": "# Research Report: 说明从子问题拆解、证据收集到逐条引用校验的完整数据流，并指出每一步的失败风险。?\n\n## Executive Summary\n- What background and definitions are needed to answer: 说明从子问题拆解、证据收集到逐条引用校验的完整数据流，并指出每一步的失败风险。? No verified evidence survived filtering for this subquestion.",
       "answer_judgment": null,
       "error": null,
-      "run_id": "2f4a8ca227e2"
+      "run_id": "c5d03b23be91"
     },
     {
       "case_id": "multihop-zh-002",
@@ -686,7 +686,7 @@
       "final_result_usable": true,
       "legacy_report_success": false,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 0.912,
+      "latency_ms": 0.924,
       "total_tokens": 1799,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -699,7 +699,7 @@
       "output_summary": "# Research Report: 解释 checkpoint、重试和幂等性如何共同避免长任务重复执行已完成阶段。?\n\n## Executive Summary\n- What background and definitions are needed to answer: 解释 checkpoint、重试和幂等性如何共同避免长任务重复执行已完成阶段。? No verified evidence survived filtering for this subquestion.",
       "answer_judgment": null,
       "error": null,
-      "run_id": "bdacd8fac158"
+      "run_id": "73d7e2894133"
     },
     {
       "case_id": "conflict-en-001",
@@ -719,7 +719,7 @@
       "final_result_usable": true,
       "legacy_report_success": true,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 1.002,
+      "latency_ms": 1.017,
       "total_tokens": 2856,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -732,7 +732,7 @@
       "output_summary": "# Research Report: Two sources disagree about whether multi-agent research always improves answer quality. Present both claims and explain how the system should report the conflict without inventing a resolution.\n\n## Executive Summary\n- Wha",
       "answer_judgment": null,
       "error": null,
-      "run_id": "24ce5a5b93c5"
+      "run_id": "5d29a8e0f382"
     },
     {
       "case_id": "conflict-en-002",
@@ -752,7 +752,7 @@
       "final_result_usable": true,
       "legacy_report_success": true,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 0.908,
+      "latency_ms": 0.91,
       "total_tokens": 2188,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -765,7 +765,7 @@
       "output_summary": "# Research Report: A report cites an existing source ID whose text does not support the associated claim. Explain how that case should be classified and surfaced.\n\n## Executive Summary\n- What background and definitions are needed to answer:",
       "answer_judgment": null,
       "error": null,
-      "run_id": "6464cfd34a7b"
+      "run_id": "732aff48bbec"
     },
     {
       "case_id": "conflict-zh-001",
@@ -785,7 +785,7 @@
       "final_result_usable": true,
       "legacy_report_success": false,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 0.884,
+      "latency_ms": 0.902,
       "total_tokens": 1895,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -798,7 +798,7 @@
       "output_summary": "# Research Report: 两个来源对同一技术方案的成本结论相反，请保留双方证据并说明系统应如何标记冲突。?\n\n## Executive Summary\n- What background and definitions are needed to answer: 两个来源对同一技术方案的成本结论相反，请保留双方证据并说明系统应如何标记冲突。? No verified evidence survived filtering for this subquestion.",
       "answer_judgment": null,
       "error": null,
-      "run_id": "aed122d4a6e3"
+      "run_id": "fcb90ac8deed"
     },
     {
       "case_id": "failure-en-001",
@@ -818,7 +818,7 @@
       "final_result_usable": true,
       "legacy_report_success": false,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 1.016,
+      "latency_ms": 1.017,
       "total_tokens": 1816,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -831,7 +831,7 @@
       "output_summary": "# Research Report: Describe the expected retry, backoff, degradation, and audit behavior when a web-search tool times out.\n\n## Executive Summary\n- What background and definitions are needed to answer: Describe the expected retry, backoff, d",
       "answer_judgment": null,
       "error": null,
-      "run_id": "03ff7f5a72fd"
+      "run_id": "fe9ae5ff8b9e"
     },
     {
       "case_id": "failure-en-002",
@@ -851,7 +851,7 @@
       "final_result_usable": true,
       "legacy_report_success": true,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 1.423,
+      "latency_ms": 1.243,
       "total_tokens": 2836,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -864,7 +864,7 @@
       "output_summary": "# Research Report: Describe how a research run should behave when a search provider returns HTTP 429 repeatedly.\n\n## Executive Summary\n- What background and definitions are needed to answer: Describe how a research run should behave when a ",
       "answer_judgment": null,
       "error": null,
-      "run_id": "3abcb0cddbe9"
+      "run_id": "f29e7ebf578b"
     },
     {
       "case_id": "failure-zh-001",
@@ -884,7 +884,7 @@
       "final_result_usable": true,
       "legacy_report_success": false,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 1.354,
+      "latency_ms": 1.035,
       "total_tokens": 1879,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -897,7 +897,7 @@
       "output_summary": "# Research Report: 当检索工具返回空结果时，研究系统应如何停止、降级并向评测记录暴露这一事实？?\n\n## Executive Summary\n- What background and definitions are needed to answer: 当检索工具返回空结果时，研究系统应如何停止、降级并向评测记录暴露这一事实？? No verified evidence survived filtering for this subquestion. Evi",
       "answer_judgment": null,
       "error": null,
-      "run_id": "42bbe3684c3d"
+      "run_id": "32dcf5fd7063"
     },
     {
       "case_id": "json-en-001",
@@ -917,7 +917,7 @@
       "final_result_usable": false,
       "legacy_report_success": true,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 1.025,
+      "latency_ms": 0.903,
       "total_tokens": 2088,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -930,7 +930,7 @@
       "output_summary": "# Research Report: Return a JSON object with keys stages, failure_modes, and observability for a deep research pipeline.\n\n## Executive Summary\n- What background and definitions are needed to answer: Return a JSON object with keys stages, fa",
       "answer_judgment": null,
       "error": null,
-      "run_id": "55e2700a6a77"
+      "run_id": "6e7d8cb61504"
     },
     {
       "case_id": "json-en-002",
@@ -950,7 +950,7 @@
       "final_result_usable": false,
       "legacy_report_success": true,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 0.936,
+      "latency_ms": 0.915,
       "total_tokens": 2040,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -963,7 +963,7 @@
       "output_summary": "# Research Report: Return a JSON array of three benchmark metrics; each item must contain name, meaning, and limitation.\n\n## Executive Summary\n- What background and definitions are needed to answer: Return a JSON array of three benchmark me",
       "answer_judgment": null,
       "error": null,
-      "run_id": "52302da8d7e6"
+      "run_id": "845d7d970944"
     },
     {
       "case_id": "json-zh-001",
@@ -983,7 +983,7 @@
       "final_result_usable": false,
       "legacy_report_success": false,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 0.976,
+      "latency_ms": 0.945,
       "total_tokens": 1877,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -996,7 +996,7 @@
       "output_summary": "# Research Report: 用 JSON 对象返回研究任务的 execution_success、citation_coverage 和 answer_quality 三个字段的含义。?\n\n## Executive Summary\n- What background and definitions are needed to answer: 用 JSON 对象返回研究任务的 execution_success、citation_coverage 和 answer_q",
       "answer_judgment": null,
       "error": null,
-      "run_id": "95999616ee0e"
+      "run_id": "5ec395339429"
     },
     {
       "case_id": "quality-en-001",
@@ -1016,7 +1016,7 @@
       "final_result_usable": true,
       "legacy_report_success": true,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 0.982,
+      "latency_ms": 0.962,
       "total_tokens": 2385,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -1029,7 +1029,7 @@
       "output_summary": "# Research Report: What source signals can a verifier use to reject low-quality evidence before synthesis?\n\n## Executive Summary\n- What background and definitions are needed to answer: What source signals can a verifier use to reject low-qu",
       "answer_judgment": null,
       "error": null,
-      "run_id": "4a8b39a5c0c9"
+      "run_id": "e6856da4b125"
     },
     {
       "case_id": "quality-zh-001",
@@ -1049,7 +1049,7 @@
       "final_result_usable": true,
       "legacy_report_success": false,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 0.892,
+      "latency_ms": 0.887,
       "total_tokens": 1871,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -1062,7 +1062,7 @@
       "output_summary": "# Research Report: 如何区分只有搜索摘要的来源与已成功抓取正文的来源，并在报告中保留降级信息？?\n\n## Executive Summary\n- What background and definitions are needed to answer: 如何区分只有搜索摘要的来源与已成功抓取正文的来源，并在报告中保留降级信息？? No verified evidence survived filtering for this subquestion. Evi",
       "answer_judgment": null,
       "error": null,
-      "run_id": "086c3b68b368"
+      "run_id": "e7834452e50e"
     },
     {
       "case_id": "replay-en-001",
@@ -1082,7 +1082,7 @@
       "final_result_usable": true,
       "legacy_report_success": true,
       "success_semantics": "deprecated alias of execution_success; answer quality requires an explicit judge",
-      "latency_ms": 1.012,
+      "latency_ms": 0.98,
       "total_tokens": 2480,
       "estimated_cost_usd": 0.0,
       "deduped_source_count": 3,
@@ -1095,7 +1095,7 @@
       "output_summary": "# Research Report: Explain which artifacts must be recorded so a live LLM and search run can later be replayed and audited offline.\n\n## Executive Summary\n- What background and definitions are needed to answer: Explain which artifacts must b",
       "answer_judgment": null,
       "error": null,
-      "run_id": "61348d957ad5"
+      "run_id": "da1e8624f831"
     }
   ]
 }
