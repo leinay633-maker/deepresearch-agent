@@ -291,10 +291,10 @@ uv run deepresearch-benchmark --cases data/benchmark_cases.jsonl \
 - `--replay-dir` 是 benchmark snapshot replay。它读取一次运行保存的 case-result artifact，跳过 LLM/search，再用当前版本的格式和 citation evaluator 重算可重算指标；旧指标保留在 `recorded_*` 字段中，不能把它当成重新调用 provider。
 - provider cassette 是 `deepresearch_agent.replay` 中的 `CassetteLLMProvider` / `CassetteSearchAdapter`。它按严格的 kind、operation、request 顺序重新执行 orchestrator，未消费完或请求漂移都会失败；当前提供 fixture 和 `deepresearch-cassette` 检查命令，还没有自动录制真实 HTTP 流量的 recorder。
 
-当前离线 24-case baseline（manifest `e515b3e6d8bca06f`）只用于冻结可靠性口径：执行成功率 `1.0`、结构化格式有效率 `0.875`、`answer_quality=null`（未配置 judge）、citation grounding `0.5417`、citation precision `0.5417`、citation coverage `1.0`、unsupported claim rate `0.4583`、source quality `0.9`、工具失败恢复适用 3 条且平均 `1.0`、fallback 总数 `3`。这是 deterministic mock/keyword plumbing 结果，不是真实答案质量提升；manifest 记录了代码提交 `269a289` 且 `git_dirty=false`，后续版本必须使用同一题集和同一指标字段比较。
+当前最终离线 24-case baseline（manifest `949aab1f58a8e33c`）只用于冻结可靠性口径：执行成功率 `1.0`、结构化格式有效率 `0.875`、`answer_quality=null`（未配置 judge）、citation grounding `0.5417`、citation precision `0.5417`、citation coverage `1.0`、unsupported claim rate `0.4583`、claim extraction 有效率 `1.0`、source quality `0.9`、工具失败恢复适用 3 条且平均 `1.0`、fallback 总数 `3`。这是 deterministic mock/keyword plumbing 结果，不是真实答案质量提升；manifest 记录了代码提交 `07a624b` 且 `git_dirty=false`，后续版本必须使用同一题集和同一指标字段比较。
 
-产物位置：`results/benchmarks/e515b3e6d8bca06f/summary.json` 和对应的
-`logs/benchmark-20260712T172444Z-e515b3e6d8bca06f.jsonl`。
+产物位置：`results/benchmarks/949aab1f58a8e33c/summary.json` 和对应的
+`logs/benchmark-20260712T185935Z-949aab1f58a8e33c.jsonl`。审查前的 `e515b3e6d8bca06f` 与审查后、最终指纹修复前的 `cfc88658446ed557` 仍按 manifest 分目录保留，便于追溯口径变化。
 
 ## 五分钟面试演示路径
 
