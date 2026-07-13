@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
 from deepresearch_agent.benchmark import refresh_replayed_case_result
+from deepresearch_agent.citation import CitationChecker
+from deepresearch_agent.citation_judge import HeuristicCitationJudgeProvider
 from deepresearch_agent.config import Settings
 from deepresearch_agent.orchestrator import DeepResearchOrchestrator
 from deepresearch_agent.replay import (
@@ -20,7 +23,7 @@ from deepresearch_agent.replay import (
     validate_replay_case_ids,
     write_cassette,
 )
-from deepresearch_agent.schemas import ResearchRequest
+from deepresearch_agent.schemas import ResearchRequest, Source
 from deepresearch_agent.search import MockSearchAdapter, SearchService
 
 
@@ -219,7 +222,11 @@ def test_case_result_artifact_can_be_replayed_without_providers(tmp_path) -> Non
         "\n".join(
             [
                 '{"type":"config","config":{}}',
-                '{"type":"case_result","case_id":"case-1","query":"q","answer":"a","success":true}',
+                (
+                    '{"type":"case_result","case_id":"case-1","query":"q",'
+                    '"answer":"a","success":true,"answer_judgment":'
+                    '{"provider":"llm-gateway","model":"glm-5.2","score":1.0}}'
+                ),
             ]
         )
         + "\n",
@@ -236,6 +243,16 @@ def test_case_result_artifact_can_be_replayed_without_providers(tmp_path) -> Non
     assert replayed["answer"] == "a"
     assert replayed["replayed"] is True
     assert replayed["manifest_id"] == "manifest-new"
+    assert replayed["generation_replay"] == {
+        "deterministic": True,
+        "mode": "recorded_case_artifact",
+        "source_manifest_id": None,
+    }
+    assert replayed["recorded_answer_judgment"] == {
+        "provider": "llm-gateway",
+        "model": "glm-5.2",
+        "score": 1.0,
+    }
     assert case_result_artifact_id(artifact).startswith("sha256:")
 
 
@@ -379,3 +396,133 @@ def test_refresh_replay_preserves_metrics_snapshot() -> None:
         refreshed["report"]["metrics"]["claim_extraction_valid"]
         is refreshed["citation_check"]["claim_extraction_valid"]
     )
+
+
+def _record_with_citation_judge(provider: str, model: str) -> dict:
+    claim = "Recorded evidence supports citation replay [S1]."
+    source = Source(
+        id="S1",
+        title="Recorded evidence",
+        url="https://example.com/recorded-evidence",
+        content="Recorded evidence supports citation replay.",
+        provider="fixture",
+        query="citation replay",
+        metadata={"extract_status": "ok", "snippet_only": False},
+    )
+    if provider == "heuristic":
+        check = CitationChecker().check(
+            [claim],
+            [source],
+            judge_provider=HeuristicCitationJudgeProvider(),
+        )
+    else:
+        check = CitationChecker().check([claim], [source])
+        check = check.model_copy(
+            update={
+                "assessments": [
+                    check.assessments[0].model_copy(
+                        update={
+                            "judge_provider": provider,
+                            "judge_model": model,
+                            "judge_confidence": 0.91,
+                            "judge_reason": "recorded live judgment",
+                        }
+                    )
+                ]
+            }
+        )
+    check_payload = check.model_dump(mode="json")
+    report = {
+        "run_id": "recorded-run",
+        "query": "How should citation replay work?",
+        "brief": {
+            "original_query": "How should citation replay work?",
+            "normalized_query": "How should citation replay work?",
+            "scope": "test",
+            "constraints": [],
+            "assumptions": [],
+        },
+        "plan": [],
+        "answer": claim,
+        "claims": [claim],
+        "findings": [],
+        "sources": [source.model_dump(mode="json")],
+        "citation_check": check_payload,
+        "cost": {
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_tokens": 0,
+            "total_estimated_cost_usd": 0.0,
+            "records": [],
+        },
+        "metrics": {
+            "citation_grounding": check.citation_grounding,
+            "citation_precision": check.citation_precision,
+            "citation_coverage": check.citation_coverage,
+            "citation_retention_rate": check.retention_rate,
+            "latency_ms": 1.0,
+        },
+        "trace_events": [],
+    }
+    return {
+        "citation_check": check_payload,
+        "metrics": dict(report["metrics"]),
+        "report": report,
+    }
+
+
+def test_refresh_replay_marks_live_citation_judge_as_unscored() -> None:
+    record = _record_with_citation_judge("llm-gateway", "glm-5.2")
+    recorded_check = json.loads(json.dumps(record["citation_check"]))
+
+    refreshed = refresh_replayed_case_result(
+        {"id": "case-1", "query": "How should citation replay work?"},
+        record,
+    )
+
+    assert refreshed["recorded_citation_check"] == recorded_check
+    assert refreshed["recorded_citation_check"]["assessments"][0][
+        "judge_provider"
+    ] == "llm-gateway"
+    assert refreshed["recorded_citation_check"]["assessments"][0][
+        "judge_model"
+    ] == "glm-5.2"
+    assert refreshed["replayed_citation_check"]["assessments"][0][
+        "judge_provider"
+    ] is None
+    assert refreshed["citation_replay"] == {
+        "status": "unscored",
+        "reason": (
+            "the recorded citation check used a non-replayable judge; the current "
+            "lexical check is diagnostic only and does not replace its scores"
+        ),
+        "recorded_judges": [{"provider": "llm-gateway", "model": "glm-5.2"}],
+        "replayed_judge": {"provider": "lexical", "model": None},
+    }
+    assert refreshed["citation_check"] is None
+    assert refreshed["citation_grounding"] is None
+    assert refreshed["citation_precision"] is None
+    assert refreshed["citation_coverage"] is None
+    assert refreshed["metrics"]["citation_retention_rate"] is None
+    assert refreshed["report"]["citation_check"] == recorded_check
+
+
+def test_refresh_replay_reuses_recorded_deterministic_citation_judge() -> None:
+    record = _record_with_citation_judge("heuristic", "local-overlap-judge")
+
+    refreshed = refresh_replayed_case_result(
+        {"id": "case-1", "query": "How should citation replay work?"},
+        record,
+    )
+
+    assert refreshed["citation_replay"]["status"] == "scored"
+    assert refreshed["citation_replay"]["recorded_judges"] == [
+        {"provider": "heuristic", "model": "local-overlap-judge"}
+    ]
+    assert refreshed["citation_replay"]["replayed_judge"] == {
+        "provider": "heuristic",
+        "model": "local-overlap-judge",
+    }
+    assert refreshed["citation_check"]["assessments"][0][
+        "judge_provider"
+    ] == "heuristic"

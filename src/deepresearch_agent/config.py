@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,12 @@ class Settings:
     mock_output_cost_per_1m_tokens: float = 0.0
     trace_dir: str = "logs"
     trace_exporter: str = "jsonl"
+    # A sealed evaluation must be able to keep traces in memory for metrics
+    # without writing question/answer-bearing events to disk.
+    trace_write_enabled: bool = True
+    # Evaluation harnesses enable this explicitly so public benchmark answer
+    # pages cannot enter a live retrieval run as ordinary web evidence.
+    benchmark_source_exclusion: bool = False
     otel_exporter_otlp_endpoint: str = ""
     otel_exporter_otlp_headers: str = ""
     otel_exporter_otlp_timeout_seconds: float = 2.0
@@ -33,11 +39,20 @@ class Settings:
     openai_compatible_api_key_required: bool = False
     openai_compatible_input_cost_per_1m_tokens: float = 0.0
     openai_compatible_output_cost_per_1m_tokens: float = 0.0
+    llm_gateway_model: str = "claude-4.6-opus"
+    llm_gateway_base_url: str = "https://llmapi.bilibili.co"
+    llm_gateway_timeout_seconds: float = 120.0
+    llm_gateway_thinking_budget_tokens: int = 1024
+    # Evaluation runs can require the Gateway to prove it served the requested
+    # model, rather than merely trusting the model name in the request body.
+    llm_gateway_require_response_model_match: bool = False
+    gateway_web_search_model: str = "claude-4.6-opus"
     llm_brief_model: str = ""
     llm_planner_model: str = ""
     llm_synthesis_model: str = ""
     citation_judge_provider: str = "none"
     citation_judge_model: str = "deepseek-v4-flash"
+    citation_judge_gateway_model: str = "glm-5.2"
     citation_judge_timeout_seconds: float = 30.0
     embedding_provider: str = "local"
     local_embedding_model: str = "BAAI/bge-small-zh-v1.5"
@@ -64,6 +79,7 @@ class Settings:
     dashscope_rerank_model: str = "gte-rerank-v2"
     local_rerank_candidate_k: int = 6
     searxng_base_url: str = ""
+    bing_search_base_url: str = "https://global.bing.com/search"
     brave_search_base_url: str = "https://api.search.brave.com/res/v1/web/search"
     tavily_search_base_url: str = "https://api.tavily.com/search"
     tavily_search_depth: str = "basic"
@@ -120,6 +136,8 @@ def load_settings() -> Settings:
         max_researchers=_int_env("MAX_RESEARCHERS", 3),
         trace_dir=os.getenv("TRACE_DIR", "logs"),
         trace_exporter=os.getenv("TRACE_EXPORTER", "jsonl").strip().lower() or "jsonl",
+        trace_write_enabled=_bool_env("TRACE_WRITE_ENABLED", True),
+        benchmark_source_exclusion=_bool_env("BENCHMARK_SOURCE_EXCLUSION", False),
         otel_exporter_otlp_endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip(),
         otel_exporter_otlp_headers=os.getenv("OTEL_EXPORTER_OTLP_HEADERS", "").strip(),
         otel_exporter_otlp_timeout_seconds=_float_env(
@@ -152,6 +170,25 @@ def load_settings() -> Settings:
         openai_compatible_output_cost_per_1m_tokens=_float_env(
             "OPENAI_COMPATIBLE_OUTPUT_COST_PER_1M_TOKENS", 0.0
         ),
+        llm_gateway_model=(
+            os.getenv("LLM_GATEWAY_MODEL", "claude-4.6-opus").strip()
+            or "claude-4.6-opus"
+        ),
+        llm_gateway_base_url=(
+            os.getenv("LLM_GATEWAY_BASE_URL", "https://llmapi.bilibili.co").strip()
+            or "https://llmapi.bilibili.co"
+        ),
+        llm_gateway_timeout_seconds=_float_env("LLM_GATEWAY_TIMEOUT_SECONDS", 120.0),
+        llm_gateway_thinking_budget_tokens=_int_env(
+            "LLM_GATEWAY_THINKING_BUDGET_TOKENS", 1024
+        ),
+        llm_gateway_require_response_model_match=_bool_env(
+            "LLM_GATEWAY_REQUIRE_RESPONSE_MODEL_MATCH", False
+        ),
+        gateway_web_search_model=(
+            os.getenv("GATEWAY_WEB_SEARCH_MODEL", "claude-4.6-opus").strip()
+            or "claude-4.6-opus"
+        ),
         llm_brief_model=os.getenv("LLM_BRIEF_MODEL", "").strip(),
         llm_planner_model=os.getenv("LLM_PLANNER_MODEL", "").strip(),
         llm_synthesis_model=os.getenv("LLM_SYNTHESIS_MODEL", "").strip(),
@@ -160,6 +197,10 @@ def load_settings() -> Settings:
         citation_judge_model=(
             os.getenv("CITATION_JUDGE_MODEL", "deepseek-v4-flash").strip()
             or "deepseek-v4-flash"
+        ),
+        citation_judge_gateway_model=(
+            os.getenv("CITATION_JUDGE_GATEWAY_MODEL", "glm-5.2").strip()
+            or "glm-5.2"
         ),
         citation_judge_timeout_seconds=_float_env("CITATION_JUDGE_TIMEOUT_SECONDS", 30.0),
         embedding_provider=os.getenv("EMBEDDING_PROVIDER", "local").strip().lower()
@@ -207,6 +248,10 @@ def load_settings() -> Settings:
         ),
         local_rerank_candidate_k=_int_env("LOCAL_RERANK_CANDIDATE_K", 6),
         searxng_base_url=os.getenv("SEARXNG_BASE_URL", "").strip(),
+        bing_search_base_url=(
+            os.getenv("BING_SEARCH_BASE_URL", "https://global.bing.com/search").strip()
+            or "https://global.bing.com/search"
+        ),
         brave_search_base_url=(
             os.getenv(
                 "BRAVE_SEARCH_BASE_URL",
@@ -234,4 +279,23 @@ def load_settings() -> Settings:
         mcp_search_tool=os.getenv("MCP_SEARCH_TOOL", "").strip(),
         mcp_query_argument=os.getenv("MCP_QUERY_ARGUMENT", "query").strip() or "query",
         run_lease_seconds=_int_env("RUN_LEASE_SECONDS", 120),
+    )
+
+
+def with_request_timeout(
+    settings: Settings,
+    request_timeout_seconds: float | None,
+) -> Settings:
+    """Apply one CLI timeout consistently to search, Gateway, and citation judging."""
+
+    if request_timeout_seconds is None:
+        return settings
+    timeout = float(request_timeout_seconds)
+    if timeout <= 0:
+        raise ValueError("request timeout must be positive")
+    return replace(
+        settings,
+        request_timeout_seconds=timeout,
+        llm_gateway_timeout_seconds=timeout,
+        citation_judge_timeout_seconds=timeout,
     )

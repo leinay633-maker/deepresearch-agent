@@ -6,7 +6,7 @@ import json
 import sys
 from dataclasses import replace
 
-from deepresearch_agent.config import load_settings
+from deepresearch_agent.config import load_settings, with_request_timeout
 from deepresearch_agent.orchestrator import DeepResearchOrchestrator
 from deepresearch_agent.report_exporter import export_report
 from deepresearch_agent.schemas import ResearchRequest
@@ -35,6 +35,7 @@ async def _run(args: argparse.Namespace) -> int:
         deadline_seconds=args.deadline_seconds,
         min_evidence_items=args.min_evidence_items,
         fallback_policy=args.fallback_policy,
+        expected_format=args.expected_format,
     )
     report = await DeepResearchOrchestrator(settings=settings).run(request)
     if args.json:
@@ -57,7 +58,10 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 def _settings_from_args(args: argparse.Namespace):
-    settings = load_settings()
+    settings = with_request_timeout(
+        load_settings(),
+        getattr(args, "request_timeout_seconds", None),
+    )
     overrides = {}
     for argument, field in [
         ("embedding_provider", "embedding_provider"),
@@ -74,6 +78,8 @@ def _settings_from_args(args: argparse.Namespace):
         ("rerank_provider", "rerank_provider"),
         ("local_rerank_candidate_k", "local_rerank_candidate_k"),
         ("searxng_base_url", "searxng_base_url"),
+        ("bing_search_base_url", "bing_search_base_url"),
+        ("gateway_web_search_model", "gateway_web_search_model"),
         ("web_crawler_provider", "web_crawler_provider"),
         ("jina_reader_base_url", "jina_reader_base_url"),
         ("jina_search_base_url", "jina_search_base_url"),
@@ -92,12 +98,28 @@ def main() -> None:
     parser.add_argument("query")
     parser.add_argument(
         "--search-provider",
-        choices=["mock", "wikipedia", "searxng", "jina", "brave", "tavily", "mcp"],
+        choices=[
+            "mock",
+            "wikipedia",
+            "bing",
+            "searxng",
+            "jina",
+            "brave",
+            "tavily",
+            "gateway-web",
+            "mcp",
+        ],
         default=None,
     )
     parser.add_argument(
         "--llm-provider",
-        choices=["mock", "deepseek", "openai-compatible", "openai_compatible"],
+        choices=[
+            "mock",
+            "deepseek",
+            "openai-compatible",
+            "openai_compatible",
+            "llm-gateway",
+        ],
         default=None,
     )
     parser.add_argument("--llm-model", default=None)
@@ -105,7 +127,9 @@ def main() -> None:
     parser.add_argument("--planner-model", default=None)
     parser.add_argument("--synthesis-model", default=None)
     parser.add_argument("--embedding-provider", choices=["local", "dashscope"], default=None)
-    parser.add_argument("--local-retrieval-mode", choices=["keyword", "hybrid"], default=None)
+    parser.add_argument(
+        "--local-retrieval-mode", choices=["none", "keyword", "hybrid"], default=None
+    )
     parser.add_argument("--local-keyword-top-k", type=int, default=None)
     parser.add_argument("--local-vector-top-k", type=int, default=None)
     parser.add_argument("--local-keyword-weight", type=float, default=None)
@@ -123,6 +147,8 @@ def main() -> None:
     parser.add_argument("--rerank-provider", choices=["local", "dashscope"], default=None)
     parser.add_argument("--local-rerank-candidate-k", type=int, default=None)
     parser.add_argument("--searxng-base-url", default=None)
+    parser.add_argument("--bing-search-base-url", default=None)
+    parser.add_argument("--gateway-web-search-model", default=None)
     parser.add_argument(
         "--web-crawler-provider",
         choices=["none", "jina", "jina_reader", "html"],
@@ -133,10 +159,24 @@ def main() -> None:
     parser.add_argument("--crawler-max-chars", type=int, default=None)
     parser.add_argument("--max-researchers", type=int, default=3)
     parser.add_argument("--max-results", type=int, default=4)
+    parser.add_argument(
+        "--request-timeout-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Common timeout for search/crawling, Gateway web search and LLM calls, "
+            "and citation judging. Defaults to configured provider timeouts."
+        ),
+    )
     parser.add_argument("--max-rounds", type=int, default=1)
     parser.add_argument("--max-tool-calls", type=int, default=1)
     parser.add_argument("--deadline-seconds", type=float, default=None)
     parser.add_argument("--min-evidence-items", type=int, default=1)
+    parser.add_argument(
+        "--expected-format",
+        choices=["text", "markdown", "json"],
+        default="markdown",
+    )
     parser.add_argument(
         "--fallback-policy",
         choices=["mock", "degraded", "fail"],
@@ -149,7 +189,7 @@ def main() -> None:
     parser.add_argument(
         "--citation-judge-provider",
         default=None,
-        help="Optional citation judge provider: none, heuristic, deepseek.",
+        help="Optional citation judge provider: none, heuristic, deepseek, llm-gateway.",
     )
     parser.add_argument("--citation-judge-model", default=None)
     parser.add_argument("--seed", type=int, default=20260606)

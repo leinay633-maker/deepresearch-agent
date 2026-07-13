@@ -34,6 +34,14 @@ class _BrokenExporter:
         raise RuntimeError(f"cannot export {event.stage}")
 
 
+class _CaptureExporter:
+    def __init__(self) -> None:
+        self.events = []
+
+    def export(self, event) -> None:
+        self.events.append(event)
+
+
 def test_trace_logger_exports_otlp_http_event(tmp_path: Path) -> None:
     _CaptureHandler.payloads = []
     _CaptureHandler.paths = []
@@ -75,6 +83,24 @@ def test_trace_logger_keeps_jsonl_when_exporter_fails(tmp_path: Path) -> None:
     assert "cannot export run" in trace.events[-1].payload["error"]
     lines = (tmp_path / "research-run-broken.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(lines) == 2
+
+
+def test_trace_logger_can_keep_events_in_memory_without_writing(tmp_path: Path) -> None:
+    exporter = _CaptureExporter()
+    trace = TraceLogger(
+        "sealed-run",
+        trace_dir=tmp_path,
+        exporter=exporter,
+        write_enabled=False,
+    )
+
+    trace.record("run", "start", {"query": "sealed sentinel query"})
+
+    assert len(trace.events) == 1
+    assert not (tmp_path / "research-sealed-run.jsonl").exists()
+    # write_enabled controls the local JSONL sink only; sealed evaluation also
+    # forces trace_exporter=none, which is covered by the CLI-level sentinel test.
+    assert len(exporter.events) == 1
 
 
 def test_build_trace_exporter_uses_otlp_settings() -> None:

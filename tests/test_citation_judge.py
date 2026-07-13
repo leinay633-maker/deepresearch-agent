@@ -34,6 +34,15 @@ class _FixedJudge:
         )
 
 
+class _FailingJudge:
+    name = "failing"
+    model = "failing-judge"
+
+    def judge(self, claim, evidence_quotes):
+        del claim, evidence_quotes
+        raise TimeoutError("judge timeout")
+
+
 def test_citation_checker_applies_optional_judge_and_records_cost() -> None:
     source = Source(
         id="S1",
@@ -61,6 +70,29 @@ def test_citation_checker_applies_optional_judge_and_records_cost() -> None:
     assert cost.records[-1].stage == "citation_judge"
     assert cost.records[-1].provider == "fixed"
     assert cost.records[-1].model == "fixed-judge"
+
+
+def test_citation_judge_failure_is_unverifiable_instead_of_crashing_run() -> None:
+    source = Source(
+        id="S1",
+        title="Official source",
+        url="https://example.com/fact",
+        content="The exact version is 3.14.6.",
+        provider="mock",
+        query="version",
+    )
+
+    report = CitationChecker(min_overlap=0.01).check(
+        ["The exact version is 3.14.6 [S1]"],
+        [source],
+        judge_provider=_FailingJudge(),
+    )
+
+    assessment = report.assessments[0]
+    assert assessment.supported is False
+    assert assessment.support_level == "unverifiable"
+    assert assessment.judge_provider == "failing"
+    assert "TimeoutError" in (assessment.judge_reason or "")
 
 
 def test_heuristic_judge_provider_has_no_key_dependency() -> None:

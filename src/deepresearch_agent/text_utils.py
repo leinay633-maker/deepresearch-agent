@@ -14,5 +14,7 @@ def tokenize(text: str) -> set[str]:
 
 
 def split_sentences(text: str) -> list[str]:
-    parts = re.split(r"(?<=[.!?。！？])\s*", text.strip())
+    # Chinese sentence punctuation does not need trailing whitespace. A period
+    # does: splitting on every dot corrupts versions (3.14.0) and hostnames.
+    parts = re.split(r"(?<=[!?。！？])\s*|(?<=\.)\s+", text.strip())
     return [part.strip() for part in parts if part.strip()]

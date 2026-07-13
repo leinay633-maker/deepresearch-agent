@@ -25,6 +25,8 @@ def test_reflection_adds_bounded_follow_up_question() -> None:
     stages = [event.stage for event in report.trace_events]
     assert len(report.plan) == 2
     assert report.plan[1].id == "R1"
+    assert report.plan[1].question == request.query
+    assert "exact answer independent source" in (report.plan[1].search_query or "")
     assert "compression.round1" in stages
     assert "reflection.round1" in stages
     assert any(finding.subquestion_id == "R1" for finding in report.findings)

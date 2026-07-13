@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from deepresearch_agent.benchmark import build_case_evaluation_metrics
-from deepresearch_agent.citation import CitationChecker
+from deepresearch_agent.citation import CitationChecker, source_is_relevant_to_claim
 from deepresearch_agent.cost import CostTracker, deepseek_usage_cost_usd
 from deepresearch_agent.dedup import SourceDeduplicator
 from deepresearch_agent.schemas import Source
@@ -145,6 +145,105 @@ def test_snippet_only_citation_is_unverifiable() -> None:
 
     assert report.assessments[0].support_level == "unverifiable"
     assert report.citation_grounding == 0.0
+
+
+def test_evidence_quote_selects_relevant_window_inside_long_unpunctuated_page() -> None:
+    source = Source(
+        id="S1",
+        title="Python.org",
+        url="https://www.python.org/",
+        content=(
+            "Navigation and unrelated fallback text " * 80
+            + "Download Python source code. Latest: Python 3.14.6. "
+            + "More unrelated footer text " * 40
+        ),
+        provider="bing",
+        query="Python latest stable version",
+        metadata={"extract_status": "ok", "snippet_only": False},
+    )
+
+    report = CitationChecker().check(
+        ["The latest Python version is 3.14.6 [S1]"],
+        [source],
+    )
+
+    assert "3.14.6" in report.assessments[0].evidence_quotes[0].quote
+
+
+def test_evidence_quote_keeps_date_sentence_for_founding_year_question() -> None:
+    source = Source(
+        id="S1",
+        title="San Carlos history",
+        url="https://example.com/san-carlos",
+        content=(
+            "San Carlos is a municipality in Antioquia, Colombia. "
+            "It has dams and a population of 14,480 people. "
+            "The town itself was officially started on August 14, 1786."
+        ),
+        provider="web",
+        query="San Carlos Antioquia founding year",
+        metadata={"extract_status": "ok", "snippet_only": False},
+    )
+
+    report = CitationChecker().check(
+        ["What year was San Carlos, Antioquia founded? [S1]"],
+        [source],
+    )
+
+    assert "1786" in report.assessments[0].evidence_quotes[0].quote
+
+
+def test_founding_date_heuristic_rejects_correct_date_for_wrong_entity() -> None:
+    source = Source(
+        id="S1",
+        title="Python history",
+        url="https://example.com/python-history",
+        content="Python was created in 1991.",
+        provider="web",
+        query="San Carlos founding year",
+        metadata={"extract_status": "ok", "snippet_only": False},
+    )
+
+    report = CitationChecker().check(
+        ["San Carlos was founded in 1991 [S1]"],
+        [source],
+    )
+
+    assert report.citation_grounding == 0.0
+    assert report.assessments[0].support_level == "unsupported"
+
+
+def test_source_relevance_rejects_single_place_overlap_for_entity_rich_question() -> None:
+    query = (
+        "In June 1637, Thomas Ballard of Wandsworth accused Richard Kestian of "
+        "calling him a liar at which man's house in Putney?"
+    )
+    unrelated_putney_page = Source(
+        id="S1",
+        title="Putney Debates",
+        url="https://example.com/putney-debates",
+        content=(
+            "The Putney Debates concerned the Levellers and the New Model Army in 1647."
+        ),
+        provider="web",
+        query=query,
+        metadata={"extract_status": "ok", "snippet_only": False},
+    )
+    relevant_record = Source(
+        id="S2",
+        title="Thomas Ballard v Richard Kestian",
+        url="https://example.com/court-record",
+        content=(
+            "Thomas Ballard of Wandsworth complained that Richard Kestian called him "
+            "a liar at William Carter's house in Putney."
+        ),
+        provider="web",
+        query=query,
+        metadata={"extract_status": "ok", "snippet_only": False},
+    )
+
+    assert source_is_relevant_to_claim(query, unrelated_putney_page) is False
+    assert source_is_relevant_to_claim(query, relevant_record) is True
 
 
 def test_cost_tracker_can_record_provider_usage() -> None:

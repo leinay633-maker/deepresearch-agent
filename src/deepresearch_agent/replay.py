@@ -143,6 +143,10 @@ class CassetteLLMProvider:
                 estimated_cost_usd=float(usage.get("estimated_cost_usd", 0.0)),
                 provider=self.name,
                 model=self.model,
+                cache_creation_input_tokens=int(
+                    usage.get("cache_creation_input_tokens", 0)
+                ),
+                cache_read_input_tokens=int(usage.get("cache_read_input_tokens", 0)),
             )
 
 
@@ -284,7 +288,44 @@ def replay_case_result(
     replayed = json.loads(json.dumps(recorded, ensure_ascii=False))
     replayed["manifest_id"] = manifest_id
     replayed["replayed"] = True
+    replayed["generation_replay"] = {
+        "deterministic": True,
+        "mode": "recorded_case_artifact",
+        "source_manifest_id": recorded.get("manifest_id"),
+    }
+    if isinstance(recorded.get("answer_judgment"), dict):
+        replayed["recorded_answer_judgment"] = json.loads(
+            json.dumps(recorded["answer_judgment"], ensure_ascii=False)
+        )
     return replayed
+
+
+def citation_judge_identities(
+    citation_check: dict[str, Any] | None,
+) -> list[dict[str, str | None]]:
+    """Return the distinct recorded citation judges without guessing missing metadata."""
+
+    if not isinstance(citation_check, dict):
+        return []
+    identities: list[dict[str, str | None]] = []
+    seen: set[tuple[str, str | None]] = set()
+    assessments = citation_check.get("assessments")
+    if not isinstance(assessments, list):
+        return identities
+    for assessment in assessments:
+        if not isinstance(assessment, dict):
+            continue
+        provider = str(assessment.get("judge_provider") or "").strip().lower()
+        if not provider:
+            continue
+        model_value = assessment.get("judge_model")
+        model = str(model_value).strip() if model_value is not None else None
+        identity = (provider, model or None)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        identities.append({"provider": provider, "model": model or None})
+    return identities
 
 
 def _validate_case_contract(case: dict[str, Any], recorded: dict[str, Any]) -> None:

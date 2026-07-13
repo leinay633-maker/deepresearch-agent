@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import argparse
+import asyncio
+import json
 import subprocess
 from pathlib import Path
 
 from deepresearch_agent.benchmark import (
     build_benchmark_manifest,
+    mark_live_judge_nondeterminism,
+    run_benchmark,
     sanitized_settings_snapshot,
 )
 from deepresearch_agent.config import Settings
@@ -49,6 +54,145 @@ def test_settings_snapshot_redacts_credential_bearing_values() -> None:
     assert snapshot["qdrant_api_key_env"] == "QDRANT_REAL_KEY_NAME"
     assert snapshot["openai_compatible_api_key_env"] == "OPENAI_REAL_KEY_NAME"
     assert snapshot["mock_input_cost_per_1m_tokens"] == 0.0
+
+
+def test_replay_manifest_separates_generation_from_live_rejudge(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "recorded.jsonl"
+    artifact.write_text(
+        '{"type":"case_result","case_id":"case-1","query":"q"}\n',
+        encoding="utf-8",
+    )
+
+    def build() -> dict:
+        return build_benchmark_manifest(
+            root=tmp_path,
+            benchmark_name="rejudge-test",
+            dataset_name="cases.jsonl",
+            cases=[{"id": "case-1", "query": "q"}],
+            config_snapshot={"rejudge_replay": True},
+            llm_provider="mock",
+            llm_model="mock-model",
+            search_provider="mock",
+            seed=7,
+            replay_dir=str(artifact),
+        )
+
+    offline = build()
+    mark_live_judge_nondeterminism(
+        offline,
+        answer_judge_provider="llm-gateway",
+        answer_judge_model="kimi-k2.7-code-highspeed",
+        answer_judge_executed=False,
+    )
+    assert offline["generation_deterministic"] is True
+    assert offline["evaluation_deterministic"] is True
+    assert offline["deterministic"] is True
+    assert offline["evaluation_judges"] == [
+        {
+            "kind": "answer",
+            "provider": "llm-gateway",
+            "model": "kimi-k2.7-code-highspeed",
+            "executed": False,
+            "deterministic": None,
+        }
+    ]
+
+    live_rejudge = build()
+    mark_live_judge_nondeterminism(
+        live_rejudge,
+        answer_judge_provider="llm-gateway",
+        answer_judge_model="kimi-k2.7-code-highspeed",
+        answer_judge_executed=True,
+    )
+    assert live_rejudge["generation_deterministic"] is True
+    assert live_rejudge["evaluation_deterministic"] is False
+    assert live_rejudge["deterministic"] is False
+    assert "live answer judge" in live_rejudge["determinism_reason"]
+
+
+def test_benchmark_manifest_records_the_timeout_used_by_gateway_channels(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cases_path = tmp_path / "cases.jsonl"
+    cases_path.write_text(
+        json.dumps(
+            {
+                "id": "timeout-case",
+                "query": "How should a timeout be recorded?",
+                "category": "single_fact",
+                "language": "en",
+                "expected_format": "text",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "deepresearch_agent.benchmark.__file__",
+        str(tmp_path / "src" / "deepresearch_agent" / "benchmark.py"),
+    )
+    monkeypatch.setattr(
+        "deepresearch_agent.benchmark.load_settings",
+        lambda: Settings(trace_dir=str(tmp_path / "traces")),
+    )
+    args = argparse.Namespace(
+        cases=str(cases_path),
+        benchmark_name="timeout-smoke",
+        search_provider="mock",
+        llm_provider="mock",
+        llm_model=None,
+        brief_model=None,
+        planner_model=None,
+        synthesis_model=None,
+        embedding_provider="local",
+        local_retrieval_mode="keyword",
+        local_keyword_top_k=4,
+        local_vector_top_k=4,
+        local_keyword_weight=1.0,
+        local_vector_weight=1.0,
+        local_hybrid_rrf_k=60,
+        rerank_enabled=False,
+        rerank_provider="local",
+        local_rerank_candidate_k=6,
+        searxng_base_url=None,
+        bing_search_base_url=None,
+        gateway_web_search_model=None,
+        web_crawler_provider="none",
+        jina_reader_base_url=None,
+        jina_search_base_url=None,
+        crawler_max_chars=None,
+        seed=20260606,
+        max_researchers=1,
+        max_results=1,
+        request_timeout_seconds=6.5,
+        max_rounds=1,
+        max_tool_calls=1,
+        deadline_seconds=None,
+        min_evidence_items=1,
+        fallback_policy="mock",
+        reflection_enabled=False,
+        max_reflection_rounds=1,
+        reflection_min_sources=4,
+        citation_judge_provider="none",
+        citation_judge_model=None,
+        replay_dir=None,
+        cassette_id=None,
+    )
+
+    summary = asyncio.run(run_benchmark(args))
+    config = summary["config"]
+
+    assert config["request_timeout_seconds"] == 6.5
+    assert config["gateway_web_search_timeout_seconds"] == 6.5
+    assert config["llm_gateway_timeout_seconds"] == 6.5
+    assert config["citation_judge_timeout_seconds"] == 6.5
+    assert config["settings"]["request_timeout_seconds"] == 6.5
+    assert config["settings"]["llm_gateway_timeout_seconds"] == 6.5
+    assert config["settings"]["citation_judge_timeout_seconds"] == 6.5
+    assert summary["manifest"]["config_snapshot"] == config
 
 
 def test_dirty_worktree_hash_prevents_manifest_collisions(tmp_path: Path) -> None:

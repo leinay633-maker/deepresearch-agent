@@ -75,6 +75,8 @@ class LocalRagRetriever:
         self.last_retrieval_degraded = False
         self.last_degrade_reason = None
         mode = self.settings.local_retrieval_mode.strip().lower()
+        if mode in {"none", "off", "disabled"}:
+            return []
         keyword_top_k = max(max_results, self.settings.local_keyword_top_k)
         keyword_results = self._keyword_retrieve(query, top_k=keyword_top_k)
         if mode == "keyword":

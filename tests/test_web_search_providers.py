@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 from typing import Any
 
 import pytest
 
 from deepresearch_agent.config import Settings
 from deepresearch_agent.search import (
+    BenchmarkContaminationError,
+    BingRssSearchAdapter,
     BraveSearchAdapter,
     HtmlTextCrawler,
     JinaReaderCrawler,
@@ -18,14 +21,20 @@ from deepresearch_agent.search import (
     build_search_adapter,
     build_search_service,
 )
-
+from deepresearch_agent.schemas import Source
+from deepresearch_agent.search import MockSearchAdapter, SearchService
+from deepresearch_agent.search import FetchedPage
 
 class FakeResponse:
     def __init__(self, payload: dict[str, Any] | str) -> None:
         if isinstance(payload, str):
             self.payload = payload.encode("utf-8")
+            self.headers = {"Content-Type": "text/plain; charset=utf-8"}
         else:
             self.payload = json.dumps(payload).encode("utf-8")
+            self.headers = {"Content-Type": "application/json; charset=utf-8"}
+        self.status = 200
+        self.offset = 0
 
     def __enter__(self):
         return self
@@ -33,8 +42,131 @@ class FakeResponse:
     def __exit__(self, exc_type, exc, tb) -> None:
         return None
 
-    def read(self) -> bytes:
-        return self.payload
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = len(self.payload) - self.offset
+        chunk = self.payload[self.offset : self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
+    def close(self) -> None:
+        return None
+
+
+def test_bing_rss_adapter_parses_search_snippets(monkeypatch) -> None:
+    rss = '''<?xml version="1.0" encoding="utf-8"?>
+    <rss><channel><item><title>Official release</title>
+    <link>https://example.com/release</link>
+    <description>Version 3.14.6 is the latest stable release.</description>
+    <pubDate>Mon, 13 Jul 2026 00:00:00 GMT</pubDate></item></channel></rss>'''
+    response = FakeResponse(rss)
+    response.headers = {"Content-Type": "application/rss+xml; charset=utf-8"}
+    monkeypatch.setattr("deepresearch_agent.search.urlopen", lambda *args, **kwargs: response)
+
+    rows = asyncio.run(
+        BingRssSearchAdapter(base_url="https://global.bing.com/search").search(
+            "Python latest stable release", 3, 1.0
+        )
+    )
+
+    assert rows[0].url == "https://example.com/release"
+    assert rows[0].metadata["snippet_only"] is True
+    assert rows[0].metadata["search_indexed_at"].startswith("Mon")
+    assert "published_at" not in rows[0].metadata
+
+
+def test_bing_rss_uses_direct_official_domain_when_site_filter_is_ignored(
+    monkeypatch,
+) -> None:
+    rss = '''<?xml version="1.0" encoding="utf-8"?>
+    <rss><channel><item><title>Unrelated downloads</title>
+    <link>https://unrelated.example/downloads</link>
+    <description>Windows downloads.</description></item></channel></rss>'''
+    response = FakeResponse(rss)
+    response.headers = {"Content-Type": "application/rss+xml; charset=utf-8"}
+    monkeypatch.setattr("deepresearch_agent.search.urlopen", lambda *args, **kwargs: response)
+
+    rows = asyncio.run(
+        BingRssSearchAdapter().search(
+            "site:python.org downloads latest stable Python version", 5, 1.0
+        )
+    )
+
+    assert [row.url for row in rows] == [
+        "https://python.org/",
+        "https://python.org/downloads/",
+    ]
+    assert all(row.metadata["direct_domain_fallback"] for row in rows)
+
+
+class _BenchmarkLeakAdapter:
+    name = "leak-fixture"
+
+    async def search(self, query: str, max_results: int, timeout: float) -> list[Source]:
+        del max_results, timeout
+        return [
+            Source(
+                title="SimpleQA answer key",
+                url="https://github.com/example/simpleqa/data.jsonl",
+                content=f'{{"query": "{query}", "reference_answer": "leaked"}}',
+                provider=self.name,
+                query=query,
+                metadata={"extract_status": "ok", "snippet_only": False},
+            )
+        ]
+
+
+class _LegitimateGitHubDocsAdapter:
+    name = "github-docs"
+
+    async def search(self, query: str, max_results: int, timeout: float) -> list[Source]:
+        del max_results, timeout
+        return [
+            Source(
+                title="FastAPI documentation",
+                url="https://github.com/tiangolo/fastapi/blob/master/README.md",
+                content="FastAPI documentation and release notes.",
+                provider=self.name,
+                query=query,
+                metadata={"extract_status": "ok", "snippet_only": False},
+            )
+        ]
+
+
+def test_benchmark_source_exclusion_blocks_known_answer_key_paths() -> None:
+    service = SearchService(
+        primary=_BenchmarkLeakAdapter(),
+        fallback=MockSearchAdapter(),
+        settings=Settings(
+            benchmark_source_exclusion=True,
+            local_retrieval_mode="none",
+        ),
+        fallback_policy="fail",
+    )
+
+    with pytest.raises(BenchmarkContaminationError, match="benchmark contamination"):
+        asyncio.run(service.search("What year was San Carlos founded?", max_results=1))
+
+
+def test_benchmark_source_exclusion_keeps_non_benchmark_github_docs() -> None:
+    service = SearchService(
+        primary=_LegitimateGitHubDocsAdapter(),
+        fallback=MockSearchAdapter(),
+        settings=Settings(
+            benchmark_source_exclusion=True,
+            local_retrieval_mode="none",
+        ),
+        fallback_policy="fail",
+    )
+
+    outcome = asyncio.run(service.search("FastAPI documentation", max_results=1))
+
+    assert outcome.sources[0].title == "FastAPI documentation"
+
+
+def _public_getaddrinfo(host: str, port: int, **kwargs: Any) -> list[tuple[Any, ...]]:
+    del host, kwargs
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
 
 
 class StubCrawler:
@@ -43,6 +175,56 @@ class StubCrawler:
     async def crawl(self, url: str, timeout: float) -> str:
         del timeout
         return f"Full crawled content from {url} about citation grounding."
+
+
+class RedirectingCrawler:
+    name = "redirecting"
+
+    async def crawl(self, url: str, timeout: float) -> FetchedPage:
+        del timeout
+        return FetchedPage(
+            content="Canonical body about citation grounding.",
+            final_url="https://example.com/canonical",
+            redirect_chain=(url, "https://example.com/canonical"),
+        )
+
+
+class _TwoAliasAdapter:
+    name = "aliases"
+
+    async def search(self, query: str, max_results: int, timeout: float) -> list[Source]:
+        del max_results, timeout
+        return [
+            Source(
+                title="Alias A",
+                url="https://example.com/alias-a",
+                content="snippet",
+                provider=self.name,
+                query=query,
+            ),
+            Source(
+                title="Alias B",
+                url="https://example.com/alias-b",
+                content="snippet",
+                provider=self.name,
+                query=query,
+            ),
+        ]
+
+
+def test_crawler_uses_final_redirect_url_for_source_provenance() -> None:
+    service = SearchService(
+        primary=_TwoAliasAdapter(),
+        fallback=MockSearchAdapter(),
+        settings=Settings(local_retrieval_mode="none"),
+        crawler=RedirectingCrawler(),
+        fallback_policy="fail",
+    )
+
+    outcome = asyncio.run(service.search("citation grounding", max_results=2))
+
+    assert {source.url for source in outcome.sources} == {"https://example.com/canonical"}
+    assert all(source.metadata["redirect_chain"][-1] == source.url for source in outcome.sources)
 
 
 def test_searxng_adapter_uses_crawler_content(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -89,6 +271,10 @@ def test_searxng_requires_base_url() -> None:
 def test_jina_reader_crawler_prefixes_target_url(monkeypatch: pytest.MonkeyPatch) -> None:
     requested_urls: list[str] = []
     monkeypatch.delenv("JINA_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "deepresearch_agent.url_policy.socket.getaddrinfo",
+        _public_getaddrinfo,
+    )
 
     def fake_urlopen(request, timeout):
         del timeout
@@ -106,6 +292,10 @@ def test_jina_reader_crawler_prefixes_target_url(monkeypatch: pytest.MonkeyPatch
 
 def test_html_text_crawler_strips_script_and_style(monkeypatch: pytest.MonkeyPatch) -> None:
     requested_urls: list[str] = []
+    monkeypatch.setattr(
+        "deepresearch_agent.url_policy.socket.getaddrinfo",
+        _public_getaddrinfo,
+    )
 
     def fake_urlopen(request, timeout):
         del timeout
@@ -137,12 +327,35 @@ def test_html_text_crawler_strips_script_and_style(monkeypatch: pytest.MonkeyPat
     assert "display:none" not in content
 
 
-def test_jina_search_adapter_parses_json_results(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("JINA_API_KEY", raising=False)
+def test_jina_reader_rejects_private_target_before_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_urls: list[str] = []
 
     def fake_urlopen(request, timeout):
         del timeout
-        assert request.full_url == "https://s.jina.ai/agent+observability"
+        requested_urls.append(request.full_url)
+        return FakeResponse("must not be reached")
+
+    monkeypatch.setattr("deepresearch_agent.search.urlopen", fake_urlopen)
+    crawler = JinaReaderCrawler(base_url="https://r.jina.ai/")
+
+    with pytest.raises(SearchError, match="non-global"):
+        asyncio.run(crawler.crawl("http://169.254.169.254/latest/meta-data/", timeout=1.0))
+
+    assert requested_urls == []
+
+
+def test_jina_search_adapter_parses_json_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("JINA_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "deepresearch_agent.url_policy.socket.getaddrinfo",
+        _public_getaddrinfo,
+    )
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        assert request.full_url == "https://s.jina.ai/agent%20observability"
         return FakeResponse(
             {
                 "data": [
@@ -163,6 +376,50 @@ def test_jina_search_adapter_parses_json_results(monkeypatch: pytest.MonkeyPatch
     assert sources[0].provider == "jina"
     assert sources[0].url == "https://example.com/trace"
     assert "per-stage cost" in sources[0].content
+
+
+def test_jina_search_drops_api_key_on_cross_origin_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RedirectResponse(FakeResponse):
+        def __init__(self) -> None:
+            super().__init__("")
+            self.status = 302
+            self.headers = {"Location": "https://other.example/results"}
+
+    monkeypatch.setenv("JINA_API_KEY", "jina-test-key")
+    monkeypatch.setattr(
+        "deepresearch_agent.url_policy.socket.getaddrinfo",
+        _public_getaddrinfo,
+    )
+    requests = []
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        requests.append(request)
+        if len(requests) == 1:
+            return RedirectResponse()
+        return FakeResponse(
+            {
+                "data": [
+                    {
+                        "title": "Result",
+                        "url": "https://example.com/result",
+                        "content": "Safe search result.",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("deepresearch_agent.search.urlopen", fake_urlopen)
+    adapter = JinaSearchAdapter(base_url="https://s.jina.ai/", max_chars=200)
+
+    sources = asyncio.run(adapter.search("safe query", max_results=1, timeout=1.0))
+
+    assert sources[0].title == "Result"
+    assert len(requests) == 2
+    assert requests[0].get_header("Authorization") == "Bearer jina-test-key"
+    assert requests[1].get_header("Authorization") is None
 
 
 def test_brave_search_adapter_parses_web_results(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -38,6 +38,7 @@ class ResearchRequest(BaseModel):
     deadline_seconds: float | None = Field(default=None, gt=0, le=3600)
     min_evidence_items: int = Field(default=1, ge=1, le=50)
     fallback_policy: Literal["mock", "degraded", "fail"] | None = None
+    expected_format: Literal["text", "markdown", "json"] = "markdown"
 
     def research_budget(self) -> ResearchBudget:
         return ResearchBudget(
@@ -54,6 +55,7 @@ class ResearchBrief(BaseModel):
     scope: str
     constraints: list[str]
     assumptions: list[str]
+    expected_format: Literal["text", "markdown", "json"] = "markdown"
     generated_at: datetime = Field(default_factory=utc_now)
 
 
@@ -61,6 +63,7 @@ class SubQuestion(BaseModel):
     id: str
     question: str
     rationale: str
+    search_query: str | None = None
 
 
 class Source(BaseModel):
@@ -167,6 +170,8 @@ class CostRecord(BaseModel):
     input_tokens: int
     output_tokens: int
     estimated_cost_usd: float
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
 
 
 class CostSummary(BaseModel):
@@ -175,6 +180,8 @@ class CostSummary(BaseModel):
     total_tokens: int
     total_estimated_cost_usd: float
     records: list[CostRecord]
+    total_cache_creation_input_tokens: int = 0
+    total_cache_read_input_tokens: int = 0
 
 
 class TraceEvent(BaseModel):

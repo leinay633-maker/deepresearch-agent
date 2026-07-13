@@ -7,21 +7,47 @@ import json
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any, Awaitable, Callable, Protocol
-from urllib.parse import quote_plus, urlencode
+from urllib.parse import quote, quote_plus, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from deepresearch_agent.config import Settings
+from deepresearch_agent.gateway_search import (
+    GatewayWebSearchAdapter,
+    GatewayWebSearchNoResultsError,
+)
 from deepresearch_agent.mcp_tools import McpServerConfig, McpToolSearchAdapter, build_mcp_client
 from deepresearch_agent.schemas import Source
 from deepresearch_agent.text_utils import tokenize
+from deepresearch_agent.url_policy import (
+    DEFAULT_MAX_RESPONSE_BYTES,
+    fetch_text_url,
+    no_redirect_urlopen,
+    validate_url,
+)
+
+
+_DEFAULT_URLOPEN = urlopen
 
 
 class SearchError(RuntimeError):
     pass
+
+
+class BenchmarkContaminationError(SearchError):
+    """A public benchmark answer page was discovered during an evaluation run."""
+
+
+def _crawler_urlopen(request: Request, timeout: float) -> Any:
+    """Use a non-redirecting transport while retaining test opener injection."""
+
+    if urlopen is _DEFAULT_URLOPEN:
+        return no_redirect_urlopen(request, timeout=timeout)
+    return urlopen(request, timeout=timeout)
 
 
 class SearchAdapter(Protocol):
@@ -46,6 +72,33 @@ class SearchOutcome:
     degraded: bool = False
     error: str | None = None
     tool_attempts: int = 0
+
+
+class FetchedPage(str):
+    """Crawler text with canonical redirect provenance.
+
+    It intentionally behaves as ``str`` so third-party crawler callers and
+    existing adapters can continue to use ordinary string operations.
+    """
+
+    final_url: str
+    redirect_chain: tuple[str, ...]
+
+    def __new__(
+        cls,
+        content: str,
+        *,
+        final_url: str,
+        redirect_chain: tuple[str, ...] = (),
+    ) -> "FetchedPage":
+        result = super().__new__(cls, content)
+        result.final_url = final_url
+        result.redirect_chain = redirect_chain
+        return result
+
+    @property
+    def content(self) -> str:
+        return str(self)
 
 
 class MockSearchAdapter:
@@ -183,12 +236,163 @@ class WikipediaSearchAdapter:
         return sources
 
 
+class BingRssSearchAdapter:
+    """No-key candidate URL discovery for personal/demo use.
+
+    Bing RSS descriptions are search snippets, not source publication dates or
+    full evidence. A configured crawler should fetch the result pages before
+    synthesis when evidence-grade content is required.
+    """
+
+    name = "bing"
+
+    def __init__(
+        self,
+        base_url: str = "https://global.bing.com/search",
+        max_chars: int = 4000,
+    ) -> None:
+        self.base_url = base_url
+        self.max_chars = max_chars
+
+    async def search(self, query: str, max_results: int, timeout: float) -> list[Source]:
+        return await asyncio.to_thread(self._search_sync, query, max_results, timeout)
+
+    def _search_sync(self, query: str, max_results: int, timeout: float) -> list[Source]:
+        errors: list[str] = []
+        candidates = _bing_query_candidates(query)
+        for request_attempt, candidate in enumerate(candidates, 1):
+            try:
+                sources = self._search_once(
+                    candidate,
+                    query,
+                    max_results,
+                    timeout,
+                    request_attempt,
+                )
+            except SearchError as exc:
+                errors.append(str(exc))
+                continue
+            if sources:
+                return sources
+        error = SearchError("; ".join(errors) or "bing RSS returned no parseable results")
+        error.request_attempts = max(len(candidates), 1)  # type: ignore[attr-defined]
+        raise error
+
+    def _search_once(
+        self,
+        search_query: str,
+        original_query: str,
+        max_results: int,
+        timeout: float,
+        request_attempt: int,
+    ) -> list[Source]:
+        params = urlencode(
+            {
+                "q": search_query,
+                "format": "rss",
+                "setlang": "en-us",
+                "cc": "us",
+            }
+        )
+        separator = "&" if "?" in self.base_url else "?"
+        try:
+            raw = fetch_text_url(
+                f"{self.base_url}{separator}{params}",
+                timeout=timeout,
+                headers={
+                    "Accept": "application/rss+xml, application/xml, text/xml",
+                    "User-Agent": "deepresearch-agent/0.1 local interview project",
+                },
+                opener=_crawler_urlopen,
+            )
+            root = ET.fromstring(raw)
+        except Exception as exc:  # pragma: no cover - depends on live network
+            raise SearchError(str(exc)) from exc
+
+        query_terms = _tokens(search_query)
+        sources: list[Source] = []
+        for index, item in enumerate(root.findall("./channel/item")[:max_results]):
+            title = html.unescape((item.findtext("title") or "").strip())
+            url = (item.findtext("link") or "").strip()
+            description = _normalize_content(item.findtext("description") or "", self.max_chars)
+            if not title or not url:
+                continue
+            overlap = len(query_terms & _tokens(f"{title} {description}"))
+            rank_bonus = max_results - index
+            sources.append(
+                Source(
+                    title=title,
+                    url=url,
+                    content=description or title,
+                    provider=self.name,
+                    query=original_query,
+                    score=float(overlap * 8 + rank_bonus),
+                    metadata={
+                        "search_api": "bing_rss",
+                        "search_query": search_query,
+                        "provider_request_attempts": request_attempt,
+                        "snippet_only": True,
+                        "extract_status": "snippet",
+                        "content_type": "text/plain",
+                        # RSS pubDate is Bing's crawl/index timestamp, not the
+                        # page's publication date, so do not map it to published_at.
+                        "search_indexed_at": item.findtext("pubDate"),
+                    },
+                )
+            )
+        if not sources:
+            raise SearchError(f"bing RSS returned no results for query: {search_query}")
+        requested_domain = _query_domain(search_query)
+        if requested_domain:
+            domain_sources = [
+                source
+                for source in sources
+                if (urlsplit(source.url).hostname or "").lower().removeprefix("www.")
+                == requested_domain.removeprefix("www.")
+            ]
+            if domain_sources:
+                return domain_sources
+            direct_urls = [f"https://{requested_domain}/"]
+            if re.search(r"\bdownloads?\b", search_query, flags=re.I):
+                direct_urls.append(f"https://{requested_domain}/downloads/")
+            return [
+                Source(
+                    title=f"{requested_domain} official site",
+                    url=url,
+                    content=(
+                        "Direct official-domain fallback generated from the validated "
+                        "search query; fetch the page body before using it as evidence."
+                    ),
+                    provider=self.name,
+                    query=original_query,
+                    score=float(100 - index),
+                    metadata={
+                        "search_api": "bing_rss",
+                        "search_query": search_query,
+                        "provider_request_attempts": request_attempt,
+                        "direct_domain_fallback": True,
+                        "snippet_only": True,
+                        "extract_status": "snippet",
+                        "content_type": "text/plain",
+                    },
+                )
+                for index, url in enumerate(dict.fromkeys(direct_urls))
+            ]
+        return sources
+
+
 class JinaReaderCrawler:
     name = "jina_reader"
 
-    def __init__(self, base_url: str = "https://r.jina.ai/", max_chars: int = 4000) -> None:
+    def __init__(
+        self,
+        base_url: str = "https://r.jina.ai/",
+        max_chars: int = 4000,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+    ) -> None:
         self.base_url = base_url.rstrip("/") + "/"
         self.max_chars = max_chars
+        self.max_response_bytes = max_response_bytes
 
     async def crawl(self, url: str, timeout: float) -> str:
         return await asyncio.to_thread(self._crawl_sync, url, timeout)
@@ -198,13 +402,19 @@ class JinaReaderCrawler:
         api_key = os.environ.get("JINA_API_KEY")
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        request = Request(
-            f"{self.base_url}{url}",
-            headers=headers,
-        )
         try:
-            with urlopen(request, timeout=timeout) as response:
-                text = response.read().decode("utf-8", errors="replace")
+            # Validate the raw target before encoding it into the Reader URL;
+            # validating only the outer r.jina.ai URL would leave a server-side
+            # fetch primitive for private and metadata addresses.
+            validate_url(url)
+            encoded_target = quote(url, safe=":/?&=%")
+            text = fetch_text_url(
+                f"{self.base_url}{encoded_target}",
+                timeout=timeout,
+                headers=headers,
+                max_response_bytes=self.max_response_bytes,
+                opener=_crawler_urlopen,
+            )
         except Exception as exc:  # pragma: no cover - depends on live network
             raise SearchError(str(exc)) from exc
         return _normalize_content(text, self.max_chars)
@@ -213,36 +423,49 @@ class JinaReaderCrawler:
 class HtmlTextCrawler:
     name = "html"
 
-    def __init__(self, max_chars: int = 4000) -> None:
+    def __init__(
+        self,
+        max_chars: int = 4000,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+    ) -> None:
         self.max_chars = max_chars
+        self.max_response_bytes = max_response_bytes
 
     async def crawl(self, url: str, timeout: float) -> str:
         return await asyncio.to_thread(self._crawl_sync, url, timeout)
 
-    def _crawl_sync(self, url: str, timeout: float) -> str:
-        request = Request(
-            url,
-            headers={"User-Agent": "deepresearch-agent/0.1 local interview project"},
-        )
+    def _crawl_sync(self, url: str, timeout: float) -> FetchedPage:
         try:
-            with urlopen(request, timeout=timeout) as response:
-                charset = None
-                if getattr(response, "headers", None) is not None:
-                    charset = response.headers.get_content_charset()
-                raw = response.read().decode(charset or "utf-8", errors="replace")
+            response = fetch_text_url(
+                url,
+                timeout=timeout,
+                headers={"User-Agent": "deepresearch-agent/0.1 local interview project"},
+                max_response_bytes=self.max_response_bytes,
+                opener=_crawler_urlopen,
+            )
         except Exception as exc:  # pragma: no cover - depends on live network
             raise SearchError(str(exc)) from exc
         parser = _HtmlTextParser()
-        parser.feed(raw)
-        return _normalize_content(parser.text(), self.max_chars)
+        parser.feed(response)
+        return FetchedPage(
+            content=_normalize_content(parser.text(), self.max_chars),
+            final_url=getattr(response, "final_url", url),
+            redirect_chain=tuple(getattr(response, "redirect_chain", (url,))),
+        )
 
 
 class JinaSearchAdapter:
     name = "jina"
 
-    def __init__(self, base_url: str = "https://s.jina.ai/", max_chars: int = 4000) -> None:
+    def __init__(
+        self,
+        base_url: str = "https://s.jina.ai/",
+        max_chars: int = 4000,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+    ) -> None:
         self.base_url = base_url.rstrip("/") + "/"
         self.max_chars = max_chars
+        self.max_response_bytes = max_response_bytes
 
     async def search(self, query: str, max_results: int, timeout: float) -> list[Source]:
         return await asyncio.to_thread(self._search_sync, query, max_results, timeout)
@@ -255,13 +478,19 @@ class JinaSearchAdapter:
         api_key = os.environ.get("JINA_API_KEY")
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        request = Request(
-            f"{self.base_url}{quote_plus(query)}",
-            headers=headers,
-        )
         try:
-            with urlopen(request, timeout=timeout) as response:
-                raw = response.read().decode("utf-8", errors="replace")
+            # The token-bearing search request uses the same explicit
+            # redirect and SSRF policy as Jina Reader.  In particular, a 3xx
+            # to another origin must never receive JINA_API_KEY.
+            raw = str(
+                fetch_text_url(
+                    f"{self.base_url}{quote(query)}",
+                    timeout=timeout,
+                    headers=headers,
+                    max_response_bytes=self.max_response_bytes,
+                    opener=_crawler_urlopen,
+                )
+            )
         except Exception as exc:  # pragma: no cover - depends on live network
             raise SearchError(str(exc)) from exc
         rows = _jina_rows(raw)
@@ -279,7 +508,11 @@ class JinaSearchAdapter:
             query=query,
             max_results=max_results,
             max_chars=self.max_chars,
-            metadata={"search_api": "jina_search"},
+            metadata={
+                "search_api": "jina_search",
+                "snippet_only": False,
+                "extract_status": "ok",
+            },
         )
         if not sources:
             raise SearchError("jina search returned no results")
@@ -568,6 +801,12 @@ class SearchService:
         self.fallback_policy = fallback_policy.strip().lower()
         if self.fallback_policy not in {"mock", "degraded", "fail"}:
             raise ValueError(f"unknown fallback policy: {fallback_policy}")
+        self.gateway_chain = self.primary.name == "gateway-web"
+        self.benchmark_source_exclusion = settings.benchmark_source_exclusion
+        if self.gateway_chain and self.crawler is None:
+            raise ValueError("gateway-web requires a configured safe web crawler")
+        if self.gateway_chain and self.fallback.name == "mock":
+            raise ValueError("gateway-web requires a real non-mock fallback provider")
         self.breaker = CircuitBreaker(
             settings.circuit_breaker_failure_threshold,
             settings.circuit_breaker_cooldown_seconds,
@@ -575,7 +814,8 @@ class SearchService:
 
     async def search(self, query: str, max_results: int) -> SearchOutcome:
         if self.primary.name == self.fallback.name:
-            sources = await self.fallback.search(query, max_results, self.settings.request_timeout_seconds)
+            request_timeout = self._primary_timeout_seconds()
+            sources = await self.fallback.search(query, max_results, request_timeout)
             return SearchOutcome(
                 sources=enrich_source_metadata(sources),
                 provider=self.fallback.name,
@@ -585,25 +825,28 @@ class SearchService:
         last_error: str | None = None
         tool_attempts = 0
         if self.breaker.allow():
-            for attempt in range(self.settings.max_retries + 1):
+            request_timeout = self._primary_timeout_seconds()
+            service_attempts = 1 if self.gateway_chain else self.settings.max_retries + 1
+            for attempt in range(service_attempts):
                 try:
                     await self.rate_limiter.wait()
                     tool_attempts += 1
                     sources = await asyncio.wait_for(
-                        self.primary.search(query, max_results, self.settings.request_timeout_seconds),
-                        timeout=self.settings.request_timeout_seconds + 0.5,
+                        self.primary.search(query, max_results, request_timeout),
+                        timeout=request_timeout + 0.5,
                     )
                     if not sources:
                         raise SearchError(f"{self.primary.name} returned no results")
+                    self._raise_if_benchmark_contaminated(sources, query=query)
+                    tool_attempts += self._provider_extra_attempts(sources)
                     self.breaker.record_success()
                     tool_attempts += self._crawl_attempt_count(sources)
                     sources = await self._crawl_sources(sources)
-                    crawl_errors = [
-                        str(source.metadata.get("degrade_reason"))
-                        for source in sources
-                        if source.metadata.get("extract_status") == "crawl_failed"
-                        and source.metadata.get("degrade_reason")
-                    ]
+                    self._raise_if_benchmark_contaminated(sources, query=query)
+                    sources, crawl_errors = self._evidence_ready_sources(
+                        sources,
+                        provider=self.primary.name,
+                    )
                     if crawl_errors:
                         error = "; ".join(dict.fromkeys(crawl_errors))
                         extracted_sources = [
@@ -629,14 +872,29 @@ class SearchService:
                         provider=self.primary.name,
                         tool_attempts=tool_attempts,
                     )
+                except BenchmarkContaminationError:
+                    # A benchmark answer page is not an ordinary transient search
+                    # failure. Do not silently fall through to another provider and
+                    # score the case as though retrieval were clean.
+                    raise
                 except Exception as exc:
                     last_error = str(exc)
+                    tool_attempts += self._exception_extra_attempts(exc)
                     self.breaker.record_failure()
-                    if attempt < self.settings.max_retries:
+                    if isinstance(exc, GatewayWebSearchNoResultsError):
+                        break
+                    if attempt < service_attempts - 1:
                         await self._retry_backoff(attempt)
         else:
             last_error = "circuit breaker open"
 
+        if self.fallback.name != "mock":
+            return await self._search_real_fallback(
+                query,
+                max_results,
+                primary_error=last_error,
+                tool_attempts=tool_attempts,
+            )
         if self.fallback_policy == "fail":
             raise SearchError(last_error or f"{self.primary.name} search failed")
         if self.fallback_policy == "degraded":
@@ -664,6 +922,157 @@ class SearchService:
             tool_attempts=tool_attempts,
         )
 
+    async def _search_real_fallback(
+        self,
+        query: str,
+        max_results: int,
+        *,
+        primary_error: str | None,
+        tool_attempts: int,
+    ) -> SearchOutcome:
+        fallback_error: str | None = None
+        try:
+            await self.rate_limiter.wait()
+            tool_attempts += 1
+            timeout = self.settings.request_timeout_seconds
+            fallback_sources = await asyncio.wait_for(
+                self.fallback.search(query, max_results, timeout),
+                timeout=timeout + 0.5,
+            )
+            if not fallback_sources:
+                raise SearchError(f"{self.fallback.name} returned no results")
+            self._raise_if_benchmark_contaminated(fallback_sources, query=query)
+            tool_attempts += self._provider_extra_attempts(fallback_sources)
+            tool_attempts += self._crawl_attempt_count(fallback_sources)
+            fallback_sources = await self._crawl_sources(fallback_sources)
+            self._raise_if_benchmark_contaminated(fallback_sources, query=query)
+            fallback_sources, crawl_errors = self._evidence_ready_sources(
+                fallback_sources,
+                provider=self.fallback.name,
+            )
+            fallback_error = "; ".join(dict.fromkeys(crawl_errors)) or None
+            audit_error = "; ".join(
+                item
+                for item in (
+                    f"{self.primary.name}: {primary_error}" if primary_error else None,
+                    f"{self.fallback.name}: {fallback_error}" if fallback_error else None,
+                )
+                if item
+            )
+            marked_sources = []
+            for source in fallback_sources:
+                metadata = {
+                    **source.metadata,
+                    "fallback_used": True,
+                    "fallback_from": self.primary.name,
+                    "fallback_provider": self.fallback.name,
+                    "fallback_search_attempts": int(
+                        source.metadata.get("provider_request_attempts") or 1
+                    ),
+                    "primary_error": primary_error,
+                }
+                marked_sources.append(source.model_copy(update={"metadata": metadata}))
+            return SearchOutcome(
+                sources=enrich_source_metadata(
+                    marked_sources,
+                    fallback_used=True,
+                    degrade_reason=audit_error or None,
+                ),
+                provider=self.fallback.name,
+                fallback_used=True,
+                degraded=bool(fallback_error),
+                error=audit_error or None,
+                tool_attempts=tool_attempts,
+            )
+        except BenchmarkContaminationError:
+            raise
+        except Exception as exc:
+            tool_attempts += self._exception_extra_attempts(exc)
+            fallback_error = str(exc)
+
+        combined_error = "; ".join(
+            item
+            for item in (
+                f"{self.primary.name}: {primary_error}" if primary_error else None,
+                f"{self.fallback.name}: {fallback_error}" if fallback_error else None,
+            )
+            if item
+        )
+        if self.fallback_policy == "degraded":
+            return SearchOutcome(
+                sources=[],
+                provider=self.fallback.name,
+                fallback_used=True,
+                degraded=True,
+                error=combined_error or None,
+                tool_attempts=tool_attempts,
+            )
+        raise SearchError(combined_error or "real search providers failed")
+
+    def _provider_extra_attempts(self, sources: list[Source]) -> int:
+        attempts = [
+            source.metadata.get("provider_request_attempts")
+            for source in sources
+            if source.metadata.get("provider_request_attempts") is not None
+        ]
+        parsed = [int(value) for value in attempts if str(value).isdigit()]
+        return max(max(parsed, default=1) - 1, 0)
+
+    def _raise_if_benchmark_contaminated(
+        self,
+        sources: list[Source],
+        *,
+        query: str,
+    ) -> None:
+        if not self.benchmark_source_exclusion:
+            return
+        for source in sources:
+            reason = _benchmark_contamination_reason(source, query=query)
+            if reason:
+                raise BenchmarkContaminationError(
+                    f"benchmark contamination blocked: {reason}"
+                )
+
+    @staticmethod
+    def _exception_extra_attempts(error: Exception) -> int:
+        attempts = getattr(error, "request_attempts", 1)
+        try:
+            return max(int(attempts) - 1, 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _evidence_ready_sources(
+        self,
+        sources: list[Source],
+        *,
+        provider: str,
+    ) -> tuple[list[Source], list[str]]:
+        crawl_errors = [
+            str(source.metadata.get("degrade_reason"))
+            for source in sources
+            if source.metadata.get("extract_status") == "crawl_failed"
+            and source.metadata.get("degrade_reason")
+        ]
+        requires_crawl = self.gateway_chain and provider in {
+            self.primary.name,
+            self.fallback.name,
+        }
+        if not requires_crawl:
+            return sources, crawl_errors
+        evidence_ready = [
+            source
+            for source in sources
+            if source.metadata.get("extract_status") == "ok"
+            and source.metadata.get("snippet_only") is False
+            and source.metadata.get("crawler") not in {None, "", "none"}
+        ]
+        if not evidence_ready:
+            detail = "; ".join(dict.fromkeys(crawl_errors)) or "no page body was extracted"
+            raise SearchError(
+                f"{provider} returned only unverified candidates; safe crawl required: {detail}"
+            )
+        return evidence_ready, crawl_errors
+
     def _crawl_attempt_count(self, sources: list[Source]) -> int:
         if self.crawler is None:
             return 0
@@ -674,6 +1083,12 @@ class SearchService:
             and source.url.startswith(("http://", "https://"))
             and source.metadata.get("crawler") in {None, "", "none"}
         )
+
+    def _primary_timeout_seconds(self) -> float:
+        timeout = getattr(self.primary, "timeout_seconds", None)
+        if isinstance(timeout, (int, float)) and timeout > 0:
+            return float(timeout)
+        return self.settings.request_timeout_seconds
 
     async def _crawl_sources(self, sources: list[Source]) -> list[Source]:
         if self.crawler is None:
@@ -690,20 +1105,38 @@ class SearchService:
             metadata.setdefault("search_snippet", source.content)
             metadata["crawler"] = self.crawler.name
             try:
-                content = await self.crawler.crawl(
+                crawled = await self.crawler.crawl(
                     source.url,
                     self.settings.request_timeout_seconds,
                 )
+                if isinstance(crawled, FetchedPage):
+                    content = crawled.content
+                    final_url = crawled.final_url
+                    redirect_chain = crawled.redirect_chain
+                else:
+                    content = str(crawled)
+                    final_url = source.url
+                    redirect_chain = (source.url,)
                 if not content.strip():
                     raise SearchError("crawler returned empty content")
+                # The fetcher validated each redirect target. Preserve the final
+                # canonical URL so evidence, deduplication and diversity metrics
+                # do not count several aliases as independent pages.
+                validate_url(final_url)
                 metadata.update(
                     {
                         "extract_status": "ok",
                         "content_type": "text/plain",
                         "snippet_only": False,
+                        "candidate_only": False,
+                        "requires_crawl": False,
+                        "verification_status": "crawled",
+                        "redirect_chain": list(redirect_chain),
                     }
                 )
-                return source.model_copy(update={"content": content, "metadata": metadata})
+                return source.model_copy(
+                    update={"url": final_url, "content": content, "metadata": metadata}
+                )
             except Exception as exc:  # noqa: BLE001 - crawler errors degrade to the snippet.
                 metadata.update(
                     {
@@ -711,6 +1144,8 @@ class SearchService:
                         "crawler_error": str(exc),
                         "degrade_reason": str(exc),
                         "snippet_only": True,
+                        "candidate_only": True,
+                        "verification_status": "crawl_failed",
                     }
                 )
                 return source.model_copy(update={"metadata": metadata})
@@ -735,10 +1170,12 @@ def enrich_source_metadata(
     for source in sources:
         web_search_provider = source.provider in {
             "wikipedia",
+            "bing",
             "searxng",
             "jina",
             "brave",
             "tavily",
+            "gateway-web",
             "mcp",
         }
         default_extract_status = "snippet" if web_search_provider else (
@@ -769,13 +1206,20 @@ def build_search_service(
     fallback_policy: str = "mock",
 ) -> SearchService:
     selected = (provider or settings.search_provider).strip().lower()
-    fallback = MockSearchAdapter()
+    crawler = build_crawler(settings)
+    if selected in {"gateway-web", "gateway_web"}:
+        fallback: SearchAdapter = BingRssSearchAdapter(
+            base_url=settings.bing_search_base_url,
+            max_chars=settings.crawler_max_chars,
+        )
+    else:
+        fallback = MockSearchAdapter()
     primary = build_search_adapter(settings, selected, fallback)
     return SearchService(
         primary=primary,
         fallback=fallback,
         settings=settings,
-        crawler=build_crawler(settings),
+        crawler=crawler,
         fallback_policy=fallback_policy,
     )
 
@@ -789,6 +1233,11 @@ def build_search_adapter(
         return fallback or MockSearchAdapter()
     if selected == "wikipedia":
         return WikipediaSearchAdapter()
+    if selected == "bing":
+        return BingRssSearchAdapter(
+            base_url=settings.bing_search_base_url,
+            max_chars=settings.crawler_max_chars,
+        )
     if selected == "searxng":
         return SearxngSearchAdapter(
             base_url=settings.searxng_base_url,
@@ -810,6 +1259,16 @@ def build_search_adapter(
             base_url=settings.tavily_search_base_url,
             search_depth=settings.tavily_search_depth,
             max_chars=settings.crawler_max_chars,
+        )
+    if selected in {"gateway-web", "gateway_web"}:
+        return GatewayWebSearchAdapter(
+            base_url=settings.llm_gateway_base_url,
+            model=settings.gateway_web_search_model,
+            max_chars=settings.crawler_max_chars,
+            timeout_seconds=settings.llm_gateway_timeout_seconds,
+            require_response_model_match=(
+                settings.llm_gateway_require_response_model_match
+            ),
         )
     if selected == "mcp":
         config = McpServerConfig(
@@ -988,6 +1447,44 @@ WIKIPEDIA_STOPWORDS = {
     "with",
 }
 
+_BENCHMARK_PATH_MARKER = re.compile(
+    r"(?:^|[/_\-.])(?:simpleqa|simple-evals?|livedrbench)(?:$|[/_\-.])",
+    re.IGNORECASE,
+)
+_BENCHMARK_ANSWER_FIELD = re.compile(
+    r"(?:\"|\b)(?:reference_?answer|ground_?truths?|expected_?answer|answers?)(?:\"|\b)\s*[:=]",
+    re.IGNORECASE,
+)
+
+
+def _benchmark_contamination_reason(source: Source, *, query: str) -> str | None:
+    """Identify known public benchmark pages before they can become evidence.
+
+    We deliberately do not block GitHub or Hugging Face broadly: legitimate
+    technical documentation remains useful. The policy targets known benchmark
+    paths, plus pages that expose a query together with answer-key fields.
+    """
+
+    parsed = urlsplit(source.url)
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    path_and_title = f"{parsed.path} {source.title}".lower()
+    if host in {
+        "github.com",
+        "raw.githubusercontent.com",
+        "huggingface.co",
+        "hf.co",
+        "datasets-server.huggingface.co",
+    } and _BENCHMARK_PATH_MARKER.search(path_and_title):
+        return "known benchmark repository or dataset path"
+
+    content = source.content.lower()
+    normalized_query = re.sub(r"\s+", " ", query.strip().lower())
+    if normalized_query and len(normalized_query) >= 16:
+        compact_content = re.sub(r"\s+", " ", content)
+        if normalized_query in compact_content and _BENCHMARK_ANSWER_FIELD.search(content):
+            return "page contains the queried prompt and benchmark answer fields"
+    return None
+
 
 def _wikipedia_query_candidates(query: str) -> list[str]:
     words = re.findall(r"[A-Za-z][A-Za-z0-9_-]+", query)
@@ -1010,3 +1507,39 @@ def _wikipedia_query_candidates(query: str) -> list[str]:
         if candidate and candidate not in deduped:
             deduped.append(candidate)
     return deduped
+
+
+def _bing_query_candidates(query: str) -> list[str]:
+    candidates = [query.strip()]
+    domain_match = re.search(r"\b(?:www\.)?([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b", query)
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9_.-]*", query)
+    keywords: list[str] = []
+    for word in words:
+        lowered = word.lower().strip(".")
+        if lowered in WIKIPEDIA_STOPWORDS or lowered in {"who", "latest", "current"}:
+            continue
+        if len(lowered) <= 2 and not lowered.isdigit():
+            continue
+        if lowered not in {item.lower() for item in keywords}:
+            keywords.append(word)
+    if keywords:
+        compact = " ".join(keywords[:10])
+        if domain_match:
+            domain = domain_match.group(1).lower()
+            compact = re.sub(rf"\b{re.escape(domain)}\b", "", compact, flags=re.I)
+            compact = f"{compact.strip()} site:{domain}"
+        candidates.append(compact)
+    quoted = re.findall(r'"([^"\n]{3,100})"', query)
+    if quoted:
+        candidates.append(" ".join(f'"{item}"' for item in quoted[:2]))
+    deduped: list[str] = []
+    for candidate in candidates:
+        normalized = re.sub(r"\s+", " ", candidate).strip()
+        if normalized and normalized not in deduped:
+            deduped.append(normalized)
+    return deduped
+
+
+def _query_domain(query: str) -> str | None:
+    match = re.search(r"(?:site:)?(?:www\.)?([A-Za-z0-9.-]+\.[A-Za-z]{2,})", query)
+    return match.group(1).lower() if match else None

@@ -14,11 +14,13 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-from deepresearch_agent.config import load_settings
+from deepresearch_agent.config import load_settings, with_request_timeout
 from deepresearch_agent.citation import CitationChecker
+from deepresearch_agent.citation_judge import HeuristicCitationJudgeProvider
 from deepresearch_agent.orchestrator import DeepResearchOrchestrator
 from deepresearch_agent.replay import (
     case_result_artifact_id,
+    citation_judge_identities,
     load_case_result_records,
     replay_case_result,
     validate_replay_case_ids,
@@ -91,26 +93,27 @@ def build_benchmark_manifest(
     normalized_replay_dir = portable_artifact_path(replay_dir, root) if replay_dir else None
     if normalized_replay_dir:
         execution_mode = "replay"
-        deterministic = True
-        determinism_reason = (
-            "benchmark snapshot replay reuses recorded case artifacts and reruns "
-            "the current deterministic evaluators"
+        generation_deterministic = True
+        generation_determinism_reason = (
+            "benchmark snapshot replay deterministically reuses recorded generation artifacts"
         )
     elif llm_provider == "mock" and search_provider == "mock":
         execution_mode = "mock"
-        deterministic = True
-        determinism_reason = "both LLM and search providers are deterministic mocks"
+        generation_deterministic = True
+        generation_determinism_reason = (
+            "both generation providers are deterministic mocks"
+        )
     elif llm_provider == "mock" or search_provider == "mock":
         execution_mode = "mixed"
-        deterministic = False
-        determinism_reason = (
+        generation_deterministic = False
+        generation_determinism_reason = (
             "the run mixes a deterministic mock with a live provider; seed and config are "
             "recorded but live output is not guaranteed deterministic"
         )
     else:
         execution_mode = "live"
-        deterministic = False
-        determinism_reason = (
+        generation_deterministic = False
+        generation_determinism_reason = (
             "the run uses at least one live provider; seed and config are recorded but "
             "provider outputs are not guaranteed deterministic"
         )
@@ -145,8 +148,13 @@ def build_benchmark_manifest(
         "manifest_id": _sha256_json(identity)[:16],
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "git_dirty": git_dirty,
-        "deterministic": deterministic,
-        "determinism_reason": determinism_reason,
+        "generation_deterministic": generation_deterministic,
+        "generation_determinism_reason": generation_determinism_reason,
+        "evaluation_deterministic": True,
+        "evaluation_determinism_reason": "no live evaluation judge is executed",
+        "evaluation_judges": [],
+        "deterministic": generation_deterministic,
+        "determinism_reason": generation_determinism_reason,
     }
 
 
@@ -240,7 +248,7 @@ def refresh_replayed_case_result(
     case: dict[str, Any],
     record: dict[str, Any],
 ) -> dict[str, Any]:
-    """Re-evaluate a stored report with the current citation/format code."""
+    """Re-evaluate a stored report without changing its citation-judge semantics."""
 
     payload = record.get("report")
     if not isinstance(payload, dict):
@@ -253,7 +261,52 @@ def refresh_replayed_case_result(
     recorded_quality = record.get("answer_quality")
     if recorded_quality is not None:
         record["recorded_answer_quality"] = recorded_quality
-    citation_check = CitationChecker().check(report.claims, report.sources)
+    recorded_citation_check = json.loads(
+        json.dumps(
+            record.get("citation_check") or report.citation_check.model_dump(mode="json"),
+            ensure_ascii=False,
+        )
+    )
+    record["recorded_citation_check"] = recorded_citation_check
+    recorded_judges = citation_judge_identities(recorded_citation_check)
+    heuristic_judge = HeuristicCitationJudgeProvider()
+    recorded_policy_replayable = all(
+        item["provider"] == heuristic_judge.name
+        and item["model"] in {None, heuristic_judge.model}
+        for item in recorded_judges
+    )
+    reproducible_judge = (
+        heuristic_judge if recorded_judges and recorded_policy_replayable else None
+    )
+    citation_check = CitationChecker().check(
+        report.claims,
+        report.sources,
+        judge_provider=reproducible_judge,
+    )
+    replayed_citation_check = citation_check.model_dump(mode="json")
+    record["replayed_citation_check"] = replayed_citation_check
+    replayed_judge = {
+        "provider": getattr(reproducible_judge, "name", "lexical"),
+        "model": getattr(reproducible_judge, "model", None),
+    }
+    policy_mismatch = bool(recorded_judges) and not recorded_policy_replayable
+    if policy_mismatch:
+        record["citation_replay"] = {
+            "status": "unscored",
+            "reason": (
+                "the recorded citation check used a non-replayable judge; the current "
+                "lexical check is diagnostic only and does not replace its scores"
+            ),
+            "recorded_judges": recorded_judges,
+            "replayed_judge": replayed_judge,
+        }
+    else:
+        record["citation_replay"] = {
+            "status": "scored",
+            "reason": "the citation check was replayed with the recorded deterministic policy",
+            "recorded_judges": recorded_judges,
+            "replayed_judge": replayed_judge,
+        }
     report_metrics = {
         **report.metrics,
         "citation_grounding": citation_check.citation_grounding,
@@ -263,17 +316,33 @@ def refresh_replayed_case_result(
         "citation_retention_rate": citation_check.retention_rate,
         "claim_extraction_valid": citation_check.claim_extraction_valid,
     }
-    report = report.model_copy(
+    replayed_report = report.model_copy(
         update={"citation_check": citation_check, "metrics": report_metrics}
     )
+    if not policy_mismatch:
+        report = replayed_report
+        record["citation_check"] = replayed_citation_check
+    else:
+        record["citation_check"] = None
     record["report"] = report.model_dump(mode="json")
-    record["citation_check"] = citation_check.model_dump(mode="json")
-    refreshed = build_case_evaluation_metrics(case, report)
+    refreshed = build_case_evaluation_metrics(case, replayed_report)
+    if policy_mismatch:
+        for key in (
+            "citation_grounding",
+            "citation_precision",
+            "citation_coverage",
+            "unsupported_claim_rate",
+            "claim_extraction_valid",
+        ):
+            refreshed[key] = None
     for key, value in refreshed.items():
         if key in {"latency_ms", "total_tokens", "estimated_cost_usd"}:
             continue
         record[key] = value
     record["metrics"] = {**(record.get("metrics") or {}), **refreshed}
+    if policy_mismatch:
+        record["citation_retention_rate"] = None
+        record["metrics"]["citation_retention_rate"] = None
     record["answer_quality"] = None
     return record
 
@@ -487,7 +556,10 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     summary_path: Path | None = None
     records = []
 
-    settings = load_settings()
+    settings = with_request_timeout(
+        load_settings(),
+        getattr(args, "request_timeout_seconds", None),
+    )
     effective_llm_model = _effective_llm_model(args, settings)
     effective_llm_provider = _normalize_llm_provider(args.llm_provider)
     stage_models = _effective_stage_models(args, settings)
@@ -518,6 +590,10 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         rerank_provider=args.rerank_provider,
         local_rerank_candidate_k=args.local_rerank_candidate_k,
         searxng_base_url=getattr(args, "searxng_base_url", None) or settings.searxng_base_url,
+        bing_search_base_url=getattr(args, "bing_search_base_url", None)
+        or settings.bing_search_base_url,
+        gateway_web_search_model=getattr(args, "gateway_web_search_model", None)
+        or settings.gateway_web_search_model,
         web_crawler_provider=getattr(args, "web_crawler_provider", None)
         or settings.web_crawler_provider,
         jina_reader_base_url=getattr(args, "jina_reader_base_url", None)
@@ -531,6 +607,9 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         openai_compatible_model=effective_llm_model
         if effective_llm_provider == "openai-compatible"
         else settings.openai_compatible_model,
+        llm_gateway_model=effective_llm_model
+        if effective_llm_provider == "llm-gateway"
+        else settings.llm_gateway_model,
         llm_brief_model=stage_models["brief_generation"] or settings.llm_brief_model,
         llm_planner_model=stage_models["planning"] or settings.llm_planner_model,
         llm_synthesis_model=stage_models["synthesis"] or settings.llm_synthesis_model,
@@ -565,6 +644,13 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "max_researchers": effective_settings.max_researchers,
         "max_results": args.max_results,
         "request_timeout_seconds": effective_settings.request_timeout_seconds,
+        "gateway_web_search_timeout_seconds": (
+            effective_settings.llm_gateway_timeout_seconds
+        ),
+        "llm_gateway_timeout_seconds": effective_settings.llm_gateway_timeout_seconds,
+        "citation_judge_timeout_seconds": (
+            effective_settings.citation_judge_timeout_seconds
+        ),
         "settings": settings_snapshot,
         "reflection_enabled": reflection_enabled,
         "max_reflection_rounds": max_reflection_rounds,
@@ -593,6 +679,8 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     mark_live_judge_nondeterminism(
         manifest,
         citation_judge_provider=effective_settings.citation_judge_provider,
+        citation_judge_model=effective_settings.citation_judge_model,
+        citation_judge_executed=not bool(getattr(args, "replay_dir", None)),
     )
     raw_path = logs_dir / f"benchmark-{timestamp}-{manifest['manifest_id']}.jsonl"
     summary_path = results_dir / "benchmarks" / manifest["manifest_id"] / "summary.json"
@@ -646,6 +734,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 deadline_seconds=deadline_seconds,
                 min_evidence_items=min_evidence_items,
                 fallback_policy=fallback_policy,
+                expected_format=case.get("expected_format") or "markdown",
             )
             try:
                 orchestrator = _benchmark_orchestrator(
@@ -744,6 +833,8 @@ def _effective_llm_model(args: argparse.Namespace, settings: Any) -> str:
         return settings.deepseek_model
     if provider == "openai-compatible":
         return settings.openai_compatible_model
+    if provider == "llm-gateway":
+        return settings.llm_gateway_model
     return settings.mock_model_name
 
 
@@ -763,24 +854,61 @@ def mark_live_judge_nondeterminism(
     manifest: dict[str, Any],
     *,
     citation_judge_provider: str | None = None,
+    citation_judge_model: str | None = None,
+    citation_judge_executed: bool = True,
     answer_judge_provider: str | None = None,
+    answer_judge_model: str | None = None,
+    answer_judge_executed: bool = True,
 ) -> None:
-    if manifest.get("execution_mode") == "replay":
-        return
-    live_judges = [
-        name
-        for name, provider in (
-            ("citation judge", citation_judge_provider),
-            ("answer judge", answer_judge_provider),
+    judges = []
+    for kind, provider, model, executed in (
+        (
+            "citation",
+            citation_judge_provider,
+            citation_judge_model,
+            citation_judge_executed,
+        ),
+        ("answer", answer_judge_provider, answer_judge_model, answer_judge_executed),
+    ):
+        normalized = (provider or "none").strip().lower()
+        if normalized in {"", "none", "off", "disabled"}:
+            continue
+        is_live = normalized in {
+            "deepseek",
+            "openai",
+            "anthropic",
+            "llm-gateway",
+            "gateway",
+        }
+        judges.append(
+            {
+                "kind": kind,
+                "provider": normalized,
+                "model": model,
+                "executed": bool(executed),
+                "deterministic": not is_live if executed else None,
+            }
         )
-        if (provider or "").strip().lower() in {"deepseek", "openai", "anthropic"}
+
+    active_live_judges = [
+        f"{item['kind']} judge"
+        for item in judges
+        if item["executed"] and item["deterministic"] is False
     ]
-    if not live_judges:
-        return
-    manifest["deterministic"] = False
-    manifest["determinism_reason"] = (
-        f"live {' and '.join(live_judges)} output is not guaranteed deterministic"
+    evaluation_deterministic = not active_live_judges
+    manifest["evaluation_judges"] = judges
+    manifest["evaluation_deterministic"] = evaluation_deterministic
+    manifest["evaluation_determinism_reason"] = (
+        f"live {' and '.join(active_live_judges)} output is not guaranteed deterministic"
+        if active_live_judges
+        else "no live evaluation judge is executed"
     )
+    generation_deterministic = bool(manifest.get("generation_deterministic"))
+    manifest["deterministic"] = generation_deterministic and evaluation_deterministic
+    reasons = [str(manifest.get("generation_determinism_reason") or "").strip()]
+    if active_live_judges:
+        reasons.append(manifest["evaluation_determinism_reason"])
+    manifest["determinism_reason"] = "; ".join(reason for reason in reasons if reason)
 
 
 def _effective_stage_models(args: argparse.Namespace, settings: Any) -> dict[str, str]:
@@ -966,7 +1094,7 @@ def _benchmark_notes(config_snapshot: dict[str, Any]) -> tuple[str, str, list[st
         ),
         [
             "latency_ms includes live network/API time and can vary across runs",
-            "DeepSeek token usage and cost come from provider usage fields when llm_provider is deepseek",
+            "Live-provider token usage comes from provider usage fields; LLM Gateway cost stays 0 because pricing is unknown",
             "Wikipedia is a real no-key adapter but not a production-grade web search provider",
             "citation_retention_rate is checked by lexical overlap, not semantic entailment",
             "success_rate is a deprecated execution-success alias, not an answer-quality score",
@@ -980,12 +1108,28 @@ def main() -> None:
     parser.add_argument("--benchmark-name", default="local_benchmark")
     parser.add_argument(
         "--search-provider",
-        choices=["mock", "wikipedia", "searxng", "jina", "brave", "tavily", "mcp"],
+        choices=[
+            "mock",
+            "wikipedia",
+            "bing",
+            "searxng",
+            "jina",
+            "brave",
+            "tavily",
+            "gateway-web",
+            "mcp",
+        ],
         default="mock",
     )
     parser.add_argument(
         "--llm-provider",
-        choices=["mock", "deepseek", "openai-compatible", "openai_compatible"],
+        choices=[
+            "mock",
+            "deepseek",
+            "openai-compatible",
+            "openai_compatible",
+            "llm-gateway",
+        ],
         default="mock",
     )
     parser.add_argument("--llm-model", default=None)
@@ -993,7 +1137,11 @@ def main() -> None:
     parser.add_argument("--planner-model", default=None)
     parser.add_argument("--synthesis-model", default=None)
     parser.add_argument("--embedding-provider", choices=["local", "dashscope"], default="local")
-    parser.add_argument("--local-retrieval-mode", choices=["keyword", "hybrid"], default="hybrid")
+    parser.add_argument(
+        "--local-retrieval-mode",
+        choices=["none", "keyword", "hybrid"],
+        default="hybrid",
+    )
     parser.add_argument("--local-keyword-top-k", type=int, default=4)
     parser.add_argument("--local-vector-top-k", type=int, default=4)
     parser.add_argument("--local-keyword-weight", type=float, default=1.0)
@@ -1003,6 +1151,8 @@ def main() -> None:
     parser.add_argument("--rerank-provider", choices=["local", "dashscope"], default="local")
     parser.add_argument("--local-rerank-candidate-k", type=int, default=6)
     parser.add_argument("--searxng-base-url", default=None)
+    parser.add_argument("--bing-search-base-url", default=None)
+    parser.add_argument("--gateway-web-search-model", default=None)
     parser.add_argument(
         "--web-crawler-provider",
         choices=["none", "jina", "jina_reader", "html"],
@@ -1014,6 +1164,15 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260606)
     parser.add_argument("--max-researchers", type=int, default=3)
     parser.add_argument("--max-results", type=int, default=4)
+    parser.add_argument(
+        "--request-timeout-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Common timeout for search/crawling, Gateway web search and LLM calls, "
+            "and citation judging. Defaults to REQUEST_TIMEOUT_SECONDS."
+        ),
+    )
     parser.add_argument("--max-rounds", type=int, default=1)
     parser.add_argument("--max-tool-calls", type=int, default=1)
     parser.add_argument("--deadline-seconds", type=float, default=None)
@@ -1029,7 +1188,7 @@ def main() -> None:
     parser.add_argument("--reflection-min-sources", type=int, default=4)
     parser.add_argument(
         "--citation-judge-provider",
-        choices=["none", "heuristic", "deepseek"],
+        choices=["none", "heuristic", "deepseek", "llm-gateway"],
         default=None,
     )
     parser.add_argument("--citation-judge-model", default=None)

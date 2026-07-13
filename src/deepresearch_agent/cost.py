@@ -92,6 +92,8 @@ class CostTracker:
         estimated_cost_usd: float,
         model: str | None = None,
         provider: str | None = None,
+        cache_creation_input_tokens: int = 0,
+        cache_read_input_tokens: int = 0,
     ) -> CostRecord:
         record = CostRecord(
             stage=stage,
@@ -100,12 +102,25 @@ class CostTracker:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             estimated_cost_usd=round(estimated_cost_usd, 8),
+            cache_creation_input_tokens=cache_creation_input_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
         )
         self.records.append(record)
         return record
 
     def summary(self) -> CostSummary:
-        input_tokens = sum(record.input_tokens for record in self.records)
+        direct_input_tokens = sum(record.input_tokens for record in self.records)
+        cache_creation_input_tokens = sum(
+            record.cache_creation_input_tokens for record in self.records
+        )
+        cache_read_input_tokens = sum(
+            record.cache_read_input_tokens for record in self.records
+        )
+        input_tokens = (
+            direct_input_tokens
+            + cache_creation_input_tokens
+            + cache_read_input_tokens
+        )
         output_tokens = sum(record.output_tokens for record in self.records)
         cost = sum(record.estimated_cost_usd for record in self.records)
         return CostSummary(
@@ -114,4 +129,6 @@ class CostTracker:
             total_tokens=input_tokens + output_tokens,
             total_estimated_cost_usd=round(cost, 8),
             records=list(self.records),
+            total_cache_creation_input_tokens=cache_creation_input_tokens,
+            total_cache_read_input_tokens=cache_read_input_tokens,
         )

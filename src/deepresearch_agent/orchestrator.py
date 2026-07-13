@@ -1,27 +1,40 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from deepresearch_agent.citation import CitationChecker, best_evidence_quote
+from deepresearch_agent.citation import (
+    CitationChecker,
+    best_evidence_quote,
+    source_is_relevant_to_claim,
+)
 from deepresearch_agent.citation_judge import build_citation_judge_provider
 from deepresearch_agent.config import Settings, load_settings
 from deepresearch_agent.cost import CostTracker
 from deepresearch_agent.dedup import SourceDeduplicator
 from deepresearch_agent.execution import ResearchExecutionEngine, is_retryable_error
+from deepresearch_agent.guardrails import safe_follow_up_query
+from deepresearch_agent.gateway_search import (
+    GatewayWebSearchUsage,
+    capture_gateway_web_search_usage,
+)
 from deepresearch_agent.llm import (
     DeepSeekLLMProvider,
+    LLMGatewayLLMProvider,
     MockLLMProvider,
     OpenAICompatibleLLMProvider,
 )
 from deepresearch_agent.rag import LocalRagRetriever
 from deepresearch_agent.report_metrics import build_execution_metrics
 from deepresearch_agent.schemas import (
+    CitationCheckReport,
     Finding,
     EvidenceItem,
+    ResearchBrief,
     ResearchRequest,
     ResearchResult,
     ResearchRoundResult,
@@ -62,6 +75,7 @@ class DeepResearchOrchestrator:
             run_id=run_id,
             trace_dir=self.settings.trace_dir,
             exporter=build_trace_exporter(self.settings),
+            write_enabled=self.settings.trace_write_enabled,
         )
         llm = self.llm_provider or self._build_llm_provider(request)
         cost = CostTracker(
@@ -87,6 +101,7 @@ class DeepResearchOrchestrator:
                 stage_start,
                 emit,
             )
+            _attach_failure_context(exc, cost=cost, trace=trace)
             raise
         await self._record(
             trace,
@@ -115,6 +130,7 @@ class DeepResearchOrchestrator:
                 stage_start,
                 emit,
             )
+            _attach_failure_context(exc, cost=cost, trace=trace)
             raise
         await self._record(
             trace,
@@ -150,11 +166,13 @@ class DeepResearchOrchestrator:
                 {"error": str(exc), "retryable": is_retryable_error(exc)},
                 emit=emit,
             )
+            _attach_failure_context(exc, cost=cost, trace=trace)
             raise
         findings = research.findings
         sources = research.sources
 
         stage_start = trace.now()
+        synthesis_context: dict[str, Any] | None = None
         try:
             answer, claims = await engine.run_synthesizer_stage(
                 brief=brief,
@@ -164,21 +182,49 @@ class DeepResearchOrchestrator:
                 llm=llm,
                 cost=cost,
             )
+            raw_synthesis_context = getattr(llm, "last_synthesis_context", None)
+            synthesis_context = (
+                raw_synthesis_context
+                if isinstance(raw_synthesis_context, dict)
+                else None
+            )
+            if (
+                self._fallback_policy(request) == "fail"
+                and isinstance(synthesis_context, dict)
+                and synthesis_context.get("synthesis_fallback")
+            ):
+                raise RuntimeError(
+                    "synthesis fallback is disallowed by fallback_policy=fail"
+                )
         except Exception as exc:
             await self._record(
                 trace,
                 "synthesizer",
                 "error",
-                {"error": str(exc), "retryable": is_retryable_error(exc)},
+                {
+                    "error": str(exc),
+                    "retryable": is_retryable_error(exc),
+                    "synthesis_fallback_reason": (
+                        str(synthesis_context.get("synthesis_fallback_reason") or "")[:500]
+                        if synthesis_context
+                        and synthesis_context.get("synthesis_fallback")
+                        else None
+                    ),
+                },
                 stage_start,
                 emit,
             )
+            _attach_failure_context(exc, cost=cost, trace=trace)
             raise
         await self._record(
             trace,
             "synthesizer",
             "success",
-            {"claim_count": len(claims), "source_count": len(sources)},
+            {
+                "claim_count": len(claims),
+                "source_count": len(sources),
+                "context": synthesis_context,
+            },
             stage_start,
             emit,
         )
@@ -200,7 +246,96 @@ class DeepResearchOrchestrator:
                 stage_start,
                 emit,
             )
+            _attach_failure_context(exc, cost=cost, trace=trace)
             raise
+
+        if citation_report.unsupported_claims:
+            await self._record(
+                trace,
+                "citation_check.initial",
+                "success",
+                citation_report.model_dump(mode="json"),
+                stage_start,
+                emit,
+            )
+            repair_synthesis = getattr(llm, "repair_synthesis", None)
+            if callable(repair_synthesis) and any(
+                assessment.evidence_quotes for assessment in citation_report.assessments
+            ):
+                repair_start = trace.now()
+                try:
+                    repaired_answer, repaired_claims = await repair_synthesis(
+                        brief,
+                        answer,
+                        citation_report,
+                        sources,
+                        cost,
+                    )
+                    repaired_report = engine.run_verifier_stage(
+                        request=request,
+                        claims=repaired_claims,
+                        sources=sources,
+                        cost=cost,
+                    )
+                    if _citation_report_is_better(repaired_report, citation_report):
+                        answer = repaired_answer
+                        claims = repaired_claims
+                        citation_report = repaired_report
+                        await self._record(
+                            trace,
+                            "synthesis_repair",
+                            "success",
+                            {
+                                "claim_count": len(claims),
+                                "citation_grounding": citation_report.citation_grounding,
+                                "unsupported_claims": citation_report.unsupported_claims,
+                            },
+                            repair_start,
+                            emit,
+                        )
+                    else:
+                        await self._record(
+                            trace,
+                            "synthesis_repair",
+                            "fallback",
+                            {
+                                "reason": "repaired answer did not improve citation grounding",
+                                "candidate_grounding": repaired_report.citation_grounding,
+                                "candidate_unsupported_claims": repaired_report.unsupported_claims,
+                            },
+                            repair_start,
+                            emit,
+                        )
+                except Exception as exc:  # noqa: BLE001 - retain the verified draft on repair failure.
+                    await self._record(
+                        trace,
+                        "synthesis_repair",
+                        "fallback",
+                        {"reason": f"{type(exc).__name__}: {str(exc)[:240]}"},
+                        repair_start,
+                        emit,
+                    )
+
+        if citation_report.unsupported_claims:
+            answer, claims, citation_report, dropped_claims = _retain_supported_claims(
+                brief,
+                citation_report,
+            )
+            await self._record(
+                trace,
+                "grounded_answer_filter",
+                "fallback",
+                {
+                    "dropped_claims": dropped_claims,
+                    "retained_claim_count": len(claims),
+                    "reason": (
+                        "removed claims that citation verification did not fully support"
+                        if claims
+                        else "all claims failed citation verification; returned an abstention"
+                    ),
+                },
+                emit=emit,
+            )
         await self._record(
             trace,
             "citation_check",
@@ -262,10 +397,26 @@ class DeepResearchOrchestrator:
                     self.settings.openai_compatible_output_cost_per_1m_tokens
                 ),
             )
-        return MockLLMProvider(
-            request.llm_model or self.settings.mock_model_name,
-            stage_models=stage_models,
-        )
+        if provider == "llm-gateway":
+            return LLMGatewayLLMProvider(
+                model=request.llm_model or self.settings.llm_gateway_model,
+                base_url=self.settings.llm_gateway_base_url,
+                timeout_seconds=self.settings.llm_gateway_timeout_seconds,
+                max_retries=self.settings.max_retries,
+                stage_models=stage_models,
+                thinking_budget_tokens=(
+                    self.settings.llm_gateway_thinking_budget_tokens
+                ),
+                require_response_model_match=(
+                    self.settings.llm_gateway_require_response_model_match
+                ),
+            )
+        if provider == "mock":
+            return MockLLMProvider(
+                request.llm_model or self.settings.mock_model_name,
+                stage_models=stage_models,
+            )
+        raise ValueError(f"unknown LLM provider: {provider}")
 
     def _stage_models(self, request: ResearchRequest) -> dict[str, str]:
         candidates = {
@@ -305,7 +456,10 @@ class DeepResearchOrchestrator:
             stage_start = trace.now()
             budget = request.research_budget()
             started_at = time.perf_counter()
-            query = subquestion.question
+            query = safe_follow_up_query(
+                subquestion.search_query or subquestion.question,
+                original_question=subquestion.question,
+            )
             tool_calls = 0
             provider_tool_attempts = 0
             raw_sources: list[Source] = []
@@ -320,6 +474,21 @@ class DeepResearchOrchestrator:
             errors: list[str] = []
             provider = search_service.primary.name
             termination_reason = "max_rounds"
+
+            def record_gateway_web_search_usage(
+                usage: GatewayWebSearchUsage,
+            ) -> None:
+                cost.add_usage(
+                    stage="gateway_web_search",
+                    provider="llm-gateway",
+                    model=usage.model,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    cache_creation_input_tokens=usage.cache_creation_input_tokens,
+                    cache_read_input_tokens=usage.cache_read_input_tokens,
+                    # Gateway pricing is unpublished; do not invent dollar cost.
+                    estimated_cost_usd=0.0,
+                )
 
             async def await_with_deadline(awaitable):
                 if budget.deadline_seconds is None:
@@ -350,7 +519,10 @@ class DeepResearchOrchestrator:
                         query,
                         max_results=request.max_results_per_researcher,
                     )
-                    outcome = await await_with_deadline(search_call)
+                    with capture_gateway_web_search_usage(
+                        record_gateway_web_search_usage
+                    ):
+                        outcome = await await_with_deadline(search_call)
                 except TimeoutError:
                     termination_reason = "deadline"
                     errors.append("research deadline exceeded")
@@ -384,6 +556,11 @@ class DeepResearchOrchestrator:
                 rag_sources.extend(round_rag_sources)
                 combined = self.deduper.dedup([*raw_sources, *rag_sources])
                 verified = self.verifier.verify(combined)
+                verified = [
+                    source
+                    for source in verified
+                    if source_is_relevant_to_claim(subquestion.question, source)
+                ]
                 evidence = self._evidence_items(subquestion.question, verified)
                 if (
                     budget.deadline_seconds is not None
@@ -449,7 +626,11 @@ class DeepResearchOrchestrator:
                 if tool_calls >= budget.max_tool_calls:
                     termination_reason = "max_tool_calls"
                     break
-                query = decision.follow_up_query or f"{subquestion.question} {decision.evidence_gap or 'additional evidence'}"
+                query = safe_follow_up_query(
+                    decision.follow_up_query,
+                    original_question=subquestion.question,
+                    evidence_gap=decision.evidence_gap,
+                )
 
             budget_exhausted = (
                 termination_reason in {"deadline", "max_rounds", "max_tool_calls"}
@@ -514,7 +695,11 @@ class DeepResearchOrchestrator:
             ) in {"snippet", "crawl_failed", "empty"}:
                 continue
             quote, overlap = best_evidence_quote(claim, source)
-            if not quote or overlap < self.citation_checker.minimum_overlap_for_claim(claim):
+            if (
+                not quote
+                or overlap < self.citation_checker.minimum_overlap_for_claim(claim)
+                or not source_is_relevant_to_claim(claim, source)
+            ):
                 continue
             items.append(
                 EvidenceItem(
@@ -645,14 +830,12 @@ class DeepResearchOrchestrator:
             }
         subquestion = SubQuestion(
             id=f"R{round_index}",
-            question=(
-                "What additional independent evidence, counterexamples, or primary sources are "
-                f"needed to verify: {request.query}"
-            ),
+            question=request.query,
             rationale=(
-                "Reflection found low source coverage or fallback in earlier research; "
-                "run one bounded follow-up search before synthesis."
+                "Reflection found low source coverage or fallback; repeat the user's exact "
+                "question to seek one direct, independent corroborating source."
             ),
+            search_query=f"{request.query} exact answer independent source",
         )
         return {
             "should_add_question": True,
@@ -752,3 +935,105 @@ class DeepResearchOrchestrator:
         if emit is not None:
             await emit({"event": "stage", "data": event.model_dump(mode="json")})
         return event
+
+
+def _citation_report_is_better(
+    candidate: CitationCheckReport,
+    current: CitationCheckReport,
+) -> bool:
+    if candidate.supported_claims <= 0:
+        return False
+    return (
+        candidate.citation_grounding > current.citation_grounding
+        or (
+            candidate.citation_grounding == current.citation_grounding
+            and candidate.unsupported_claims < current.unsupported_claims
+        )
+    )
+
+
+def _retain_supported_claims(
+    brief: ResearchBrief,
+    report: CitationCheckReport,
+) -> tuple[str, list[str], CitationCheckReport, list[dict[str, str]]]:
+    supported = []
+    seen_claims: set[str] = set()
+    for assessment in report.assessments:
+        if not assessment.supported or assessment.claim in seen_claims:
+            continue
+        seen_claims.add(assessment.claim)
+        supported.append(assessment)
+    claims = [assessment.claim for assessment in supported]
+    if not claims:
+        answer = _citation_abstention_answer(brief)
+        dropped = [
+            {
+                "claim": assessment.claim,
+                "support_level": assessment.support_level,
+                "reason": assessment.judge_reason or assessment.reason,
+            }
+            for assessment in report.assessments
+        ]
+        # Keep the original failed assessments for diagnosis. The visible answer and
+        # exported claims abstain, while citation_check still explains why they were
+        # removed instead of pretending that no claims were ever checked.
+        return answer, [], report, dropped
+    if brief.expected_format == "json":
+        answer = json.dumps({"claims": claims}, ensure_ascii=False, indent=2)
+    elif brief.expected_format == "text" or len(claims) == 1:
+        answer = "\n".join(claims)
+    else:
+        answer = "\n".join(f"- {claim}" for claim in claims)
+    dropped = [
+        {
+            "claim": assessment.claim,
+            "support_level": assessment.support_level,
+            "reason": assessment.judge_reason or assessment.reason,
+        }
+        for assessment in report.assessments
+        if not assessment.supported
+    ]
+    retained_count = len(supported)
+    filtered_report = report.model_copy(
+        update={
+            "total_claims": retained_count,
+            "supported_claims": retained_count,
+            "unsupported_claims": 0,
+            "retention_rate": 1.0,
+            "assessments": supported,
+            "citation_grounding": 1.0,
+            "citation_coverage": 1.0,
+            "unsupported_claim_rate": 0.0,
+            "claim_extraction_valid": True,
+        }
+    )
+    return answer, claims, filtered_report, dropped
+
+
+def _citation_abstention_answer(brief: ResearchBrief) -> str:
+    chinese = any("\u3400" <= char <= "\u9fff" for char in brief.original_query)
+    limitation = (
+        "现有来源不足以形成经过引用核查的结论。"
+        if chinese
+        else "The available sources are insufficient to support a citation-verified answer."
+    )
+    if brief.expected_format == "json":
+        return json.dumps(
+            {"claims": [], "limitations": [limitation]},
+            ensure_ascii=False,
+            indent=2,
+        )
+    return limitation
+
+
+def _attach_failure_context(
+    exc: Exception,
+    *,
+    cost: CostTracker,
+    trace: TraceLogger,
+) -> None:
+    """Preserve auditable attempted usage and stages for an eval failure."""
+
+    setattr(exc, "deepresearch_cost", cost.summary())
+    setattr(exc, "deepresearch_trace_events", list(trace.events))
+    setattr(exc, "deepresearch_run_id", trace.run_id)

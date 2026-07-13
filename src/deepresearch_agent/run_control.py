@@ -496,6 +496,7 @@ class RunController:
             run_id=run_id,
             trace_dir=self.settings.trace_dir,
             exporter=build_trace_exporter(self.settings),
+            write_enabled=self.settings.trace_write_enabled,
         )
         search_service = build_search_service(
             self.settings,
@@ -1007,6 +1008,8 @@ class RunController:
                     estimated_cost_usd=record.estimated_cost_usd,
                     provider=record.provider,
                     model=record.model,
+                    cache_creation_input_tokens=record.cache_creation_input_tokens,
+                    cache_read_input_tokens=record.cache_read_input_tokens,
                 )
             return
 
@@ -1179,13 +1182,22 @@ def _merge_costs(first: CostSummary, second: CostSummary) -> CostSummary:
         *[CostRecord.model_validate(item.model_dump(mode="json")) for item in first.records],
         *[CostRecord.model_validate(item.model_dump(mode="json")) for item in second.records],
     ]
+    cache_creation_input_tokens = sum(
+        record.cache_creation_input_tokens for record in records
+    )
+    cache_read_input_tokens = sum(record.cache_read_input_tokens for record in records)
     input_tokens = sum(record.input_tokens for record in records)
+    total_input_tokens = (
+        input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+    )
     output_tokens = sum(record.output_tokens for record in records)
     cost = sum(record.estimated_cost_usd for record in records)
     return CostSummary(
-        total_input_tokens=input_tokens,
+        total_input_tokens=total_input_tokens,
         total_output_tokens=output_tokens,
-        total_tokens=input_tokens + output_tokens,
+        total_tokens=total_input_tokens + output_tokens,
         total_estimated_cost_usd=round(cost, 8),
         records=records,
+        total_cache_creation_input_tokens=cache_creation_input_tokens,
+        total_cache_read_input_tokens=cache_read_input_tokens,
     )

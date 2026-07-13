@@ -98,12 +98,15 @@ class TraceLogger:
         run_id: str,
         trace_dir: str = "logs",
         exporter: TraceExporter | None = None,
+        write_enabled: bool = True,
     ) -> None:
         self.run_id = run_id
         self.events: list[TraceEvent] = []
+        self.write_enabled = write_enabled
         self.trace_dir = Path(trace_dir)
-        self.trace_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.trace_dir / f"research-{run_id}.jsonl"
+        if self.write_enabled:
+            self.trace_dir.mkdir(parents=True, exist_ok=True)
         self.exporter = exporter
 
     def now(self) -> float:
@@ -132,6 +135,8 @@ class TraceLogger:
         return event
 
     def _write_event(self, event: TraceEvent) -> None:
+        if not self.write_enabled:
+            return
         with self.path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(event.model_dump(mode="json"), ensure_ascii=False) + "\n")
 
