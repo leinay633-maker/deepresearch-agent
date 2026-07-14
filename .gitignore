@@ -24,3 +24,7 @@ logs/*.log
 logs/research-*.jsonl
 !logs/.gitkeep
 !logs/benchmark-*.jsonl
+
+# Transient eval artifacts written to the default results path
+results/livedrbench_predictions.json
+results/deep-research-eval-*.jsonl

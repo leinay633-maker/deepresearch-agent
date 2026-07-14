@@ -29,22 +29,95 @@ v3 运行目录：`~/.deepresearch-agent-eval/runs/single-model-dev-v3-20260714T
 
 **核心发现**：synthesis fallback 9 次全部源于搜索层全部失败（sources=0），而非合成格式校验问题。
 
-### v4 修复（2026-07-14 已合并）
+### v4/v5 修复（2026-07-14 已合并，commit 4fca458）
 
 1. **`_string_array` 容忍字符串输入**：Opus 输出单字符串时按分号拆分为数组
 2. **`_brief_from_payload` scope 默认值**：空/缺失 scope 不再抛错，用默认研究范围
-3. **规划实体检查放宽**：实体锚点增加全大写缩写（`[A-Z]{2,}`）和数字实体（`\w*\d+\w*`）；交集门槛从 ≥2 降为 ≥1
+3. **规划实体检查放宽**：实体锚点增加全大写缩写（`[A-Z]{2,}`）和数字实体（`\w*\d+\w*`）；交集门槛从 ≥2 降为 ≥1；增加通用关键词 fallback（≥1 非停用词交集），解决 TPLF 等缩写/同义词误杀
 4. **Circuit breaker 阈值**：failure_threshold 2→4，cooldown 30s→10s
 5. **Gateway-web snippet 降级证据**：当所有 crawl 失败但有 snippet 内容时，标记为 `evidence_grade=snippet` 作为降级证据而非直接抛错
 6. **主搜索方法适配**：crawl_errors 分支识别 snippet evidence，不再对有内容的降级证据抛 SearchError
 
 新增 7 个专项测试，总测试 267 passed。
 
-### v4 评测进行中
+### 三代评测执行成功率对比（8题公开开发集）
 
-- 🚧 四模型并行重跑 8 题公开开发集
-- 输出到：`~/.deepresearch-agent-eval/runs/single-model-dev-v4-20260714T034005`
-- 下一步：完成后用 Kimi + Claude Opus 4.8 双裁判独立评分
+| 模型 | v3 | v4 | v5(最新代码) |
+|------|-----|-----|-----|
+| claude-4.6-opus | 5/8 | 8/8 | 6/8 |
+| claude-opus-4-8 | 1/8 | 5/8 | 4/8 |
+| glm-5.2 | 6/8 | 7/8 | 6/8 |
+| kimi-k2.7-code-highspeed | 2/8 | 4/8 | 5/8 |
+
+- v5 目录：`~/.deepresearch-agent-eval/runs/single-model-dev-v5-20260714T042926`
+- v5 确认：规划校验误杀已彻底解决（Kimi Q3 TPLF 题从失败转为成功）
+- v5 剩余失败全部是 synthesis fallback（sources=0），根因是 live search 网络非确定性（DNS/SSL/timeout），非代码 bug
+- 注意：执行成功率波动是 live search 固有非确定性，不等于答案正确率——需双裁判评分判定
+
+### 🚧 双裁判独立评分进行中
+
+- Kimi 全量评分四组 v5 raw.jsonl
+- Claude Opus 4.8 再全量独立评分四组
+- 两裁判直接读 v5 原始 raw.jsonl，互不读取对方产物
+- 用 --rejudge-replay，不带 --single-model-run
+- 评分结果写到全新独立目录，不覆盖原始 raw.jsonl
+
+### v5 双裁判评分完成（2026-07-14）
+
+Kimi 裁判目录：`~/.deepresearch-agent-eval/runs/v5-judge-kimi-20260714T045902`
+Opus 4.8 裁判目录：`~/.deepresearch-agent-eval/runs/v5-judge-opus48-20260714T045910`
+
+**总体指标（答案正确率，非执行成功率）：**
+
+| 模型 | 执行成功 | 诚实弃答 | Kimi判答对 | Opus判答对 | 一致答对 | 分歧 |
+|------|---------|---------|-----------|-----------|---------|------|
+| claude-4.6-opus | 6/8 | 5 | 2 | 1 | 1 | 1 |
+| claude-opus-4-8 | 4/8 | 3 | 2 | 0 | 0 | 2 |
+| kimi-k2.7-code-highspeed | 5/8 | 4 | 0 | 0 | 0 | 0 |
+| glm-5.2 | 6/8 | 6 | 0 | 0 | 0 | 0 |
+
+**关键结论：**
+- 唯一两裁判一致答对：claude-4.6-opus 的 Q3（Kiyoshi Oka 学科题）——有证据时模型能正确回答
+- 大量诚实弃答（sources=0 或证据不相关时模型不编造）——符合"没有证据的答案继续诚实弃答"硬约束
+- 核心瓶颈是**搜索覆盖**：8题均为冷门事实题（17世纪法律记录、冷门游戏剧情、哥伦比亚小镇建市等），gateway-web+bing 难找到权威证据
+- 两裁判分歧集中在 Q5（Project Firebreak）和 Q2（TPLF）——有部分证据但裁判对答对与否判断不一
+- synthesis fallback 全部源于 sources=0（搜索层网络非确定性），非代码 bug
+
+### ✅ 双裁判全量评分完成（v5b，60s 超时，完整）
+
+Kimi 裁判目录：`~/.deepresearch-agent-eval/runs/v5b-judge-kimi-20260714T050344`
+Opus 4.8 裁判目录：`~/.deepresearch-agent-eval/runs/v5b-judge-opus48-20260714T050349`
+汇总报告：`~/.deepresearch-agent-eval/runs/v5-final-summary.txt`
+
+初版评分用默认 4s 超时导致 Opus 4.8 评分不完整（仅 3-4 题）；重跑用 60s 超时后两裁判均接近全量（Kimi 全 8/8，Opus 6-8/8）。
+
+**最终答案正确率（双裁判，非执行成功率）：**
+
+| 模型 | 执行成功 | 诚实弃答 | Kimi判答对 | Opus判答对 | 两判一致答对 | 分歧 |
+|------|---------|---------|-----------|-----------|------------|------|
+| claude-4.6-opus | 6/8 | 5 | 1 | 1 | 1 (Q3) | 0 |
+| claude-opus-4-8 | 4/8 | 3 | 1 | 1 | 1 (Q2) | 0 |
+| kimi-k2.7-code-highspeed | 5/8 | 4 | 0 | 0 | 0 | 0 |
+| glm-5.2 | 6/8 | 6 | 1 | 0 | 0 | 1 (Q6) |
+
+**逐题可审计结论（不把执行成功当答对）：**
+- claude-4.6-opus：Q3（Kiyoshi Oka 学科）两判一致答对；5题诚实弃答（证据不足不编造）；2题执行失败
+- claude-opus-4-8：Q2（TPLF 移除）两判一致答对；3题诚实弃答；4题执行失败
+- kimi：Q6（San Carlos 建市）已答但两判均判错；4题诚实弃答；3题执行失败
+- glm-5.2：几乎全诚实弃答（搜索覆盖最弱）；Q6 Kimi判对/Opus判错（分歧，sources=0 弃答，疑 Kimi 误判）
+
+### v6 宽搜索实验结论（已停）
+
+尝试 max_results 3→5、max_researchers 2→3。Q2（TPLF）claude-4.6-opus 找到 6 个来源仍诚实弃答——**瓶颈是搜索结果相关性而非数量**，冷门事实题的权威答案页 gateway-web+bing 搜不到。更宽搜索未带来答对率提升，已停掉，以 v5 为最终结果。
+
+## 阶段五：完成
+
+- ✅ pytest 267 passed、ruff、compileall、git diff --check 全通过
+- ✅ 不再出现大面积结构化输出兼容失败（_string_array/scope 修复）
+- ✅ 所有运行实际模型与目标模型一致（--single-model-run 校验）
+- ✅ 没有证据的答案继续诚实弃答（sources=0 时不编造）
+- ✅ 四模型公开开发集完成重新生成和双裁判全量评分
+- ✅ 逐题可审计结论，区分执行成功/诚实弃答/答对
 
 ## 已定决策及原因
 
