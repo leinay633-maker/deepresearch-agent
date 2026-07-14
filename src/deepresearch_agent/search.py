@@ -1294,6 +1294,7 @@ def build_search_adapter(
             require_response_model_match=(
                 settings.llm_gateway_require_response_model_match
             ),
+            thinking_budget_tokens=settings.llm_gateway_thinking_budget_tokens,
         )
     if selected == "mcp":
         config = McpServerConfig(

@@ -17,7 +17,9 @@ import httpx
 from deepresearch_agent.guardrails import safe_follow_up_query
 from deepresearch_agent.llm_gateway import (
     ANTHROPIC_VERSION,
+    KIMI_MIN_THINKING_BUDGET_TOKENS,
     LLM_GATEWAY_API_KEY_ENV,
+    _requires_thinking,
     response_model_matches,
 )
 from deepresearch_agent.schemas import Source
@@ -92,6 +94,7 @@ class GatewayWebSearchAdapter:
         timeout_seconds: float = 120.0,
         require_response_model_match: bool = False,
         transport: httpx.AsyncBaseTransport | None = None,
+        thinking_budget_tokens: int = KIMI_MIN_THINKING_BUDGET_TOKENS,
     ) -> None:
         if max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
@@ -108,6 +111,9 @@ class GatewayWebSearchAdapter:
         self.timeout_seconds = timeout_seconds
         self.require_response_model_match = require_response_model_match
         self.transport = transport
+        self.thinking_budget_tokens = max(
+            thinking_budget_tokens, KIMI_MIN_THINKING_BUDGET_TOKENS
+        )
 
     async def search(self, query: str, max_results: int, timeout: float) -> list[Source]:
         api_key = os.environ.get(LLM_GATEWAY_API_KEY_ENV)
@@ -191,6 +197,15 @@ class GatewayWebSearchAdapter:
             ],
             "messages": [{"role": "user", "content": query}],
         }
+        # Some gateway models (e.g. Kimi) reject requests without an explicit
+        # enabled thinking block. Mirror LLMGatewayClient so web search works
+        # for the same model set as structured generation.
+        if _requires_thinking(self.model):
+            body["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": self.thinking_budget_tokens,
+            }
+            body["max_tokens"] = self.max_tokens + self.thinking_budget_tokens
         headers = {
             "Authorization": f"Bearer {api_key}",
             "anthropic-version": ANTHROPIC_VERSION,

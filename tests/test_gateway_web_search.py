@@ -698,3 +698,94 @@ def test_gateway_web_search_settings_and_adapter_builder(
     assert isinstance(adapter, GatewayWebSearchAdapter)
     assert adapter.base_url == "https://gateway.example"
     assert adapter.model == "glm-5.2"
+
+
+def test_gateway_web_search_enables_thinking_for_kimi_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kimi rejects requests without an enabled thinking block (HTTP 400).
+
+    The adapter must mirror LLMGatewayClient and add thinking=enabled for
+    models that require it, otherwise web search silently fails for the whole
+    run and every question degrades to an evidence-less abstention.
+    """
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "test-gateway-key")
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return _json_response(
+            {
+                "model": "kimi-k2.7-code-highspeed",
+                "content": [
+                    {
+                        "type": "web_search_tool_result",
+                        "content": [
+                            {
+                                "type": "web_search_result",
+                                "title": "Andrew Tate kickboxing",
+                                "url": "https://example.com/tate",
+                            }
+                        ],
+                    },
+                    {"type": "text", "text": "King Cobra"},
+                ],
+            }
+        )
+
+    adapter = GatewayWebSearchAdapter(
+        base_url="https://gateway.example/v1",
+        model="kimi-k2.7-code-highspeed",
+        max_chars=300,
+        transport=httpx.MockTransport(handler),
+    )
+
+    asyncio.run(adapter.search("Andrew Tate kickboxing name", max_results=2, timeout=9.0))
+
+    body = captured["body"]
+    assert body["thinking"] == {
+        "type": "enabled",
+        "budget_tokens": adapter.thinking_budget_tokens,
+    }
+    # max_tokens must grow by the thinking budget so the text budget is preserved
+    assert body["max_tokens"] == 500 + adapter.thinking_budget_tokens
+
+
+def test_gateway_web_search_omits_thinking_for_claude_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude models must NOT get a thinking block — it would break their requests."""
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "test-gateway-key")
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return _json_response(
+            {
+                "model": "claude-4.6-opus",
+                "content": [
+                    {
+                        "type": "web_search_tool_result",
+                        "content": [
+                            {
+                                "type": "web_search_result",
+                                "title": "result",
+                                "url": "https://example.com/r",
+                            }
+                        ],
+                    },
+                    {"type": "text", "text": "ok"},
+                ],
+            }
+        )
+
+    adapter = GatewayWebSearchAdapter(
+        base_url="https://gateway.example/v1",
+        model="claude-4.6-opus",
+        max_chars=300,
+        transport=httpx.MockTransport(handler),
+    )
+    asyncio.run(adapter.search("query", max_results=1, timeout=9.0))
+
+    assert "thinking" not in captured["body"]
+    assert captured["body"]["max_tokens"] == 500
