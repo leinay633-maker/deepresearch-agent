@@ -1420,26 +1420,59 @@ def _rows_to_sources(
 
 
 class _HtmlTextParser(HTMLParser):
+    # Non-content tags: their text is navigation, chrome, or boilerplate that
+    # crowds out the article body within a fixed char budget.
+    _SKIP_TAGS = {
+        "script",
+        "style",
+        "noscript",
+        "svg",
+        "nav",
+        "header",
+        "footer",
+        "aside",
+        "form",
+        "menu",
+    }
+    # Main-content tags: when present, prefer their text over the rest so a
+    # nav-heavy page does not waste the budget on menus before the article.
+    _MAIN_TAGS = {"article", "main"}
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self._skip_depth = 0
+        self._main_depth = 0
         self._parts: list[str] = []
+        self._main_parts: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         del attrs
-        if tag.lower() in {"script", "style", "noscript", "svg"}:
+        lower = tag.lower()
+        if lower in self._SKIP_TAGS:
             self._skip_depth += 1
+        elif lower in self._MAIN_TAGS:
+            self._main_depth += 1
 
     def handle_endtag(self, tag: str) -> None:
-        if tag.lower() in {"script", "style", "noscript", "svg"} and self._skip_depth:
+        lower = tag.lower()
+        if lower in self._SKIP_TAGS and self._skip_depth:
             self._skip_depth -= 1
+        elif lower in self._MAIN_TAGS and self._main_depth:
+            self._main_depth -= 1
 
     def handle_data(self, data: str) -> None:
-        if not self._skip_depth and data.strip():
-            self._parts.append(data.strip())
+        if not data.strip():
+            return
+        if self._skip_depth:
+            return
+        self._parts.append(data.strip())
+        if self._main_depth:
+            self._main_parts.append(data.strip())
 
     def text(self) -> str:
-        return " ".join(self._parts)
+        # Prefer article/main body when the page exposed it; otherwise fall
+        # back to nav-stripped full text.
+        return " ".join(self._main_parts or self._parts)
 
 
 WIKIPEDIA_STOPWORDS = {

@@ -86,7 +86,7 @@ class Settings:
     web_crawler_provider: str = "none"
     jina_reader_base_url: str = "https://r.jina.ai/"
     jina_search_base_url: str = "https://s.jina.ai/"
-    crawler_max_chars: int = 4000
+    crawler_max_chars: int = 8000
     mcp_transport: str = "stdio"
     mcp_command: str = ""
     mcp_args: str = ""
@@ -271,7 +271,7 @@ def load_settings() -> Settings:
         or "https://r.jina.ai/",
         jina_search_base_url=os.getenv("JINA_SEARCH_BASE_URL", "https://s.jina.ai/").strip()
         or "https://s.jina.ai/",
-        crawler_max_chars=_int_env("CRAWLER_MAX_CHARS", 4000),
+        crawler_max_chars=_int_env("CRAWLER_MAX_CHARS", 8000),
         mcp_transport=os.getenv("MCP_TRANSPORT", "stdio").strip().lower() or "stdio",
         mcp_command=os.getenv("MCP_COMMAND", "").strip(),
         mcp_args=os.getenv("MCP_ARGS", "").strip(),

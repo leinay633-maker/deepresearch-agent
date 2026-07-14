@@ -327,6 +327,115 @@ def test_html_text_crawler_strips_script_and_style(monkeypatch: pytest.MonkeyPat
     assert "display:none" not in content
 
 
+def test_html_text_crawler_strips_nav_chrome_and_keeps_article_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nav-heavy pages must not let menus crowd out the article body.
+
+    Reproduces the sherdog/MacTutor failure: a long nav bar used to fill the
+    char budget before the answer-bearing body text was reached.
+    """
+    monkeypatch.setattr(
+        "deepresearch_agent.url_policy.socket.getaddrinfo",
+        _public_getaddrinfo,
+    )
+
+    nav_menu = "NEWS FEATURES FIGHT FINDER PODCASTS VIDEOS RANKINGS FORUM " * 40
+    fake_html = f"""
+    <html>
+      <head><title>Andrew Tate</title></head>
+      <body>
+        <nav>{nav_menu}</nav>
+        <header>Site header chrome</header>
+        <article>
+          <h1>Andrew Tate kickboxing</h1>
+          <p>Tate's kickboxing nickname was "King Cobra".</p>
+        </article>
+        <footer>Copyright footer links</footer>
+      </body>
+    </html>
+    """
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        return FakeResponse(fake_html)
+
+    monkeypatch.setattr("deepresearch_agent.search.urlopen", fake_urlopen)
+    crawler = HtmlTextCrawler(max_chars=4000)
+
+    content = asyncio.run(crawler.crawl("https://example.com/tate", timeout=1.0))
+
+    # Article body survives
+    assert "King Cobra" in content
+    assert "kickboxing nickname" in content
+    # Nav chrome is stripped, not dominating the budget
+    assert "FIGHT FINDER" not in content
+    assert "Site header chrome" not in content
+    assert "Copyright footer" not in content
+
+
+def test_html_text_crawler_prefers_article_over_sidebar_noise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When <article> is present, prefer it over aside/sidebar content."""
+    monkeypatch.setattr(
+        "deepresearch_agent.url_policy.socket.getaddrinfo",
+        _public_getaddrinfo,
+    )
+
+    fake_html = """
+    <html><body>
+      <aside>Related articles sidebar noise</aside>
+      <article>
+        <p>San Carlos Antioquia was founded in 1786.</p>
+      </article>
+      <aside>More sidebar promotions</aside>
+    </body></html>
+    """
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        return FakeResponse(fake_html)
+
+    monkeypatch.setattr("deepresearch_agent.search.urlopen", fake_urlopen)
+    crawler = HtmlTextCrawler(max_chars=4000)
+
+    content = asyncio.run(crawler.crawl("https://example.com/sancarlos", timeout=1.0))
+    assert "1786" in content
+    assert "sidebar noise" not in content
+    assert "sidebar promotions" not in content
+
+
+def test_html_text_crawler_falls_back_to_nav_stripped_text_without_article(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pages without <article>/<main> still get nav-stripped full text."""
+    monkeypatch.setattr(
+        "deepresearch_agent.url_policy.socket.getaddrinfo",
+        _public_getaddrinfo,
+    )
+
+    fake_html = """
+    <html><body>
+      <nav>Menu links</nav>
+      <p>The answer is hidden in a plain paragraph.</p>
+      <footer>Footer</footer>
+    </body></html>
+    """
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        return FakeResponse(fake_html)
+
+    monkeypatch.setattr("deepresearch_agent.search.urlopen", fake_urlopen)
+    crawler = HtmlTextCrawler(max_chars=4000)
+
+    content = asyncio.run(crawler.crawl("https://example.com/plain", timeout=1.0))
+    assert "hidden in a plain paragraph" in content
+    assert "Menu links" not in content
+    assert "Footer" not in content
+
+
 def test_jina_reader_rejects_private_target_before_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

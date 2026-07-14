@@ -39,7 +39,7 @@ def pack_sources_for_synthesis(
     sources: list[Source],
     max_input_tokens: int = 12_000,
     reserved_tokens: int = 3_500,
-    per_source_tokens: int = 650,
+    per_source_tokens: int = 1200,
     max_sources: int = 18,
     max_sources_per_domain: int = 2,
 ) -> PackedContext:
