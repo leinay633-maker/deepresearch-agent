@@ -307,6 +307,26 @@ def source_is_relevant_to_claim(claim: str, source: Source) -> bool:
     return True
 
 
+def entity_anchor_coverage(claim: str, candidate: str) -> dict[str, int | bool]:
+    """Return aggregate-safe named-entity coverage without retaining page text."""
+
+    anchors = _proper_name_anchors(claim)
+    candidate_tokens = _tokens(candidate)
+    matched = anchors.intersection(candidate_tokens)
+    normalized_candidate = " ".join(
+        token.lower() for token in re.findall(r"[A-Za-z0-9-]+", candidate)
+    )
+    complete_multiword_entity = any(
+        " ".join(phrase) in normalized_candidate
+        for phrase in _multiword_entity_phrases(claim)
+    )
+    return {
+        "anchor_count": len(anchors),
+        "matched_anchor_count": len(matched),
+        "complete_multiword_entity": complete_multiword_entity,
+    }
+
+
 def _requires_entity_anchor(claim_lower: str) -> bool:
     return _asks_for_time_or_year(claim_lower) or _asks_about_founding(claim_lower)
 
@@ -323,24 +343,37 @@ def _has_required_anchor_overlap(claim: str, candidate: str) -> bool:
 
 
 def _has_entity_anchor_overlap(claim: str, candidate: str) -> bool:
-    """Require enough capitalized name/place anchors for entity-rich prompts."""
+    """Reject one-token collisions in prompts containing multiple named anchors."""
 
-    anchors = _proper_name_anchors(claim)
-    if not anchors:
+    coverage = entity_anchor_coverage(claim, candidate)
+    anchor_count = int(coverage["anchor_count"])
+    if not anchor_count:
         return True
-    overlap = anchors.intersection(_tokens(candidate))
-    required = 2 if len(anchors) >= 2 else 1
-    return len(overlap) >= required
+    matched = int(coverage["matched_anchor_count"])
+    required = 2 if anchor_count >= 2 else 1
+    return matched >= required or bool(coverage["complete_multiword_entity"])
 
 
 def _proper_name_anchors(claim: str) -> set[str]:
-    """Extract likely English person/place tokens while ignoring question words."""
+    """Extract likely English proper-name tokens and all-caps acronyms."""
 
     return {
         token.lower()
-        for token in re.findall(r"\b[A-Z][a-z]{2,}\b", claim)
+        for token in re.findall(r"\b(?:[A-Z][a-z]{2,}|[A-Z][A-Z0-9-]{1,})\b", claim)
         if token.lower() not in STOPWORDS and token.lower() not in _QUERY_GENERIC_TOKENS
     }
+
+
+def _multiword_entity_phrases(claim: str) -> list[tuple[str, ...]]:
+    phrases = re.findall(
+        r"\b(?:[A-Z][a-z]{2,}|[A-Z][A-Z0-9-]{1,})"
+        r"(?:\s+(?:[A-Z][a-z]{2,}|[A-Z][A-Z0-9-]{1,}))+\b",
+        claim,
+    )
+    return [
+        tuple(token.lower() for token in re.findall(r"[A-Za-z0-9-]+", phrase))
+        for phrase in phrases
+    ]
 
 
 def _meaningful_query_anchors(claim: str) -> set[str]:

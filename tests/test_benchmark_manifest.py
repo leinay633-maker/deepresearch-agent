@@ -6,9 +6,12 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from deepresearch_agent.benchmark import (
     build_benchmark_manifest,
     mark_live_judge_nondeterminism,
+    require_clean_worktree,
     run_benchmark,
     sanitized_settings_snapshot,
 )
@@ -54,6 +57,43 @@ def test_settings_snapshot_redacts_credential_bearing_values() -> None:
     assert snapshot["qdrant_api_key_env"] == "QDRANT_REAL_KEY_NAME"
     assert snapshot["openai_compatible_api_key_env"] == "OPENAI_REAL_KEY_NAME"
     assert snapshot["mock_input_cost_per_1m_tokens"] == 0.0
+
+
+def test_dataset_content_hash_excludes_benchmark_run_label(tmp_path: Path) -> None:
+    common = {
+        "root": tmp_path,
+        "dataset_name": "cases.jsonl",
+        "cases": [
+            {
+                "id": "case-1",
+                "query": "Who won?",
+                "benchmark_name": "label-inside-case",
+                "metadata": {"answer": "Ada"},
+            }
+        ],
+        "config_snapshot": {"provider": "mock"},
+        "llm_provider": "mock",
+        "llm_model": "mock-model",
+        "search_provider": "mock",
+        "seed": 7,
+    }
+
+    first = build_benchmark_manifest(benchmark_name="run-a", **common)
+    common["cases"][0]["benchmark_name"] = "different-case-label"
+    second = build_benchmark_manifest(benchmark_name="run-b", **common)
+
+    assert first["dataset_version"] == second["dataset_version"]
+    assert first["dataset_content_hash"] == second["dataset_content_hash"]
+    assert first["manifest_id"] != second["manifest_id"]
+
+
+def test_require_clean_worktree_fails_closed() -> None:
+    require_clean_worktree({"git_dirty": False})
+
+    with pytest.raises(RuntimeError, match="verified clean git worktree"):
+        require_clean_worktree({"git_dirty": True})
+    with pytest.raises(RuntimeError, match="verified clean git worktree"):
+        require_clean_worktree({"git_dirty": None})
 
 
 def test_replay_manifest_separates_generation_from_live_rejudge(

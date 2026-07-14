@@ -723,12 +723,34 @@
 [状态: 待消化]
 标签：Benchmark / Deep Research Eval
 检索关键词：LiveDRBench, public deep research eval, artifact, judge
-回答：我新增了 `src/deepresearch_agent/deep_research_eval.py`，它能加载本地 JSONL/JSON/CSV，也能直接从 Hugging Face 拉 `microsoft/LiveDRBench` 的 preview 或 v1-full，跑完整 orchestrator，并保存 raw JSONL、summary JSON 和 LiveDRBench-style predictions。`judge_provider=none` 时 `answer_quality=null`，只产 execution/format/citation/cost artifact；`heuristic` 是本地 normalized substring 弱评分；`deepseek` 是非官方 LLM judge，会记录 token/cost。我没有编官方分数，也不把历史 1 条真实样本的旧 `success_rate=0.0` 当当前质量结论；它最多说明公开评测入口能暴露搜索覆盖、格式约束和 citation 语义短板。
+回答：我新增了 `src/deepresearch_agent/deep_research_eval.py`，它能加载本地 JSONL/JSON/CSV，也能直接从 Hugging Face 拉 `microsoft/LiveDRBench`，跑完整 orchestrator，并保存 raw JSONL、summary 和 predictions。SimpleQA 这条线把历史 8 题降级成诊断集，另从 OpenAI 官方公开 CSV 按固定 seed 建了 32 题主集，topic 每类 3–4 题、answer type 每类 6–7 题，并记录上游 commit、source/case hash 和源行号。答案裁判统一为 `correct / incorrect / not_attempted / unscored`，固定全部题为分母，citation grounding 和 `grounded_correct` 单列；Gateway 裁判实际模型不匹配或 JSON 不完整会重试三次，仍失败就显式 `unscored`。我不会把双判一致说成官方真值，也会单列自评和分歧。
 关联模块：`deep_research_eval.py`, `eval_judge.py`, `orchestrator.py`, `results/deep_research_eval_livedrbench_deepseek_wikipedia_summary.json`
 可追问：
 1. 为什么不直接报官方分？
 2. LiveDRBench 和 BEIR/scifact 有什么区别？
 3. DeepSeek judge 为什么不等于官方 judge？
+
+## Q：为什么不能用一次 live 评测证明某个 harness 修复有效？
+[状态: 待消化]
+标签：Benchmark / 因果归因
+检索关键词：live variance, snapshot audit, repeated runs
+回答：真实搜索和模型生成都非确定。v7 到 v8 的 Kimi 分数上涨时，搜索候选和来源也一起变化，所以无法把结果只归因于 HTML extractor。我的修正做法有两层：先对固定 artifact 分别看 gold URL、可引用正文、snippet 和 650/1200 token context，定位事实在哪层丢失；再让同一 commit、同一主集做至少三次 live 重复，报告均值、范围、弃答率和逐题翻转。历史 raw 没保存原始 HTML，所以它只能证明 context 个案，不能做严格 extractor A/B。
+关联模块：`scripts/analyze_eval_snapshot.py`, `deep_research_eval.py`, `benchmark.py`
+可追问：
+1. 为什么三次仍不算统计显著？
+2. 如何保存原始 HTML 又不扩大安全风险？
+3. 搜索候选变化怎么控制？
+
+## Q：为什么搜索 snippet 不能作为最终证据？
+[状态: 待消化]
+标签：Search / Citation / 安全
+检索关键词：snippet candidate, verified body, failed_candidate_hints
+回答：snippet 是搜索服务生成的摘要，可能截断、改写、过时，也没有稳定的正文位置，拿它直接合成和引用会把“发现候选”混成“验证事实”。现在 Gateway/Bing snippet 只负责候选 URL；HTML crawler 成功且通过 URL policy、正文抽取、相关性和 verifier 后才进入 evidence。抓取失败时只留下脱敏审计 hint：title、去 query 的 URL、rank、错误分类、尝试次数和 actual model，不保留 snippet、正文或原始错误。CitationChecker 仍有 snippet/crawl_failed 的最后一道 fail-closed 防线。
+关联模块：`search.py`, `orchestrator.py`, `citation.py`, `gateway_search.py`
+可追问：
+1. 全部 crawl 失败时为什么宁可弃答？
+2. 哪些错误会重试？
+3. 如何防重定向偷带凭证？
 
 # 对比与岗位表达
 

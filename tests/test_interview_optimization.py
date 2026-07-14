@@ -8,7 +8,12 @@ from deepresearch_agent.citation import CitationChecker
 from deepresearch_agent.config import Settings
 from deepresearch_agent.orchestrator import DeepResearchOrchestrator
 from deepresearch_agent.schemas import ResearchRequest, Source
-from deepresearch_agent.search import MockSearchAdapter, SearchError, SearchService
+from deepresearch_agent.search import (
+    MockSearchAdapter,
+    SearchError,
+    SearchEvidenceUnavailableError,
+    SearchService,
+)
 from deepresearch_agent.text_utils import tokenize
 
 
@@ -449,8 +454,8 @@ def test_crawler_failure_is_explicitly_degraded_or_failed() -> None:
         asyncio.run(failed_service.search("query", max_results=1))
 
 
-def test_gateway_chain_snippet_fallback_when_all_crawls_fail() -> None:
-    """Gateway-web chain: when all crawls fail, use snippets as degraded evidence."""
+def test_gateway_chain_keeps_failed_snippet_only_as_audit_hint() -> None:
+    """Gateway snippets remain auditable but never become final evidence."""
 
     class GatewayStyleAdapter:
         name = "gateway-web"
@@ -479,12 +484,17 @@ def test_gateway_chain_snippet_fallback_when_all_crawls_fail() -> None:
         crawler=FailingCrawler(),
         fallback_policy="fail",
     )
-    outcome = asyncio.run(service.search("query", max_results=1))
-    # Should succeed with snippet-grade evidence instead of failing
-    assert len(outcome.sources) >= 1
-    source = outcome.sources[0]
-    assert source.metadata.get("evidence_grade") == "snippet"
-    assert source.metadata.get("retrieval_degraded") is True
+    with pytest.raises(
+        SearchEvidenceUnavailableError,
+        match="safe crawl required",
+    ) as error:
+        asyncio.run(service.search("query", max_results=1))
+
+    assert error.value.failed_candidate_hints[0]["title"] == "Gateway result"
+    assert error.value.failed_candidate_hints[0]["crawl_status"] == "failed"
+    assert "search snippet with useful info" not in str(
+        error.value.failed_candidate_hints
+    )
 
 
 def test_gateway_chain_raises_when_snippets_also_empty() -> None:

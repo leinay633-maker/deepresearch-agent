@@ -24,10 +24,12 @@ from deepresearch_agent.benchmark import (
     mark_live_judge_nondeterminism,
     portable_artifact_path,
     refresh_replayed_case_result,
+    require_clean_worktree,
     sanitized_settings_snapshot,
 )
 from deepresearch_agent.config import load_settings, with_request_timeout
 from deepresearch_agent.eval_judge import build_eval_judge_provider
+from deepresearch_agent.llm_gateway import response_model_matches
 from deepresearch_agent.orchestrator import DeepResearchOrchestrator
 from deepresearch_agent.search import BenchmarkContaminationError
 from deepresearch_agent.replay import (
@@ -43,7 +45,9 @@ LIVE_DR_BENCH_CONFIGS = {
     "livedrbench-v1-full": "v1-full",
 }
 
-_SEALED_JUDGE_VERDICTS = frozenset({"pass", "partial", "fail", "unscored"})
+_SEALED_JUDGE_VERDICTS = frozenset(
+    {"correct", "incorrect", "not_attempted", "unscored"}
+)
 _SEALED_FAILURE_CATEGORIES = frozenset(
     {
         "retrieval",
@@ -229,6 +233,9 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
         "deadline_seconds": deadline_seconds,
         "min_evidence_items": min_evidence_items,
         "fallback_policy": fallback_policy,
+        "require_clean_worktree": bool(
+            getattr(args, "require_clean_worktree", False)
+        ),
         "official_judge_score": "not_run",
         "sealed_holdout": sealed_holdout,
         "single_model_run": bool(getattr(args, "single_model_run", False)),
@@ -268,6 +275,8 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
         replay_dir=getattr(args, "replay_dir", None),
         cassette_id=getattr(args, "cassette_id", None),
     )
+    if getattr(args, "require_clean_worktree", False):
+        require_clean_worktree(manifest)
     mark_live_judge_nondeterminism(
         manifest,
         citation_judge_provider=effective_settings.citation_judge_provider,
@@ -312,8 +321,17 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
                 and (replay_records is None or rejudge_replay)
             )
             if should_run_judge:
+                generation_models = _generation_models(
+                    record,
+                    configured_model=effective_llm_model,
+                )
                 try:
-                    record["answer_judgment"] = asdict(answer_judge.judge(case, record))
+                    judgment = asdict(answer_judge.judge(case, record))
+                    judgment["self_judge"] = _is_self_judge(
+                        judgment,
+                        generation_models=generation_models,
+                    )
+                    record["answer_judgment"] = judgment
                 except Exception as exc:  # noqa: BLE001 - judge failure is a scored artifact.
                     record["answer_judgment"] = {
                         "provider": judge_provider,
@@ -326,6 +344,16 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
                         "input_tokens": 0,
                         "output_tokens": 0,
                         "estimated_cost_usd": 0.0,
+                        "confidence": 0.0,
+                        "critical_errors": [],
+                        "failure_categories": ["judge_uncertainty"],
+                        "self_judge": _is_self_judge(
+                            {
+                                "provider": judge_provider,
+                                "model": effective_judge_model,
+                            },
+                            generation_models=generation_models,
+                        ),
                     }
                 attach_answer_quality(record, record["answer_judgment"])
             elif answer_judge is not None and record.get("answer_judgment"):
@@ -707,11 +735,27 @@ def _summarize(
     source_counts = [record.get("deduped_source_count", 0) for record in records]
     provider_counts = [record.get("source_provider_count", 0) for record in records]
     domain_counts = [record.get("source_domain_count", 0) for record in records]
+    all_answer_judgments = [
+        record["answer_judgment"]
+        for record in records
+        if isinstance(record.get("answer_judgment"), dict)
+    ]
     answer_judgments = [
         record["answer_judgment"]
         for record in records
-        if record.get("answer_judgment") and record["answer_judgment"].get("score") is not None
+        if isinstance(record.get("answer_judgment"), dict)
+        and record.get("answer_verdict")
+        in {"correct", "incorrect", "not_attempted"}
+        and record["answer_judgment"].get("score") is not None
     ]
+    answer_verdict_counts = {
+        verdict: sum(
+            1
+            for record in records
+            if str(record.get("answer_verdict") or "unscored") == verdict
+        )
+        for verdict in ("correct", "incorrect", "not_attempted", "unscored")
+    }
     split_metrics = evaluation_summary(records)
     summary = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -776,6 +820,12 @@ def _summarize(
             "provider": config_snapshot.get("judge_provider", "none"),
             "model": config_snapshot.get("judge_model"),
             "scored_count": len(answer_judgments),
+            "fixed_denominator": len(records),
+            "verdict_counts": answer_verdict_counts,
+            "unscored_count": answer_verdict_counts["unscored"],
+            "self_judge_count": sum(
+                1 for item in all_answer_judgments if item.get("self_judge") is True
+            ),
             "score_avg": round(
                 sum(item["score"] for item in answer_judgments) / len(answer_judgments),
                 4,
@@ -783,18 +833,25 @@ def _summarize(
             if answer_judgments
             else None,
             "pass_rate": round(
-                sum(1 for item in answer_judgments if item["verdict"] == "pass")
-                / len(answer_judgments),
+                answer_verdict_counts["correct"] / len(records),
                 4,
             )
-            if answer_judgments
+            if all_answer_judgments
             else None,
+            "correct_rate": round(
+                answer_verdict_counts["correct"] / len(records), 4
+            )
+            if records
+            else 0.0,
             "tokens_total": sum(
                 item.get("input_tokens", 0) + item.get("output_tokens", 0)
-                for item in answer_judgments
+                for item in all_answer_judgments
             ),
             "estimated_cost_usd_total": round(
-                sum(item.get("estimated_cost_usd", 0.0) for item in answer_judgments),
+                sum(
+                    item.get("estimated_cost_usd", 0.0)
+                    for item in all_answer_judgments
+                ),
                 8,
             ),
             "official_judge_score": "not_run",
@@ -826,6 +883,12 @@ def _summary_records(
             "execution_success": record.get("execution_success", record["success"]),
             "task_format_valid": record.get("task_format_valid", False),
             "answer_quality": record.get("answer_quality"),
+            "answer_verdict": record.get("answer_verdict", "unscored"),
+            "grounded_correct": record.get("grounded_correct"),
+            "report_emitted": record.get("report_emitted", False),
+            "substantive_answer": record.get("substantive_answer", False),
+            "grounded_answer": record.get("grounded_answer", False),
+            "evidence_abstention": record.get("evidence_abstention", False),
             "citation_grounding": record.get("citation_grounding"),
             "citation_precision": record.get("citation_precision"),
             "citation_coverage": record.get("citation_coverage"),
@@ -907,6 +970,7 @@ def _sealed_answer_judgment(judgment: dict[str, Any]) -> dict[str, Any]:
         "score": score,
         "verdict": verdict,
         "confidence": _sealed_unit_interval(judgment.get("confidence")),
+        "self_judge": judgment.get("self_judge") is True,
         "failure_categories": sorted(
             {
                 str(category).strip().lower()
@@ -961,6 +1025,49 @@ def _effective_llm_model(args: argparse.Namespace, settings: Any) -> str:
     if provider == "llm-gateway":
         return settings.llm_gateway_model
     return settings.mock_model_name
+
+
+def _is_self_judge(
+    judgment: dict[str, Any],
+    *,
+    generation_models: set[str],
+) -> bool:
+    if str(judgment.get("provider") or "").strip().lower() == "heuristic":
+        return False
+    judge_model = judgment.get("model")
+    return bool(
+        isinstance(judge_model, str)
+        and judge_model
+        and any(
+            response_model_matches(generation_model, judge_model)
+            for generation_model in generation_models
+        )
+    )
+
+
+def _generation_models(
+    record: dict[str, Any],
+    *,
+    configured_model: str,
+) -> set[str]:
+    """Recover generation models from replayed usage instead of trusting CLI defaults."""
+
+    models = {configured_model} if configured_model else set()
+    cost = record.get("cost") if isinstance(record.get("cost"), dict) else {}
+    usage_records = cost.get("records") if isinstance(cost.get("records"), list) else []
+    generation_stages = {
+        "brief_generation",
+        "planning",
+        "research_decision",
+        "synthesis",
+    }
+    for usage in usage_records:
+        if not isinstance(usage, dict) or usage.get("stage") not in generation_stages:
+            continue
+        model = usage.get("model")
+        if isinstance(model, str) and model.strip():
+            models.add(model.strip())
+    return models
 
 
 def _normalize_llm_provider(value: str) -> str:
@@ -1136,6 +1243,11 @@ def main() -> None:
     )
     parser.add_argument("--cassette-id", default=None)
     parser.add_argument(
+        "--require-clean-worktree",
+        action="store_true",
+        help="Fail before running cases unless git reports a clean worktree.",
+    )
+    parser.add_argument(
         "--rejudge-replay",
         action="store_true",
         help="Explicitly call the selected live/local answer judge on replayed artifacts.",
@@ -1160,6 +1272,20 @@ def _sealed_stdout_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "task_format_valid_rate",
         "answer_quality_scored_count",
         "answer_quality_avg",
+        "answer_verdict_counts",
+        "answer_correct_count",
+        "answer_correct_rate",
+        "answer_incorrect_count",
+        "answer_not_attempted_count",
+        "answer_unscored_count",
+        "answer_fixed_denominator",
+        "grounded_correct_count",
+        "grounded_correct_rate",
+        "self_judge_count",
+        "report_emitted_count",
+        "substantive_answer_count",
+        "grounded_answer_count",
+        "evidence_abstention_count",
         "citation_grounding_avg",
         "citation_precision_avg",
         "citation_coverage_avg",

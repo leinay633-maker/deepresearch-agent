@@ -44,6 +44,18 @@ class GatewayWebSearchUsage:
     cache_read_input_tokens: int
 
 
+@dataclass(frozen=True)
+class GatewayWebSearchCapabilityProbe:
+    """Secret-free summary of one server-side web-search capability request."""
+
+    requested_model: str
+    actual_response_model: str | None
+    content_block_types: tuple[str, ...]
+    tool_result_count: int
+    status: str
+    error: str | None = None
+
+
 GatewayWebSearchUsageRecorder = Callable[[GatewayWebSearchUsage], None]
 _USAGE_RECORDER: ContextVar[GatewayWebSearchUsageRecorder | None] = ContextVar(
     "gateway_web_search_usage_recorder",
@@ -178,12 +190,98 @@ class GatewayWebSearchAdapter:
             request_attempts=attempts,
         )
 
+    async def probe_capability(
+        self,
+        *,
+        query: str = "official web search capability test",
+        timeout: float | None = None,
+    ) -> GatewayWebSearchCapabilityProbe:
+        """Probe tool support without retaining response text or result bodies.
+
+        The returned record intentionally contains only the actual response model,
+        block-type names, a tool-result count and a coarse status. This makes a
+        text-only model response (notably GLM on some gateway routes) distinguishable
+        from an ordinary tool response with zero search results.
+        """
+
+        api_key = os.environ.get(LLM_GATEWAY_API_KEY_ENV)
+        if not api_key:
+            return GatewayWebSearchCapabilityProbe(
+                requested_model=self.model,
+                actual_response_model=None,
+                content_block_types=(),
+                tool_result_count=0,
+                status="missing_api_key",
+                error=f"{LLM_GATEWAY_API_KEY_ENV} environment variable is required",
+            )
+        request_timeout = timeout if timeout is not None else self.timeout_seconds
+        if request_timeout <= 0:
+            raise ValueError("timeout must be positive")
+        safe_query = query.strip()
+        if not safe_query:
+            raise ValueError("query must be non-empty")
+
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=False,
+                transport=self.transport,
+            ) as client:
+                payload = await self._request(
+                    client,
+                    safe_query,
+                    request_timeout,
+                    api_key,
+                    enforce_model_match=False,
+                )
+        except GatewayWebSearchError as exc:
+            return GatewayWebSearchCapabilityProbe(
+                requested_model=self.model,
+                actual_response_model=None,
+                content_block_types=(),
+                tool_result_count=0,
+                status="request_error",
+                error=str(exc),
+            )
+
+        raw_model = payload.get("model")
+        actual_model = (
+            raw_model.strip()
+            if isinstance(raw_model, str) and raw_model.strip()
+            else None
+        )
+        block_types = _response_block_types(payload)
+        tool_result_count = _tool_result_count(payload)
+        result_count = len(_web_search_results(payload.get("content", [])))
+        if actual_model is not None and not response_model_matches(
+            self.model, actual_model
+        ):
+            status = "model_mismatch"
+        elif tool_result_count and result_count:
+            status = "tool_results"
+        elif tool_result_count:
+            status = "tool_no_results"
+        elif "text" in block_types:
+            status = "text_only_no_tool"
+        elif block_types:
+            status = "no_tool_result"
+        else:
+            status = "empty_response"
+        return GatewayWebSearchCapabilityProbe(
+            requested_model=self.model,
+            actual_response_model=actual_model,
+            content_block_types=block_types,
+            tool_result_count=tool_result_count,
+            status=status,
+        )
+
     async def _request(
         self,
         client: httpx.AsyncClient,
         query: str,
         timeout: float,
         api_key: str,
+        *,
+        enforce_model_match: bool = True,
     ) -> dict[str, Any]:
         body = {
             "model": self.model,
@@ -257,7 +355,7 @@ class GatewayWebSearchAdapter:
         if not isinstance(payload, dict):
             raise GatewayWebSearchError("Gateway web search response is not a JSON object")
         raw_response_model = payload.get("model")
-        if self.require_response_model_match and (
+        if enforce_model_match and self.require_response_model_match and (
             not isinstance(raw_response_model, str)
             or not response_model_matches(self.model, raw_response_model)
         ):
@@ -266,6 +364,32 @@ class GatewayWebSearchAdapter:
             )
         _record_response_usage(payload, requested_model=self.model)
         return payload
+
+
+def _response_block_types(payload: dict[str, Any]) -> tuple[str, ...]:
+    blocks = payload.get("content")
+    if not isinstance(blocks, list):
+        return ()
+    return tuple(
+        sorted(
+            {
+                str(value.get("type"))
+                for value in _walk_json(blocks)
+                if isinstance(value.get("type"), str) and value.get("type")
+            }
+        )
+    )
+
+
+def _tool_result_count(payload: dict[str, Any]) -> int:
+    blocks = payload.get("content")
+    if not isinstance(blocks, list):
+        return 0
+    return sum(
+        1
+        for value in _walk_json(blocks)
+        if value.get("type") == "web_search_tool_result"
+    )
 
 
 def _record_response_usage(
@@ -416,6 +540,7 @@ def _response_sources(
                     "gateway_model": response_model,
                     "gateway_attempt": attempt,
                     "provider_request_attempts": attempt,
+                    "search_rank": rank + 1,
                     "page_age": page_age,
                     "candidate_only": True,
                     "requires_crawl": True,

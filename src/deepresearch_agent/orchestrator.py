@@ -4,12 +4,14 @@ import asyncio
 import json
 import time
 import uuid
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from deepresearch_agent.citation import (
     CitationChecker,
     best_evidence_quote,
+    entity_anchor_coverage,
     source_is_relevant_to_claim,
 )
 from deepresearch_agent.citation_judge import build_citation_judge_provider
@@ -472,6 +474,8 @@ class DeepResearchOrchestrator:
             fallback_used = False
             degraded = False
             errors: list[str] = []
+            failed_candidate_hints: list[dict[str, Any]] = []
+            retrieval_rounds: list[dict[str, Any]] = []
             provider = search_service.primary.name
             termination_reason = "max_rounds"
 
@@ -527,6 +531,38 @@ class DeepResearchOrchestrator:
                     termination_reason = "deadline"
                     errors.append("research deadline exceeded")
                     break
+                except Exception as exc:
+                    failure_hints = list(
+                        getattr(exc, "failed_candidate_hints", []) or []
+                    )
+                    failure_audit = dict(
+                        getattr(exc, "retrieval_audit", {}) or {}
+                    )
+                    if failure_audit:
+                        failure_audit = self._retrieval_round_audit(
+                            claim=subquestion.question,
+                            query=query,
+                            round_index=round_index,
+                            audit=failure_audit,
+                            sources=[],
+                            failed_candidate_hints=failure_hints,
+                        )
+                        retrieval_rounds.append(failure_audit)
+                    await self._record(
+                        trace,
+                        stage,
+                        "error",
+                        {
+                            "subquestion": subquestion.question,
+                            "provider": provider,
+                            "error": str(exc),
+                            "failed_candidate_hints": failure_hints,
+                            "retrieval_rounds": retrieval_rounds,
+                        },
+                        stage_start,
+                        emit,
+                    )
+                    raise
 
                 if cancel_check is not None:
                     cancel_check()
@@ -536,6 +572,20 @@ class DeepResearchOrchestrator:
                 degraded = degraded or outcome.degraded
                 if outcome.error:
                     errors.append(outcome.error)
+                failed_candidate_hints = self._merge_audit_hints(
+                    failed_candidate_hints,
+                    outcome.failed_candidate_hints,
+                )
+                retrieval_rounds.append(
+                    self._retrieval_round_audit(
+                        claim=subquestion.question,
+                        query=query,
+                        round_index=round_index,
+                        audit=outcome.retrieval_audit,
+                        sources=outcome.sources,
+                        failed_candidate_hints=outcome.failed_candidate_hints,
+                    )
+                )
                 raw_sources.extend(outcome.sources)
                 try:
                     round_rag_sources = enrich_source_metadata(
@@ -559,6 +609,9 @@ class DeepResearchOrchestrator:
                 verified = [
                     source
                     for source in verified
+                    if not source.metadata.get("snippet_only")
+                    and source.metadata.get("extract_status")
+                    not in {"snippet", "crawl_failed", "empty"}
                     if source_is_relevant_to_claim(subquestion.question, source)
                 ]
                 evidence = self._evidence_items(subquestion.question, verified)
@@ -674,6 +727,8 @@ class DeepResearchOrchestrator:
                 "provider_tool_attempts": provider_tool_attempts,
                 "termination_reason": termination_reason,
                 "budget_exhausted": budget_exhausted,
+                "failed_candidate_hints": failed_candidate_hints,
+                "retrieval_rounds": retrieval_rounds,
             }
             await self._record(trace, stage, status, payload, stage_start, emit)
             return finding, SearchOutcome(
@@ -683,6 +738,8 @@ class DeepResearchOrchestrator:
                 degraded=degraded,
                 error=payload["error"],
                 tool_attempts=provider_tool_attempts,
+                failed_candidate_hints=failed_candidate_hints,
+                retrieval_audit=self._aggregate_retrieval_rounds(retrieval_rounds),
             )
 
     def _evidence_items(
@@ -713,6 +770,102 @@ class DeepResearchOrchestrator:
                 )
             )
         return items
+
+    def _retrieval_round_audit(
+        self,
+        *,
+        claim: str,
+        query: str,
+        round_index: int,
+        audit: dict[str, Any],
+        sources: list[Source],
+        failed_candidate_hints: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        coverage_rows = [
+            entity_anchor_coverage(claim, f"{source.title} {source.content}")
+            for source in sources
+        ]
+        coverage_rows.extend(
+            entity_anchor_coverage(claim, str(hint.get("title") or ""))
+            for hint in failed_candidate_hints
+        )
+        anchor_count = max(
+            (int(row["anchor_count"]) for row in coverage_rows),
+            default=int(entity_anchor_coverage(claim, "")["anchor_count"]),
+        )
+        matched_distribution = Counter(
+            str(int(row["matched_anchor_count"])) for row in coverage_rows
+        )
+        required = 2 if anchor_count >= 2 else 1
+        eligible_count = (
+            sum(
+                1
+                for row in coverage_rows
+                if int(row["matched_anchor_count"]) >= required
+                or bool(row["complete_multiword_entity"])
+            )
+            if anchor_count
+            else 0
+        )
+        return {
+            "round_index": round_index,
+            "query": query,
+            "candidate_count": int(
+                audit.get("candidate_count")
+                or len(sources) + len(failed_candidate_hints)
+            ),
+            "fetchable_count": int(
+                audit.get("fetchable_count")
+                or len(sources) + len(failed_candidate_hints)
+            ),
+            "verified_count": int(audit.get("verified_count") or len(sources)),
+            "crawl_attempts": int(audit.get("crawl_attempts") or 0),
+            "error_classes": dict(audit.get("error_classes") or {}),
+            "entity_coverage": {
+                "anchor_count": anchor_count,
+                "max_matched_anchor_count": max(
+                    (
+                        int(row["matched_anchor_count"])
+                        for row in coverage_rows
+                    ),
+                    default=0,
+                ),
+                "eligible_candidate_count": eligible_count,
+                "matched_anchor_distribution": dict(
+                    sorted(matched_distribution.items())
+                ),
+            },
+        }
+
+    @staticmethod
+    def _merge_audit_hints(
+        existing: list[dict[str, Any]],
+        new: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for hint in [*existing, *new]:
+            fingerprint = json.dumps(hint, sort_keys=True, ensure_ascii=True)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            merged.append(hint)
+        return merged
+
+    @staticmethod
+    def _aggregate_retrieval_rounds(
+        rounds: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        errors: Counter[str] = Counter()
+        for item in rounds:
+            errors.update(item.get("error_classes") or {})
+        return {
+            "candidate_count": sum(int(item.get("candidate_count") or 0) for item in rounds),
+            "fetchable_count": sum(int(item.get("fetchable_count") or 0) for item in rounds),
+            "verified_count": sum(int(item.get("verified_count") or 0) for item in rounds),
+            "crawl_attempts": sum(int(item.get("crawl_attempts") or 0) for item in rounds),
+            "error_classes": dict(sorted(errors.items())),
+        }
 
     def _summarize_evidence(self, result: ResearchResult) -> str:
         if not result.evidence:

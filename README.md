@@ -205,7 +205,32 @@ $env:DEEPSEEK_API_KEY="<your-key>"
 py -3.11 -m deepresearch_agent.deep_research_eval --dataset livedrbench-preview --limit 1 --llm-provider deepseek --search-provider wikipedia --local-retrieval-mode keyword --max-researchers 1 --max-results 1 --request-timeout-seconds 8
 ```
 
-输出会写入 `logs/deep-research-eval-*.jsonl`、`results/deep_research_eval_summary.json` 和 `results/livedrbench_predictions.json`。当前脚本先产可复查 artifact 和 LiveDRBench-style predictions；可选 `--judge-provider heuristic` 会按 case 里的 `ground_truths` / `answer` / `expected_answer` 做本地字符串命中评分；可选 `--judge-provider deepseek --judge-model deepseek-v4-flash` 会用 `DEEPSEEK_API_KEY` 调 DeepSeek JSON mode 打分，并在 `answer_judgment` / `answer_judge` 里记录 judge model、token 和估算成本。官方 judge/answer-quality scoring 尚未接入。
+输出会写入 `logs/deep-research-eval-*.jsonl`、`results/deep_research_eval_summary.json` 和 `results/livedrbench_predictions.json`。当前脚本先产可复查 artifact 和 LiveDRBench-style predictions；可选 `--judge-provider heuristic` 会按 case 里的 `ground_truths` / `answer` / `expected_answer` 做本地字符串命中评分；`deepseek` 与 `llm-gateway` judge 会返回严格 JSON。答案判分固定为 `correct / incorrect / not_attempted / unscored`，始终以全部题目为分母；citation grounding 另算，不能用引用质量替代事实正确性。裁判实际返回模型不匹配、字段缺失或三次重试后仍无效时记为 `unscored`，不会静默跳过。官方 judge 尚未接入。
+
+### SimpleQA 公开质量评测
+
+`evals/simpleqa_public32_v1.jsonl` 是从 OpenAI `simple_qa_test_set.csv` 按固定 seed `20260714` 抽取的独立 32 题公开主集；source hash、上游 commit、抽样算法、源行号和 case hash 记录在同名 manifest。抽样同时平衡 topic（10 类，每类 3–4 题）与 answer type（5 类，每类 6–7 题）。历史 8 题集合只作为诊断回归集，不能代表整体 SimpleQA 质量。
+
+重新生成公开主集：
+
+```bash
+python scripts/build_simpleqa_public32.py \
+  --source-file /path/to/simple_qa_test_set.csv \
+  --exclude-cases /path/to/simpleqa-diagnostic.jsonl \
+  --output evals/simpleqa_public32_v1.jsonl \
+  --manifest evals/simpleqa_public32_v1.manifest.json
+```
+
+正式生成使用 `--single-model-run --require-clean-worktree`，brief、planner、synthesis 与 Gateway web search 必须显式使用同一模型；生成期禁止配置外部 LLM judge。Gateway 搜索摘要只是候选信息，只有安全 HTML crawler 成功得到的正文才能进入 evidence、合成上下文和引用。失败候选只在 trace 中保存不含正文、query string 或原始错误的审计 hint。
+
+离线检查固定 artifact 中答案事实在哪一层丢失：
+
+```bash
+python scripts/analyze_eval_snapshot.py --cases evals/simpleqa_public32_v1.jsonl \
+  --artifact /path/to/raw.jsonl --output /path/to/snapshot-audit.json
+```
+
+该工具分别统计 gold URL 候选、可引用正文、snippet/crawl-failed 候选，以及 650/1200 token 打包上下文，避免把搜索摘要命中误写成证据命中。Gateway server-side web-search 能力可用 `scripts/probe_gateway_web_search.py` 生成不保留响应正文的 capability artifact。两份事后重判可用 `scripts/summarize_dual_judges.py` 合并；合并器会保留自评、分歧和 `unscored`，双判一致只称为一致性证据，不冒充官方真值。
 
 运行 retrieval 对比 benchmark：
 
@@ -324,7 +349,7 @@ uv run deepresearch-benchmark --cases data/benchmark_cases.jsonl \
 
 ## Limitations / Future work
 
-当前完整回归：`LLM_PROVIDER=mock SEARCH_PROVIDER=mock LOCAL_RETRIEVAL_MODE=keyword uv run pytest -q` 通过，`118 passed, 1 warning`。warning 来自 FastAPI/Starlette 的 TestClient deprecation，未影响功能。ruff、compileall、`uv lock --check --offline` 和 `git diff --check` 同样通过。默认 hybrid 需要首次下载本地 embedding 模型；CI 和离线演示显式使用 keyword，避免把模型下载耗时混入功能回归。
+当前完整回归：`.venv/bin/python -m pytest -q` 通过，`308 passed, 1 warning`。warning 来自 FastAPI/Starlette 的 TestClient deprecation，未影响功能；ruff、compileall 和 `git diff --check` 同样通过。默认 hybrid 需要首次下载本地 embedding 模型；CI 和离线演示显式使用 keyword，避免把模型下载耗时混入功能回归。
 
 实测口径需要严格区分：mock benchmark 只证明离线路径、trace、citation ID 和记录链路能跑，不能当真实性能、真实成本或真实答案质量成果；DeepSeek v4-flash + Wikipedia benchmark 是真实 provider 小样本，延迟包含网络/API 时间，citation retention 仍是 lexical checker 口径，不是语义级事实评分。
 

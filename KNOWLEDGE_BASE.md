@@ -355,6 +355,15 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 代价：当前 synthesis/verifier 的控制面包装仍保留少量 stage instrumentation，SQLite 也仍是单机方案。
 面试怎么答：我会说先把业务执行和控制平面分开：engine 负责 stage 语义，RunController 负责 durable state、lease、retry 和 SSE，而不是把 SQLite 包装成生产级队列。
 
+## 决策 37：为什么先重建可信评测账本，而不是继续根据单次 live 结果调 harness
+
+背景：我连续做了几轮真实四模型评测后，一度把 Kimi 单次从 4/8 到 6/8 归因于 HTML 正文提取和 context budget。但重新审计发现 v7/v8 的搜索候选同时变化，两个版本都只有一次 live 生成，8 题单题波动就是 12.5 个百分点；旧 answer judge 还把事实正确性和 citation grounding 混在一起，缺字段的裁判结果也可能进入已评分分母。
+可选方案：继续根据 8 题单次分数调 prompt/crawler；放松引用和弃答换取表面成功率；先冻结公开主集、判分语义和可复现诊断，再做检索改动。
+最终选择：把原 8 题降级为诊断集；从 OpenAI 官方 SimpleQA 公开 CSV 按固定 seed 建 32 题主集，同时平衡 topic 和 answer type，并记录 source/case hash 与原始行号。答案裁判统一为 `correct / incorrect / not_attempted / unscored`，固定全部题目为分母，citation grounding 和 `grounded_correct` 单列；实际裁判模型不匹配、JSON 字段不全或三次失败都记 `unscored`。正式生成要求干净工作树和严格单模型，任何修复结论至少需要固定 artifact 分层分析与三次 live 重复。
+理由：这样能把“执行成功、事实答对、引用支撑、诚实弃答、裁判失败”拆成不同事实，也能防止我用一次搜索运气解释代码因果。
+代价：评测成本和总时长显著增加；32 题仍不是完整 SimpleQA，双裁判也不是官方真值，分歧和自评仍需人工披露；没有保存原始 HTML 的历史运行无法做严格 extractor A/B。
+面试怎么答：我会主动讲这次纠偏：真正的评测工程不是不断调参让数字上涨，而是先保证数据分布、固定分母、actual model、replay、自评和 `unscored` 都能审计。Kimi thinking 缺失是确定性协议 bug，但“HTML 是最大损耗”目前只有个案证据，不能外推。
+
 # 5 实现细节
 
 Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。`ResearchRequest.planner_model` 或 `LLM_PLANNER_MODEL` 可以覆盖 planning stage 的模型名。局限是 planner 还不会根据 researcher 中间结果做 LLM 语义级动态追加子问题。
@@ -369,7 +378,7 @@ Researcher：`src/deepresearch_agent/orchestrator.py` 的 `_research_one` 和共
 
 Reflection / Compression Loop：`src/deepresearch_agent/orchestrator.py` 的 `_run_reflection_rounds`、`_compress_findings`、`_reflect_on_evidence`。输入是初始 plan 和 researcher results，输出是可能扩展后的 plan/results。开启 `reflection_enabled` 后，每轮先把 findings 压成短文本写入 `compression.roundN` trace，再根据 fallback_count 和每个 finding 的唯一 source 数是否低于 `reflection_min_sources` 来决定是否追加 `R<N>` 子问题。`run_control.py` 的 researcher 阶段也调用同一个 helper，所以 `/research` 和 `/runs` 语义一致。局限是当前 policy 是启发式，不是 LLM reflection。
 
-Web Search / Crawler Provider：`src/deepresearch_agent/search.py`。`build_search_adapter()` 按 provider name 构造 `mock`、`wikipedia`、`searxng`、`jina`、`brave`、`tavily` 或 `mcp`，`build_crawler()` 按配置构造 `JinaReaderCrawler` 或 `HtmlTextCrawler`。`SearchService` 统一执行候选 URL→正文抽取→metadata enrichment；SearXNG 的兼容 crawler 路径也会写相同状态。每个 Source 记录 `retrieved_at`、`content_hash`、`content_type`、`extract_status`、`snippet_only`、`published_at` 和 `degrade_reason`。`fallback_policy=mock` 只用于离线兜底，`degraded` 保留弱结果并标记，`fail` 对空结果/全量抽取失败直接抛出，避免 live benchmark 混入 mock 来源。所有 key 都不进入 Settings 快照。
+Web Search / Crawler Provider：`src/deepresearch_agent/search.py`。`build_search_adapter()` 按 provider name 构造 `mock`、`wikipedia`、`searxng`、`jina`、`brave`、`tavily`、`gateway-web` 或 `mcp`，`build_crawler()` 按配置构造 `JinaReaderCrawler` 或 `HtmlTextCrawler`。`SearchService` 统一执行候选 URL→安全正文抽取→metadata enrichment；Gateway/Bing 搜索摘要只用于发现候选 URL，snippet/crawl-failed/empty 来源会在 verifier/evidence/citation 三层被拒绝，失败候选只保存脱敏 title、去 query URL、rank、错误分类和尝试次数。crawler 仅对 timeout、DNS/连接失败、429、5xx 单次重试，4xx、策略拒绝、非 HTML、过大响应和空正文不重试。每轮 trace 聚合 candidate/fetchable/verified、crawl attempts、error classes 和实体覆盖；所有 key 都不进入 Settings 快照。
 
 MCP Tool Adapter：`src/deepresearch_agent/mcp_tools.py`。`McpToolSearchAdapter` 用 `McpClient.call_tool()` 调配置好的 search tool，把 MCP result 里的 `sources` 或 `content[type=text]` 解析成统一 `Source`。`HttpMcpClient` 用 JSON-RPC HTTP POST，`StdioMcpClient` 用 MCP 的 `Content-Length` framing 和子进程 stdin/stdout。当前实现只覆盖 `tools/list`、`tools/call` 和 search-like result 转换，不做资源订阅或长连接池。
 
@@ -383,7 +392,7 @@ Rerank Provider：`src/deepresearch_agent/rerankers.py`。输入 query 和候选
 
 Retrieval Eval Harness：`src/deepresearch_agent/retrieval_eval.py`。输入是 BEIR/scifact 的 corpus、queries、qrels，输出 `results/retrieval_eval_scifact.json`。这个脚本不调用 LLM、不调用 Wikipedia、不跑 orchestrator，只把 SciFact 文档写成本项目 local corpus 格式，然后复用 `LocalRagRetriever` 跑 keyword / hybrid / hybrid+rerank。评测默认不保存每个 query 的 ranking 明细，避免结果文件过大；需要排查时可以显式加 `--include-rankings`。
 
-Public Deep Research Eval Harness：`src/deepresearch_agent/deep_research_eval.py`。输入可以是本地 JSONL/JSON/CSV，也可以直接从 Hugging Face datasets-server 拉 `microsoft/LiveDRBench` 的 `preview` 或 `v1-full` split。它会跑完整 `DeepResearchOrchestrator`，写 raw JSONL、summary JSON、manifest 和 LiveDRBench-style `preds` 文件。`judge_provider=none` 时 `answer_quality=null`，只产 execution/format/citation/cost 等可复查指标；`judge_provider=heuristic` 时调用本地字符串命中评分；`judge_provider=deepseek` 时用 `DEEPSEEK_API_KEY` 调 JSON mode，并记录 judge token/cost。`data/benchmark_cases.jsonl` 当前固定 24 条离线回归题。`--replay-dir` 是 snapshot replay：从 case-result artifact 恢复 case/report，复用 answer/source/claims/trace，并用当前格式/citation evaluator 重算指标；provider cassette 则通过 `CassetteLLMProvider` / `CassetteSearchAdapter` 真正重新执行 orchestrator。当前两者都没有自动录制真实 HTTP 流量的 recorder。
+Public Deep Research Eval Harness：`src/deepresearch_agent/deep_research_eval.py`。输入可以是本地 JSONL/JSON/CSV，也可以直接从 Hugging Face datasets-server 拉 `microsoft/LiveDRBench` 的 `preview` 或 `v1-full` split。它会跑完整 `DeepResearchOrchestrator`，写 raw JSONL、summary JSON、manifest 和 LiveDRBench-style `preds` 文件。`judge_provider=none` 时只产 execution/format/citation/cost；heuristic、DeepSeek 和 LLM Gateway answer judge 统一输出 `correct / incorrect / not_attempted / unscored`。Gateway judge 强制 actual model 匹配和完整 JSON；答案事实判断不读取 sources/citations，grounding 另算。`--require-clean-worktree` 为正式运行冻结 Git 状态，`--single-model-run` 强制 brief/planner/synthesis/search 同模型并禁止生成期外部 LLM judge。`evals/simpleqa_public32_v1.*` 保存公开主集与抽样 manifest；`scripts/analyze_eval_snapshot.py` 做正文/snippet/context 分层，`scripts/summarize_dual_judges.py` 合并事后双裁判且保留自评、分歧和未评分。
 
 Verifier：`src/deepresearch_agent/verifier.py`。输入是 source 列表，输出是过滤后的 source。关键设计是可解释 quality reasons。局限是规则打分，不能真正判断来源权威性。
 

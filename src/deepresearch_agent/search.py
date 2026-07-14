@@ -6,13 +6,15 @@ import html
 import json
 import os
 import re
+import socket
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any, Awaitable, Callable, Protocol
-from urllib.parse import quote, quote_plus, urlencode, urlsplit
+from urllib.parse import quote, quote_plus, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from deepresearch_agent.config import Settings
@@ -25,6 +27,10 @@ from deepresearch_agent.schemas import Source
 from deepresearch_agent.text_utils import tokenize
 from deepresearch_agent.url_policy import (
     DEFAULT_MAX_RESPONSE_BYTES,
+    ResponseTooLargeError,
+    SafeHTTPError,
+    UnsupportedContentTypeError,
+    URLPolicyError,
     fetch_text_url,
     no_redirect_urlopen,
     validate_url,
@@ -40,6 +46,21 @@ class SearchError(RuntimeError):
 
 class BenchmarkContaminationError(SearchError):
     """A public benchmark answer page was discovered during an evaluation run."""
+
+
+class SearchEvidenceUnavailableError(SearchError):
+    """Search found candidates, but none yielded safely crawled page evidence."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failed_candidate_hints: list[dict[str, Any]],
+        retrieval_audit: dict[str, Any],
+    ) -> None:
+        super().__init__(message)
+        self.failed_candidate_hints = failed_candidate_hints
+        self.retrieval_audit = retrieval_audit
 
 
 def _crawler_urlopen(request: Request, timeout: float) -> Any:
@@ -72,6 +93,8 @@ class SearchOutcome:
     degraded: bool = False
     error: str | None = None
     tool_attempts: int = 0
+    failed_candidate_hints: list[dict[str, Any]] = field(default_factory=list)
+    retrieval_audit: dict[str, Any] = field(default_factory=dict)
 
 
 class FetchedPage(str):
@@ -99,6 +122,157 @@ class FetchedPage(str):
     @property
     def content(self) -> str:
         return str(self)
+
+
+@dataclass(frozen=True)
+class CrawlErrorInfo:
+    error_class: str
+    retryable: bool
+
+
+def _classify_crawl_error(error: Exception) -> CrawlErrorInfo:
+    """Classify crawl failures without exposing raw upstream diagnostics."""
+
+    message = str(error).lower()
+    status_match = re.search(r"\bstatus\s+(\d{3})\b|\bhttp\s+(\d{3})\b", message)
+    status = int(next(value for value in status_match.groups() if value)) if status_match else None
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError, socket.timeout)) or any(
+        marker in message for marker in ("timed out", "timeout")
+    ):
+        return CrawlErrorInfo("timeout", True)
+    if status == 429:
+        return CrawlErrorInfo("http_429", True)
+    if status is not None and 500 <= status <= 599:
+        return CrawlErrorInfo("http_5xx", True)
+    if status is not None and 400 <= status <= 499:
+        return CrawlErrorInfo("http_4xx", False)
+    if isinstance(error, UnsupportedContentTypeError):
+        return CrawlErrorInfo("non_html", False)
+    if isinstance(error, ResponseTooLargeError):
+        return CrawlErrorInfo("response_too_large", False)
+    if isinstance(error, URLPolicyError):
+        if "dns resolution failed" in message:
+            return CrawlErrorInfo("dns_failure", True)
+        return CrawlErrorInfo("policy_rejected", False)
+    if isinstance(error, (ConnectionError, OSError)) or any(
+        marker in message
+        for marker in (
+            "connection refused",
+            "connection reset",
+            "connection aborted",
+            "remote end closed",
+            "temporary failure",
+            "network is unreachable",
+            "ssl",
+        )
+    ):
+        return CrawlErrorInfo("connection_failure", True)
+    if isinstance(error, SafeHTTPError):
+        return CrawlErrorInfo("transport_failure", False)
+    if "empty content" in message:
+        return CrawlErrorInfo("empty_content", False)
+    return CrawlErrorInfo("crawler_error", False)
+
+
+def _safe_audit_text(value: Any, *, max_chars: int = 240) -> str:
+    normalized = " ".join(str(value or "").split())
+    return normalized[:max_chars]
+
+
+def _safe_audit_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    try:
+        parsed = urlsplit(raw)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return ""
+        host = parsed.hostname
+        if ":" in host:
+            host = f"[{host}]"
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        return urlunsplit((parsed.scheme.lower(), host, parsed.path, "", ""))[:2048]
+    except ValueError:
+        return ""
+
+
+def _failed_candidate_hints(sources: list[Source]) -> list[dict[str, Any]]:
+    hints: list[dict[str, Any]] = []
+    for index, source in enumerate(sources, 1):
+        if source.metadata.get("extract_status") != "crawl_failed":
+            continue
+        hints.append(
+            {
+                "title": _safe_audit_text(source.title),
+                "url": _safe_audit_url(source.url),
+                "query": _safe_audit_text(source.query, max_chars=320),
+                "provider": _safe_audit_text(source.provider, max_chars=80),
+                "rank": int(source.metadata.get("search_rank") or index),
+                "crawl_status": "failed",
+                "error_class": _safe_audit_text(
+                    source.metadata.get("crawl_error_class") or "crawler_error",
+                    max_chars=80,
+                ),
+                "crawl_attempts": int(source.metadata.get("crawl_attempts") or 1),
+                "actual_model": _safe_audit_text(
+                    source.metadata.get("gateway_model"), max_chars=120
+                )
+                or None,
+            }
+        )
+    return hints
+
+
+def _retrieval_audit(
+    candidates: list[Source],
+    verified: list[Source],
+) -> dict[str, Any]:
+    error_classes = Counter(
+        str(source.metadata.get("crawl_error_class") or "crawler_error")
+        for source in candidates
+        if source.metadata.get("extract_status") == "crawl_failed"
+    )
+    return {
+        "candidate_count": len(candidates),
+        "fetchable_count": sum(
+            1 for source in candidates if source.url.startswith(("http://", "https://"))
+        ),
+        "verified_count": len(verified),
+        "crawl_attempts": sum(
+            int(source.metadata.get("crawl_attempts") or 0) for source in candidates
+        ),
+        "error_classes": dict(sorted(error_classes.items())),
+    }
+
+
+def _merge_failed_candidate_hints(
+    *groups: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for group in groups:
+        for hint in group:
+            fingerprint = json.dumps(hint, sort_keys=True, ensure_ascii=True)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            merged.append(hint)
+    return merged
+
+
+def _merge_retrieval_audits(*audits: dict[str, Any]) -> dict[str, Any]:
+    valid = [audit for audit in audits if audit]
+    if not valid:
+        return {}
+    errors: Counter[str] = Counter()
+    for audit in valid:
+        errors.update(audit.get("error_classes") or {})
+    return {
+        "candidate_count": sum(int(audit.get("candidate_count") or 0) for audit in valid),
+        "fetchable_count": sum(int(audit.get("fetchable_count") or 0) for audit in valid),
+        "verified_count": sum(int(audit.get("verified_count") or 0) for audit in valid),
+        "crawl_attempts": sum(int(audit.get("crawl_attempts") or 0) for audit in valid),
+        "error_classes": dict(sorted(errors.items())),
+    }
 
 
 class MockSearchAdapter:
@@ -435,16 +609,13 @@ class HtmlTextCrawler:
         return await asyncio.to_thread(self._crawl_sync, url, timeout)
 
     def _crawl_sync(self, url: str, timeout: float) -> FetchedPage:
-        try:
-            response = fetch_text_url(
-                url,
-                timeout=timeout,
-                headers={"User-Agent": "deepresearch-agent/0.1 local interview project"},
-                max_response_bytes=self.max_response_bytes,
-                opener=_crawler_urlopen,
-            )
-        except Exception as exc:  # pragma: no cover - depends on live network
-            raise SearchError(str(exc)) from exc
+        response = fetch_text_url(
+            url,
+            timeout=timeout,
+            headers={"User-Agent": "deepresearch-agent/0.1 local interview project"},
+            max_response_bytes=self.max_response_bytes,
+            opener=_crawler_urlopen,
+        )
         parser = _HtmlTextParser()
         parser.feed(response)
         return FetchedPage(
@@ -816,14 +987,19 @@ class SearchService:
         if self.primary.name == self.fallback.name:
             request_timeout = self._primary_timeout_seconds()
             sources = await self.fallback.search(query, max_results, request_timeout)
+            enriched = enrich_source_metadata(sources)
             return SearchOutcome(
-                sources=enrich_source_metadata(sources),
+                sources=enriched,
                 provider=self.fallback.name,
                 tool_attempts=1,
+                failed_candidate_hints=_failed_candidate_hints(enriched),
+                retrieval_audit=_retrieval_audit(enriched, enriched),
             )
 
         last_error: str | None = None
         tool_attempts = 0
+        failed_candidate_hints: list[dict[str, Any]] = []
+        retrieval_audit: dict[str, Any] = {}
         if self.breaker.allow():
             request_timeout = self._primary_timeout_seconds()
             service_attempts = 1 if self.gateway_chain else self.settings.max_retries + 1
@@ -840,44 +1016,65 @@ class SearchService:
                     self._raise_if_benchmark_contaminated(sources, query=query)
                     tool_attempts += self._provider_extra_attempts(sources)
                     self.breaker.record_success()
-                    tool_attempts += self._crawl_attempt_count(sources)
                     sources = await self._crawl_sources(sources)
+                    tool_attempts += self._crawl_attempt_count(sources)
                     self._raise_if_benchmark_contaminated(sources, query=query)
-                    sources, crawl_errors = self._evidence_ready_sources(
+                    (
                         sources,
-                        provider=self.primary.name,
+                        crawl_errors,
+                        current_hints,
+                        current_audit,
+                    ) = self._evidence_ready_sources(
+                        sources, provider=self.primary.name
                     )
                     if crawl_errors:
                         error = "; ".join(dict.fromkeys(crawl_errors))
-                        extracted_sources = [
-                            source
-                            for source in sources
-                            if not source.metadata.get("snippet_only", False)
-                        ]
-                        # For gateway-chain with snippet fallback: sources marked
-                        # evidence_grade=snippet are usable degraded evidence
-                        snippet_evidence = [
-                            source
-                            for source in sources
-                            if source.metadata.get("evidence_grade") == "snippet"
-                        ]
-                        if self.fallback_policy == "fail":
-                            if not extracted_sources and not snippet_evidence:
-                                raise SearchError(f"crawler extraction failed: {error}")
-                            sources = extracted_sources or snippet_evidence
-                        elif self.fallback_policy == "mock" and not extracted_sources and not snippet_evidence:
-                            raise SearchError(f"crawler extraction failed: {error}")
+                        if not self.gateway_chain and self.fallback_policy != "degraded":
+                            sources = [
+                                source
+                                for source in sources
+                                if source.metadata.get("extract_status") == "ok"
+                                and source.metadata.get("snippet_only") is False
+                            ]
+                        if not sources:
+                            message = (
+                                f"{self.primary.name} returned only unverified candidates; "
+                                f"safe crawl required: {error}"
+                                if self.gateway_chain
+                                else f"crawler extraction failed: {error}"
+                            )
+                            raise SearchEvidenceUnavailableError(
+                                message,
+                                failed_candidate_hints=current_hints,
+                                retrieval_audit=current_audit,
+                            )
+                        failed_candidate_hints = _merge_failed_candidate_hints(
+                            failed_candidate_hints, current_hints
+                        )
+                        retrieval_audit = _merge_retrieval_audits(
+                            retrieval_audit, current_audit
+                        )
                         return SearchOutcome(
                             sources=enrich_source_metadata(sources),
                             provider=self.primary.name,
                             degraded=True,
                             error=error,
                             tool_attempts=tool_attempts,
+                            failed_candidate_hints=failed_candidate_hints,
+                            retrieval_audit=retrieval_audit,
                         )
+                    failed_candidate_hints = _merge_failed_candidate_hints(
+                        failed_candidate_hints, current_hints
+                    )
+                    retrieval_audit = _merge_retrieval_audits(
+                        retrieval_audit, current_audit
+                    )
                     return SearchOutcome(
                         sources=enrich_source_metadata(sources),
                         provider=self.primary.name,
                         tool_attempts=tool_attempts,
+                        failed_candidate_hints=failed_candidate_hints,
+                        retrieval_audit=retrieval_audit,
                     )
                 except BenchmarkContaminationError:
                     # A benchmark answer page is not an ordinary transient search
@@ -886,6 +1083,14 @@ class SearchService:
                     raise
                 except Exception as exc:
                     last_error = str(exc)
+                    failed_candidate_hints = _merge_failed_candidate_hints(
+                        failed_candidate_hints,
+                        getattr(exc, "failed_candidate_hints", []),
+                    )
+                    retrieval_audit = _merge_retrieval_audits(
+                        retrieval_audit,
+                        getattr(exc, "retrieval_audit", {}),
+                    )
                     tool_attempts += self._exception_extra_attempts(exc)
                     self.breaker.record_failure()
                     if isinstance(exc, GatewayWebSearchNoResultsError):
@@ -901,8 +1106,16 @@ class SearchService:
                 max_results,
                 primary_error=last_error,
                 tool_attempts=tool_attempts,
+                failed_candidate_hints=failed_candidate_hints,
+                retrieval_audit=retrieval_audit,
             )
         if self.fallback_policy == "fail":
+            if failed_candidate_hints:
+                raise SearchEvidenceUnavailableError(
+                    last_error or f"{self.primary.name} search failed",
+                    failed_candidate_hints=failed_candidate_hints,
+                    retrieval_audit=retrieval_audit,
+                )
             raise SearchError(last_error or f"{self.primary.name} search failed")
         if self.fallback_policy == "degraded":
             return SearchOutcome(
@@ -911,6 +1124,8 @@ class SearchService:
                 degraded=True,
                 error=last_error,
                 tool_attempts=tool_attempts,
+                failed_candidate_hints=failed_candidate_hints,
+                retrieval_audit=retrieval_audit,
             )
 
         tool_attempts += 1
@@ -927,6 +1142,7 @@ class SearchService:
             fallback_used=True,
             error=last_error,
             tool_attempts=tool_attempts,
+            retrieval_audit=_retrieval_audit(fallback_sources, fallback_sources),
         )
 
     async def _search_real_fallback(
@@ -936,6 +1152,8 @@ class SearchService:
         *,
         primary_error: str | None,
         tool_attempts: int,
+        failed_candidate_hints: list[dict[str, Any]],
+        retrieval_audit: dict[str, Any],
     ) -> SearchOutcome:
         fallback_error: str | None = None
         try:
@@ -950,14 +1168,31 @@ class SearchService:
                 raise SearchError(f"{self.fallback.name} returned no results")
             self._raise_if_benchmark_contaminated(fallback_sources, query=query)
             tool_attempts += self._provider_extra_attempts(fallback_sources)
-            tool_attempts += self._crawl_attempt_count(fallback_sources)
             fallback_sources = await self._crawl_sources(fallback_sources)
+            tool_attempts += self._crawl_attempt_count(fallback_sources)
             self._raise_if_benchmark_contaminated(fallback_sources, query=query)
-            fallback_sources, crawl_errors = self._evidence_ready_sources(
+            (
                 fallback_sources,
-                provider=self.fallback.name,
+                crawl_errors,
+                fallback_hints,
+                fallback_audit,
+            ) = self._evidence_ready_sources(
+                fallback_sources, provider=self.fallback.name
             )
             fallback_error = "; ".join(dict.fromkeys(crawl_errors)) or None
+            if not fallback_sources:
+                detail = fallback_error or "no page body was extracted"
+                raise SearchEvidenceUnavailableError(
+                    f"crawler extraction failed: {detail}",
+                    failed_candidate_hints=fallback_hints,
+                    retrieval_audit=fallback_audit,
+                )
+            failed_candidate_hints = _merge_failed_candidate_hints(
+                failed_candidate_hints, fallback_hints
+            )
+            retrieval_audit = _merge_retrieval_audits(
+                retrieval_audit, fallback_audit
+            )
             audit_error = "; ".join(
                 item
                 for item in (
@@ -990,10 +1225,20 @@ class SearchService:
                 degraded=bool(fallback_error),
                 error=audit_error or None,
                 tool_attempts=tool_attempts,
+                failed_candidate_hints=failed_candidate_hints,
+                retrieval_audit=retrieval_audit,
             )
         except BenchmarkContaminationError:
             raise
         except Exception as exc:
+            failed_candidate_hints = _merge_failed_candidate_hints(
+                failed_candidate_hints,
+                getattr(exc, "failed_candidate_hints", []),
+            )
+            retrieval_audit = _merge_retrieval_audits(
+                retrieval_audit,
+                getattr(exc, "retrieval_audit", {}),
+            )
             tool_attempts += self._exception_extra_attempts(exc)
             fallback_error = str(exc)
 
@@ -1013,6 +1258,14 @@ class SearchService:
                 degraded=True,
                 error=combined_error or None,
                 tool_attempts=tool_attempts,
+                failed_candidate_hints=failed_candidate_hints,
+                retrieval_audit=retrieval_audit,
+            )
+        if failed_candidate_hints:
+            raise SearchEvidenceUnavailableError(
+                combined_error or "real search providers failed",
+                failed_candidate_hints=failed_candidate_hints,
+                retrieval_audit=retrieval_audit,
             )
         raise SearchError(combined_error or "real search providers failed")
 
@@ -1053,19 +1306,25 @@ class SearchService:
         sources: list[Source],
         *,
         provider: str,
-    ) -> tuple[list[Source], list[str]]:
+    ) -> tuple[
+        list[Source],
+        list[str],
+        list[dict[str, Any]],
+        dict[str, Any],
+    ]:
         crawl_errors = [
-            str(source.metadata.get("degrade_reason"))
+            str(source.metadata.get("crawl_error_class") or "crawler_error")
             for source in sources
             if source.metadata.get("extract_status") == "crawl_failed"
-            and source.metadata.get("degrade_reason")
         ]
         requires_crawl = self.gateway_chain and provider in {
             self.primary.name,
             self.fallback.name,
         }
         if not requires_crawl:
-            return sources, crawl_errors
+            return sources, crawl_errors, _failed_candidate_hints(sources), _retrieval_audit(
+                sources, sources
+            )
         evidence_ready = [
             source
             for source in sources
@@ -1073,40 +1332,17 @@ class SearchService:
             and source.metadata.get("snippet_only") is False
             and source.metadata.get("crawler") not in {None, "", "none"}
         ]
-        if not evidence_ready:
-            # Fallback: use snippet sources as degraded evidence instead of failing
-            # entirely. Mark them so citation grounding knows they are snippet-grade.
-            snippet_sources = [
-                source.model_copy(
-                    update={
-                        "metadata": {
-                            **source.metadata,
-                            "evidence_grade": "snippet",
-                            "retrieval_degraded": True,
-                            "degrade_reason": "crawl failed; using search snippet as evidence",
-                        }
-                    }
-                )
-                for source in sources
-                if source.content and source.content.strip()
-            ]
-            if snippet_sources:
-                return snippet_sources, crawl_errors
-            detail = "; ".join(dict.fromkeys(crawl_errors)) or "no page body was extracted"
-            raise SearchError(
-                f"{provider} returned only unverified candidates; safe crawl required: {detail}"
-            )
-        return evidence_ready, crawl_errors
+        del provider
+        return (
+            evidence_ready,
+            crawl_errors,
+            _failed_candidate_hints(sources),
+            _retrieval_audit(sources, evidence_ready),
+        )
 
     def _crawl_attempt_count(self, sources: list[Source]) -> int:
-        if self.crawler is None:
-            return 0
         return sum(
-            1
-            for source in sources
-            if source.provider != "mock"
-            and source.url.startswith(("http://", "https://"))
-            and source.metadata.get("crawler") in {None, "", "none"}
+            int(source.metadata.get("crawl_attempts") or 0) for source in sources
         )
 
     def _primary_timeout_seconds(self) -> float:
@@ -1129,51 +1365,62 @@ class SearchService:
             metadata = dict(source.metadata)
             metadata.setdefault("search_snippet", source.content)
             metadata["crawler"] = self.crawler.name
-            try:
-                crawled = await self.crawler.crawl(
-                    source.url,
-                    self.settings.request_timeout_seconds,
-                )
-                if isinstance(crawled, FetchedPage):
-                    content = crawled.content
-                    final_url = crawled.final_url
-                    redirect_chain = crawled.redirect_chain
-                else:
-                    content = str(crawled)
-                    final_url = source.url
-                    redirect_chain = (source.url,)
-                if not content.strip():
-                    raise SearchError("crawler returned empty content")
-                # The fetcher validated each redirect target. Preserve the final
-                # canonical URL so evidence, deduplication and diversity metrics
-                # do not count several aliases as independent pages.
-                validate_url(final_url)
-                metadata.update(
-                    {
-                        "extract_status": "ok",
-                        "content_type": "text/plain",
-                        "snippet_only": False,
-                        "candidate_only": False,
-                        "requires_crawl": False,
-                        "verification_status": "crawled",
-                        "redirect_chain": list(redirect_chain),
-                    }
-                )
-                return source.model_copy(
-                    update={"url": final_url, "content": content, "metadata": metadata}
-                )
-            except Exception as exc:  # noqa: BLE001 - crawler errors degrade to the snippet.
-                metadata.update(
-                    {
-                        "extract_status": "crawl_failed",
-                        "crawler_error": str(exc),
-                        "degrade_reason": str(exc),
-                        "snippet_only": True,
-                        "candidate_only": True,
-                        "verification_status": "crawl_failed",
-                    }
-                )
-                return source.model_copy(update={"metadata": metadata})
+            for attempt in (1, 2):
+                try:
+                    crawled = await self.crawler.crawl(
+                        source.url,
+                        self.settings.request_timeout_seconds,
+                    )
+                    if isinstance(crawled, FetchedPage):
+                        content = crawled.content
+                        final_url = crawled.final_url
+                        redirect_chain = crawled.redirect_chain
+                    else:
+                        content = str(crawled)
+                        final_url = source.url
+                        redirect_chain = (source.url,)
+                    if not content.strip():
+                        raise SearchError("crawler returned empty content")
+                    # The fetcher validated each redirect target. Preserve the final
+                    # canonical URL so evidence, deduplication and diversity metrics
+                    # do not count several aliases as independent pages.
+                    validate_url(final_url)
+                    metadata.update(
+                        {
+                            "extract_status": "ok",
+                            "content_type": "text/plain",
+                            "snippet_only": False,
+                            "candidate_only": False,
+                            "requires_crawl": False,
+                            "verification_status": "crawled",
+                            "redirect_chain": list(redirect_chain),
+                            "crawl_attempts": attempt,
+                        }
+                    )
+                    return source.model_copy(
+                        update={"url": final_url, "content": content, "metadata": metadata}
+                    )
+                except Exception as exc:  # noqa: BLE001 - classify before bounded retry.
+                    error_info = _classify_crawl_error(exc)
+                    if attempt == 1 and error_info.retryable:
+                        await self._retry_backoff(0)
+                        continue
+                    metadata.update(
+                        {
+                            "extract_status": "crawl_failed",
+                            "crawler_error": str(exc),
+                            "crawl_error_class": error_info.error_class,
+                            "crawl_retryable": error_info.retryable,
+                            "crawl_attempts": attempt,
+                            "degrade_reason": error_info.error_class,
+                            "snippet_only": True,
+                            "candidate_only": True,
+                            "verification_status": "crawl_failed",
+                        }
+                    )
+                    return source.model_copy(update={"metadata": metadata})
+
+            raise AssertionError("crawler retry loop exhausted without a result")
 
         return list(await asyncio.gather(*(crawl_one(source) for source in sources)))
 

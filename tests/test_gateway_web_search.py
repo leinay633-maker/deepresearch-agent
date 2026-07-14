@@ -12,6 +12,7 @@ from deepresearch_agent.config import Settings, load_settings
 from deepresearch_agent.cost import CostTracker
 from deepresearch_agent.gateway_search import (
     GatewayWebSearchAdapter,
+    GatewayWebSearchCapabilityProbe,
     GatewayWebSearchError,
     GatewayWebSearchUsage,
     capture_gateway_web_search_usage,
@@ -440,6 +441,82 @@ def test_gateway_web_search_does_not_invent_missing_usage(
     assert receipts == []
 
 
+def test_gateway_web_search_capability_probe_distinguishes_text_only_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "test-gateway-key")
+    adapter = GatewayWebSearchAdapter(
+        base_url="https://gateway.example",
+        model="glm-5.2",
+        transport=httpx.MockTransport(
+            lambda request: _json_response(
+                {
+                    "model": "glm-5.2",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "private model answer that the probe must not retain",
+                        }
+                    ],
+                }
+            )
+        ),
+    )
+
+    probe = asyncio.run(adapter.probe_capability(timeout=1.0))
+
+    assert probe == GatewayWebSearchCapabilityProbe(
+        requested_model="glm-5.2",
+        actual_response_model="glm-5.2",
+        content_block_types=("text",),
+        tool_result_count=0,
+        status="text_only_no_tool",
+    )
+    assert "private model answer" not in repr(probe)
+
+
+def test_gateway_web_search_capability_probe_reports_tool_results_without_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "test-gateway-key")
+    adapter = GatewayWebSearchAdapter(
+        base_url="https://gateway.example",
+        model="claude-4.6-opus",
+        transport=httpx.MockTransport(
+            lambda request: _json_response(
+                {
+                    "model": "claude-4.6-opus-20260701",
+                    "content": [
+                        {
+                            "type": "web_search_tool_result",
+                            "content": [
+                                {
+                                    "type": "web_search_result",
+                                    "title": "Secret-free probe result",
+                                    "url": "https://example.com/probe?token=must-not-persist",
+                                    "cited_text": "body must not persist",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+        ),
+    )
+
+    probe = asyncio.run(adapter.probe_capability(timeout=1.0))
+
+    assert probe.status == "tool_results"
+    assert probe.actual_response_model == "claude-4.6-opus-20260701"
+    assert probe.content_block_types == (
+        "web_search_result",
+        "web_search_tool_result",
+    )
+    assert probe.tool_result_count == 1
+    assert "must-not-persist" not in repr(probe)
+    assert "body must not persist" not in repr(probe)
+
+
 class _StubCrawler:
     name = "safe_stub"
 
@@ -514,6 +591,27 @@ def test_gateway_web_search_drops_uncrawled_candidates_from_evidence(
     assert outcome.sources[0].metadata["candidate_only"] is False
     assert outcome.sources[0].metadata["verification_status"] == "crawled"
     assert outcome.sources[0].metadata["snippet_only"] is False
+    assert outcome.failed_candidate_hints == [
+        {
+            "title": "Result 1",
+            "url": urls[0],
+            "query": "evidence query",
+            "provider": "gateway-web",
+            "rank": 1,
+            "crawl_status": "failed",
+            "error_class": "crawler_error",
+            "crawl_attempts": 1,
+            "actual_model": "claude-4.6-opus",
+        }
+    ]
+    assert outcome.retrieval_audit == {
+        "candidate_count": 2,
+        "fetchable_count": 2,
+        "verified_count": 1,
+        "crawl_attempts": 2,
+        "error_classes": {"crawler_error": 1},
+    }
+    assert all(source.content != "Result 1" for source in outcome.sources)
 
 
 def test_orchestrator_records_gateway_usage_once_after_crawl_and_multiple_sources(
@@ -562,7 +660,9 @@ def test_orchestrator_records_gateway_usage_once_after_crawl_and_multiple_source
         name = "safe_relevant_crawler"
 
         async def crawl(self, url: str, timeout: float) -> str:
-            del url, timeout
+            del timeout
+            if url.endswith("python-313-notes"):
+                raise SearchError("safe crawl failed")
             return (
                 "Python 3.13.0 was released on October 7, 2024. "
                 "The official release page documents the Python 3.13.0 release date."
@@ -588,13 +688,14 @@ def test_orchestrator_records_gateway_usage_once_after_crawl_and_multiple_source
         search_query="Python 3.13.0 release date",
     )
 
+    trace = TraceLogger("gateway-usage-test", write_enabled=False)
     _finding, outcome = asyncio.run(
         orchestrator._research_one(
             subquestion,
             request,
             service,
             asyncio.Semaphore(1),
-            TraceLogger("gateway-usage-test", write_enabled=False),
+            trace,
             None,
             llm,
             cost,
@@ -604,7 +705,7 @@ def test_orchestrator_records_gateway_usage_once_after_crawl_and_multiple_source
     search_records = [
         record for record in cost.records if record.stage == "gateway_web_search"
     ]
-    assert len(outcome.sources) == 2
+    assert len(outcome.sources) == 1
     assert len(search_records) == 1
     assert search_records[0].model == "actual-search-model"
     assert search_records[0].provider == "llm-gateway"
@@ -614,6 +715,21 @@ def test_orchestrator_records_gateway_usage_once_after_crawl_and_multiple_source
     assert search_records[0].output_tokens == 3
     assert search_records[0].estimated_cost_usd == 0.0
     assert all("usage" not in source.metadata for source in outcome.sources)
+    researcher_event = next(
+        event for event in trace.events if event.stage == "researcher.Q1"
+    )
+    round_audit = researcher_event.payload["retrieval_rounds"][0]
+    assert round_audit["candidate_count"] == 2
+    assert round_audit["fetchable_count"] == 2
+    assert round_audit["verified_count"] == 1
+    assert round_audit["error_classes"] == {"crawler_error": 1}
+    assert "entity_coverage" in round_audit
+    assert researcher_event.payload["failed_candidate_hints"][0]["title"] == (
+        "Python 3.13 release notes"
+    )
+    assert "safe crawl failed" not in str(
+        researcher_event.payload["failed_candidate_hints"]
+    )
 
 
 def test_gateway_empty_retries_do_not_stack_and_bing_fallback_is_auditable(

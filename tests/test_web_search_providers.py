@@ -24,6 +24,11 @@ from deepresearch_agent.search import (
 from deepresearch_agent.schemas import Source
 from deepresearch_agent.search import MockSearchAdapter, SearchService
 from deepresearch_agent.search import FetchedPage
+from deepresearch_agent.url_policy import (
+    SafeHTTPError,
+    UnsupportedContentTypeError,
+    URLPolicyError,
+)
 
 class FakeResponse:
     def __init__(self, payload: dict[str, Any] | str) -> None:
@@ -187,6 +192,137 @@ class RedirectingCrawler:
             final_url="https://example.com/canonical",
             redirect_chain=(url, "https://example.com/canonical"),
         )
+
+
+class _OneCandidateAdapter:
+    name = "remote"
+
+    async def search(self, query: str, max_results: int, timeout: float) -> list[Source]:
+        del max_results, timeout
+        return [
+            Source(
+                title="Remote candidate",
+                url="https://example.com/candidate?token=strip-me",
+                content="unverified snippet",
+                provider=self.name,
+                query=query,
+            )
+        ]
+
+
+class _FailingAuditCrawler:
+    name = "failing_audit"
+
+    def __init__(self, error_factory) -> None:
+        self.error_factory = error_factory
+        self.calls = 0
+
+    async def crawl(self, url: str, timeout: float) -> str:
+        del url, timeout
+        self.calls += 1
+        raise self.error_factory()
+
+
+@pytest.mark.parametrize(
+    ("error_factory", "expected_class", "expected_attempts"),
+    [
+        (lambda: TimeoutError("timed out"), "timeout", 2),
+        (lambda: ConnectionError("connection reset"), "connection_failure", 2),
+        (lambda: SafeHTTPError("HTTP request failed with status 429"), "http_429", 2),
+        (lambda: SafeHTTPError("HTTP request failed with status 503"), "http_5xx", 2),
+        (lambda: SafeHTTPError("HTTP request failed with status 404"), "http_4xx", 1),
+        (lambda: URLPolicyError("blocked hostname: localhost"), "policy_rejected", 1),
+        (
+            lambda: UnsupportedContentTypeError(
+                "unsupported response Content-Type: image/png"
+            ),
+            "non_html",
+            1,
+        ),
+    ],
+)
+def test_crawler_retries_only_transient_failures_and_records_error_class(
+    error_factory,
+    expected_class: str,
+    expected_attempts: int,
+) -> None:
+    crawler = _FailingAuditCrawler(error_factory)
+    service = SearchService(
+        primary=_OneCandidateAdapter(),
+        fallback=MockSearchAdapter(),
+        settings=Settings(
+            local_retrieval_mode="none",
+            search_retry_backoff_seconds=0,
+        ),
+        crawler=crawler,
+        fallback_policy="degraded",
+    )
+
+    outcome = asyncio.run(service.search("audit query", max_results=1))
+
+    assert crawler.calls == expected_attempts
+    assert outcome.tool_attempts == 1 + expected_attempts
+    assert outcome.sources[0].metadata["crawl_error_class"] == expected_class
+    assert outcome.sources[0].metadata["crawl_attempts"] == expected_attempts
+    assert outcome.retrieval_audit["error_classes"] == {expected_class: 1}
+    assert outcome.failed_candidate_hints[0]["error_class"] == expected_class
+    assert outcome.failed_candidate_hints[0]["url"] == "https://example.com/candidate"
+    assert "strip-me" not in str(outcome.failed_candidate_hints)
+
+
+@pytest.mark.parametrize(
+    ("error_factory", "expected_class", "expected_attempts"),
+    [
+        (
+            lambda: URLPolicyError("DNS resolution failed for example.com"),
+            "dns_failure",
+            2,
+        ),
+        (
+            lambda: URLPolicyError("blocked hostname: localhost"),
+            "policy_rejected",
+            1,
+        ),
+        (
+            lambda: UnsupportedContentTypeError(
+                "unsupported response Content-Type: image/png"
+            ),
+            "non_html",
+            1,
+        ),
+    ],
+)
+def test_html_crawler_preserves_safe_error_types_for_retry_classification(
+    monkeypatch: pytest.MonkeyPatch,
+    error_factory,
+    expected_class: str,
+    expected_attempts: int,
+) -> None:
+    calls = 0
+
+    def fail_fetch(*args, **kwargs):
+        nonlocal calls
+        del args, kwargs
+        calls += 1
+        raise error_factory()
+
+    monkeypatch.setattr("deepresearch_agent.search.fetch_text_url", fail_fetch)
+    service = SearchService(
+        primary=_OneCandidateAdapter(),
+        fallback=MockSearchAdapter(),
+        settings=Settings(
+            local_retrieval_mode="none",
+            search_retry_backoff_seconds=0,
+        ),
+        crawler=HtmlTextCrawler(),
+        fallback_policy="degraded",
+    )
+
+    outcome = asyncio.run(service.search("audit query", max_results=1))
+
+    assert calls == expected_attempts
+    assert outcome.retrieval_audit["error_classes"] == {expected_class: 1}
+    assert outcome.failed_candidate_hints[0]["crawl_attempts"] == expected_attempts
 
 
 class _TwoAliasAdapter:

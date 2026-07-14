@@ -246,6 +246,54 @@ def test_source_relevance_rejects_single_place_overlap_for_entity_rich_question(
     assert source_is_relevant_to_claim(query, relevant_record) is True
 
 
+def test_source_relevance_rejects_single_acronym_collision_in_multi_entity_question() -> None:
+    query = (
+        "In the video game Project Firebreak, what does the acronym CYAN stand for?"
+    )
+    unrelated_cyan_page = Source(
+        id="S1",
+        title="CyAN color terminology",
+        url="https://example.com/cyan-color",
+        content=(
+            "CYAN is discussed as a blue-green color term and printing component. "
+            "This reference explains what the acronym CYAN can mean in color systems."
+        ),
+        provider="web",
+        query=query,
+        metadata={"extract_status": "ok", "snippet_only": False},
+    )
+    project_page = Source(
+        id="S2",
+        title="Project Firebreak game guide",
+        url="https://example.com/project-firebreak",
+        content=(
+            "Project Firebreak includes an organization abbreviated CYAN. "
+            "The game guide expands the acronym in its story reference section."
+        ),
+        provider="web",
+        query=query,
+        metadata={"extract_status": "ok", "snippet_only": False},
+    )
+
+    assert source_is_relevant_to_claim(query, unrelated_cyan_page) is False
+    assert source_is_relevant_to_claim(query, project_page) is True
+
+
+def test_source_relevance_keeps_single_acronym_query_compatible() -> None:
+    query = "What does TPLF stand for?"
+    source = Source(
+        id="S1",
+        title="TPLF overview",
+        url="https://example.com/tplf",
+        content="TPLF stands for the Tigray People's Liberation Front.",
+        provider="web",
+        query=query,
+        metadata={"extract_status": "ok", "snippet_only": False},
+    )
+
+    assert source_is_relevant_to_claim(query, source) is True
+
+
 def test_cost_tracker_can_record_provider_usage() -> None:
     tracker = CostTracker(provider="deepseek", model="deepseek-v4-flash")
 

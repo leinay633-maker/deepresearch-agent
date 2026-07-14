@@ -5,12 +5,20 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import deepresearch_agent.deep_research_eval as eval_module
 import pytest
+from deepresearch_agent.benchmark import (
+    attach_answer_quality,
+    build_case_evaluation_metrics,
+    evaluation_summary,
+)
 from deepresearch_agent.config import Settings
 from deepresearch_agent.deep_research_eval import (
     _effective_citation_judge_model,
+    _generation_models,
+    _is_self_judge,
     _prediction_payload,
     _sealed_stdout_summary,
     _validate_single_model_run_args,
@@ -124,6 +132,40 @@ def test_gateway_citation_judge_uses_gateway_model_default() -> None:
     ) == "glm-5.2"
 
 
+def test_self_judge_flag_uses_actual_judge_model() -> None:
+    assert _is_self_judge(
+        {"provider": "llm-gateway", "model": "claude-opus-4-8"},
+        generation_models={"claude-opus-4-8"},
+    ) is True
+    assert _is_self_judge(
+        {"provider": "llm-gateway", "model": "glm-5.2"},
+        generation_models={"claude-opus-4-8"},
+    ) is False
+    assert _is_self_judge(
+        {"provider": "heuristic", "model": "claude-opus-4-8"},
+        generation_models={"claude-opus-4-8"},
+    ) is False
+
+
+def test_generation_models_recovers_actual_model_from_replay_usage() -> None:
+    record = {
+        "cost": {
+            "records": [
+                {
+                    "stage": "planning",
+                    "model": "claude-opus-4-8-20260701",
+                },
+                {"stage": "answer_judge", "model": "kimi-k2.7-code-highspeed"},
+            ]
+        }
+    }
+
+    assert _generation_models(record, configured_model="mock-default") == {
+        "mock-default",
+        "claude-opus-4-8-20260701",
+    }
+
+
 def test_single_model_run_requires_all_generation_models_to_match() -> None:
     model = "claude-opus-4-8"
     matching = argparse.Namespace(
@@ -222,8 +264,115 @@ def test_heuristic_answer_judge_scores_ground_truth_groups() -> None:
     )
 
     assert judgment.score == 1.0
-    assert judgment.verdict == "pass"
+    assert judgment.verdict == "correct"
     assert judgment.missing == []
+
+
+def test_heuristic_answer_judge_marks_evidence_abstention_not_attempted() -> None:
+    provider = HeuristicAnswerJudgeProvider()
+
+    judgment = provider.judge(
+        {"metadata": {"answer": "Ada"}},
+        {
+            "answer": (
+                "The available sources are insufficient to support a citation-verified "
+                "answer."
+            )
+        },
+    )
+
+    assert judgment.score == 0.0
+    assert judgment.verdict == "not_attempted"
+
+
+def test_abstention_is_emitted_but_not_a_usable_substantive_answer() -> None:
+    citation_check = SimpleNamespace(
+        total_claims=0,
+        supported_claims=0,
+        unsupported_claims=0,
+        assessments=[],
+        citation_grounding=0.0,
+        citation_precision=0.0,
+        citation_coverage=0.0,
+        claim_extraction_valid=False,
+    )
+    report = SimpleNamespace(
+        answer="The available sources are insufficient to support an answer.",
+        claims=[],
+        citation_check=citation_check,
+        sources=[],
+        metrics={},
+        cost=SimpleNamespace(total_tokens=0, total_estimated_cost_usd=0.0),
+    )
+
+    metrics = build_case_evaluation_metrics({"expected_format": "text"}, report)
+    record = {**metrics, "metrics": dict(metrics)}
+    attach_answer_quality(
+        record,
+        {"verdict": "not_attempted", "score": 0.0},
+    )
+    summary = evaluation_summary([record])
+
+    assert metrics["report_emitted"] is True
+    assert metrics["substantive_answer"] is False
+    assert metrics["grounded_answer"] is False
+    assert metrics["evidence_abstention"] is True
+    assert metrics["final_result_usable"] is False
+    assert record["answer_quality"] == 0.0
+    assert record["grounded_correct"] is False
+    assert summary["answer_not_attempted_count"] == 1
+    assert summary["answer_correct_rate"] == 0.0
+
+
+def test_attach_answer_quality_cannot_mark_empty_failed_output_correct() -> None:
+    record = {
+        "answer": "",
+        "execution_success": False,
+        "report_emitted": False,
+        "substantive_answer": False,
+        "evidence_abstention": False,
+        "grounded_answer": False,
+        "metrics": {},
+    }
+    judgment = {
+        "verdict": "correct",
+        "score": 1.0,
+        "reason": "invalid optimistic judge",
+        "failure_categories": [],
+    }
+
+    attach_answer_quality(record, judgment)
+
+    assert record["answer_verdict"] == "not_attempted"
+    assert record["answer_quality"] == 0.0
+    assert record["grounded_correct"] is False
+    assert judgment["verdict"] == "not_attempted"
+    assert "abstention" in judgment["failure_categories"]
+
+
+def test_attach_answer_quality_marks_nonempty_failed_correct_as_unscored() -> None:
+    record = {
+        "answer": "A candidate escaped from a failed run",
+        "execution_success": False,
+        "report_emitted": False,
+        "substantive_answer": True,
+        "evidence_abstention": False,
+        "grounded_answer": False,
+        "metrics": {},
+    }
+    judgment = {
+        "verdict": "correct",
+        "score": 1.0,
+        "reason": "invalid optimistic judge",
+        "failure_categories": [],
+    }
+
+    attach_answer_quality(record, judgment)
+
+    assert record["answer_verdict"] == "unscored"
+    assert record["answer_quality"] is None
+    assert judgment["verdict"] == "unscored"
+    assert "judge_uncertainty" in judgment["failure_categories"]
 
 
 def test_deepseek_answer_judge_parses_json_response(monkeypatch) -> None:
@@ -242,11 +391,13 @@ def test_deepseek_answer_judge_parses_json_response(monkeypatch) -> None:
                         "message": {
                             "content": json.dumps(
                                 {
-                                    "score": 0.75,
-                                    "verdict": "partial",
+                                    "verdict": "incorrect",
+                                    "confidence": 0.9,
                                     "reason": "answer missed one expected group",
                                     "matched": ["paper title"],
                                     "missing": ["second fact"],
+                                    "critical_errors": [],
+                                    "failure_categories": ["reasoning"],
                                 }
                             )
                         }
@@ -281,8 +432,8 @@ def test_deepseek_answer_judge_parses_json_response(monkeypatch) -> None:
     assert user_payload["ground_truth_groups"] == [["paper title"], ["second fact"]]
     assert judgment.provider == "deepseek"
     assert judgment.model == "deepseek-v4-flash"
-    assert judgment.score == 0.75
-    assert judgment.verdict == "partial"
+    assert judgment.score == 0.0
+    assert judgment.verdict == "incorrect"
     assert judgment.matched == ["paper title"]
     assert judgment.missing == ["second fact"]
     assert judgment.input_tokens == 100
@@ -369,8 +520,18 @@ def test_run_public_eval_with_mock_writes_artifacts(tmp_path: Path) -> None:
     assert raw_lines[0]["manifest"]["manifest_id"] == summary["manifest"]["manifest_id"]
     assert raw_lines[1]["type"] == "case_result"
     assert raw_lines[1]["sources"]
-    assert raw_lines[1]["answer_judgment"]["verdict"] == "pass"
+    assert raw_lines[1]["answer_judgment"]["verdict"] == "correct"
     assert raw_lines[1]["answer_quality"] == 1.0
+    assert raw_lines[1]["answer_verdict"] == "correct"
+    assert raw_lines[1]["grounded_correct"] is True
+    assert summary["answer_verdict_counts"] == {
+        "correct": 1,
+        "incorrect": 0,
+        "not_attempted": 0,
+        "unscored": 0,
+    }
+    assert summary["answer_fixed_denominator"] == 1
+    assert summary["grounded_correct_rate"] == 1.0
 
 
 def test_mock_eval_without_judge_never_infers_answer_quality_from_citations(
@@ -428,6 +589,8 @@ def test_mock_eval_without_judge_never_infers_answer_quality_from_citations(
     assert summary["answer_quality_avg"] is None
     assert summary["answer_judge"]["scored_count"] == 0
     assert summary["answer_judge"]["pass_rate"] is None
+    assert summary["answer_unscored_count"] == 1
+    assert summary["answer_correct_rate"] == 0.0
     assert "answer_quality_success_rate" not in summary
 
 
@@ -616,6 +779,7 @@ def test_sealed_main_emits_only_aggregate_and_creates_no_private_artifacts(
         "score": None,
         "verdict": "unscored",
         "confidence": 0.75,
+        "self_judge": False,
         "failure_categories": ["format"],
     }
     assert not trace_dir.exists()
@@ -790,7 +954,7 @@ def test_public_eval_tracks_local_and_live_rejudge_determinism(
                 provider="llm-gateway",
                 model="kimi-k2.7-code-highspeed",
                 score=1.0,
-                verdict="pass",
+                verdict="correct",
                 reason="test live rejudge",
                 matched=["citation marker"],
                 missing=[],

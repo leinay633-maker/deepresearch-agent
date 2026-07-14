@@ -112,7 +112,25 @@ Opus 4.8 裁判目录：`~/.deepresearch-agent-eval/runs/v5b-judge-opus48-202607
 
 ## 阶段五：完成
 
-### 🔥 关键 bug 发现与修复（commit 1a552af，v7 验证中）
+### 🔥 答对率低的根因诊断（2026-07-14，v7→v8）
+
+v7 整体答对率 4/32（12.5%），用户判断"上不了台面"。系统诊断**成绩低主要是 harness 损耗，不是题目难度**：
+
+- **题目难度（次因）**：SimpleQA 是 OpenAI 对抗性收集的难题集，但 dev set 8 题**全部有 gold_urls、答案页都存在**（多数 Wikipedia/知名站）。kimi 修复 thinking 后 4/8（50%）证明可答。
+- **Harness 损耗（主因）**，分层定位：
+  1. **HTML 正文提取粗糙（最大损耗）**：`_HtmlTextParser` 只跳过 script/style，不剔除 nav/header/footer/aside，导航菜单占满 `crawler_max_chars=4000` 预算、正文（含答案）被截断。铁证：Q08 sherdog 找到正确页面但 4000 字符全是 "NEWS FEATURES FIGHT FINDER..."；Q03 找到 gold_url MacTutor 但 content 开头是导航。
+  2. **context budget 偏小**：`crawler_max_chars=4000` + `per_source_tokens=650`，导航占满后正文两层截断丢失。
+  3. **合成对已有证据利用不足**：Q03 nara-wu content 第 1137 字符就有 "Department of Physics"（在预算内），claude 仍弃答——合成对"Physics 次年转 Math"类表述判断过严。
+  4. **crawl 失败率高**：Q08 tapology（标题就是 King Cobra）crawl 失败只剩 snippet。
+  5. **搜索查询没命中 gold_url**：Q05 没找到 fandom、Q06 没找到 Wikipedia。
+  6. **glm 不支持 server-side web_search 工具**（模型/网关侧限制）。
+
+**修复（commit f334544，v8 验证中）：**
+- `_HtmlTextParser` 扩展 skip 标签（nav/header/footer/aside/form/menu），优先 `<article>/<main>` 正文，无则回退去导航全文
+- `crawler_max_chars` 4000→8000，`per_source_tokens` 650→1200
+- 新增 3 个正文提取测试，总计 272 passed
+
+### 🔥 关键 bug 发现与修复（commit 1a552af，v7）
 
 v5 评分答对率低（1/8），深挖发现**根因不是"冷门题搜不到"，而是 kimi web search 100% 失败**：
 
@@ -172,13 +190,29 @@ Opus 4.8 裁判：`~/.deepresearch-agent-eval/runs/v7-judge-8-20260714T054138`
 - ✅ 四模型公开开发集完成重新生成和双裁判全量评分
 - ✅ 逐题可审计结论，区分执行成功/诚实弃答/答对
 
+### 🚧 独立审计后的可信评测重建（2026-07-14）
+
+此前“低分主要是 harness、HTML 正文提取是最大损耗、v8 已证明提升”的结论已被降级为待验证假设：v7/v8 都只有一次 live 生成，候选来源发生变化；v7 全局 24/32 执行成功，v8 为 23/32，不能把 Kimi 单次 6/8 外推为跨模型提升。v5/v7 还是 dirty worktree，v6 宽搜索也只完成了单题，历史归因不满足可复现门槛。
+
+- ✅ 完成独立评测与工程链路审计，未触碰隐藏集。
+- ✅ answer judge 重构为 `correct / incorrect / not_attempted / unscored`，答案正确性与 citation grounding 分开；裁判缺字段或实际模型漂移记 `unscored`。
+- ✅ 修正弃答、实质答案、grounded answer、`final_result_usable` 与数据集内容哈希口径，新增正式运行 clean-worktree 校验。
+- ✅ 从 OpenAI 官方公开 SimpleQA CSV 按固定种子生成独立 32 题主集及 manifest；现有 8 题保留为诊断集。
+- ✅ 公开 32 题主集改为 topic 与 answer_type 双边近均衡配额：10 个 topic 每类 3–4 题，5 个 answer_type 每类 6–7 题；修复带括号、转义换行、重复和尾随引号的 gold URL 解析问题。当前 source SHA-256 为 `feee3f7e...5032`，case SHA-256 为 `9702de3e...bfc1`，另记录 8 条诊断集排除项的 hash。
+- ✅ 完成检索候选/抓取错误审计、短暂错误单次重试、Gateway 工具能力探针和多实体相关性过滤；snippet/crawl-failed 候选只保留脱敏审计 hint，不进入最终 evidence、synthesis 或 citation。
+- ✅ 真实 Gateway capability probe 已落盘到 `~/.deepresearch-agent-eval/runs/gateway-capability-20260714T173939/capabilities.json`：Claude 4.6、Opus 4.8、Kimi 均返回 `web_search_tool_result` 且实际模型匹配；GLM 5.2 仅返回 `text`，状态为 `text_only_no_tool`。这确认 GLM 的 server-side web search 缺失是当前网关能力差异，不是猜测；正式榜单仍保持严格单模型，不为 GLM 混入其他搜索模型。
+- ✅ 固定历史 artifact 的离线分层分析已拆开正文与 snippet。v7→v8 的 answer-in-citable-source 变化：Claude 4.6 `2→1`、Opus 4.8 `1→0`、GLM `0→0`、Kimi `4→5`；只有 Kimi 增 1，且检索来源同时变化，进一步否定“HTML 修复已被单次 v8 证明是最大杠杆”。v7 Claude 4.6 的 650→1200 token 打包由 `1→2`，说明预算有个案收益，但不是跨模型普遍结论。
+- ✅ 独立只读评审发现并关闭 5 项问题：空/失败输出被错误计 correct、不完整裁判 artifact 被合并器信任、自评一致未单列、正式 HTML crawler 丢失异常类型、gold URL 转义换行污染。复核确认 5 项全部关闭。
+- ✅ 当前全量测试 `308 passed`；ruff、compileall、`git diff --check` 全部通过。
+- ⬜ 下一步入口：建立干净中文提交后，执行四模型三波交错生成与 Kimi/Opus 4.8 事后双裁判。
+
 ## 已定决策及原因
 
 - 凭证只进 Keychain，运行时注入环境变量；仓库仅保存环境变量名和非敏感配置。
 - 真实质量不能继续使用旧 `success` 或单一引用重叠指标；必须保留标准答案、完整来源、论断、证据、独立裁判和失败分类。
 - 不把同一个生成模型的自评当最终质量结论；至少使用另一个模型做独立裁判，并保留人工可复查产物。
 - 优先修复搜索覆盖、结构化格式和引用/事实支撑，再考虑增加更多导出或基础设施功能。
-- snippet 降级证据保留了诚实性（标记 `retrieval_degraded=True` 和 `evidence_grade=snippet`），不掩盖抓取失败。
+- ~~snippet 降级证据保留了诚实性~~：该历史决策已撤销。搜索摘要不是可引用正文；现在只保留脱敏失败候选审计信息，snippet 不进入最终证据、合成上下文或引用。
 - circuit breaker 阈值放宽但不取消：4 次连续失败仍触发熔断，10 秒冷却后重试——防止完全不降级同时避免过度敏感。
 
 ## 遗留问题

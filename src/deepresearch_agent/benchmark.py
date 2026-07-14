@@ -89,7 +89,8 @@ def build_benchmark_manifest(
 
     git_commit_sha, git_dirty, git_worktree_hash = _git_metadata(root)
     prompt_bundle_hash = _prompt_bundle_hash(root)
-    dataset_version = f"sha256:{_sha256_json(cases)}"
+    dataset_content_hash = f"sha256:{_sha256_json(_stable_dataset_cases(cases))}"
+    dataset_version = dataset_content_hash
     normalized_replay_dir = portable_artifact_path(replay_dir, root) if replay_dir else None
     if normalized_replay_dir:
         execution_mode = "replay"
@@ -126,6 +127,7 @@ def build_benchmark_manifest(
         "benchmark_name": benchmark_name,
         "dataset_name": dataset_name,
         "dataset_version": dataset_version,
+        "dataset_content_hash": dataset_content_hash,
         "dataset_config": dataset_config,
         "dataset_split": dataset_split,
         "case_count": len(cases),
@@ -171,6 +173,10 @@ def build_case_evaluation_metrics(
         failure_attempted = _tool_failure_case(case)
         return {
             "execution_success": False,
+            "report_emitted": False,
+            "substantive_answer": False,
+            "grounded_answer": False,
+            "evidence_abstention": False,
             "task_format_valid": False,
             "answer_quality": None,
             "citation_grounding": None,
@@ -205,7 +211,22 @@ def build_case_evaluation_metrics(
     degraded_count = int(report.metrics.get("degraded_count", 0) or 0)
     task_format_valid = _task_format_valid(case, report.answer)
     failure_attempted = _tool_failure_case(case)
-    final_result_usable = bool(report.answer.strip()) and task_format_valid
+    report_emitted = True
+    report_claims = getattr(report, "claims", [])
+    substantive_answer = bool(report.answer.strip() and report_claims)
+    grounded_answer = bool(
+        substantive_answer
+        and report.citation_check.total_claims > 0
+        and len(report_claims) == report.citation_check.total_claims
+        and report.citation_check.supported_claims
+        == report.citation_check.total_claims
+        and all(
+            assessment.supported and bool(getattr(assessment, "citation_ids", []))
+            for assessment in report.citation_check.assessments
+        )
+    )
+    evidence_abstention = bool(report.answer.strip()) and not substantive_answer
+    final_result_usable = task_format_valid and grounded_answer
     failure_recovered = (
         1.0
         if failure_attempted and final_result_usable and (fallback_count or degraded_count)
@@ -215,6 +236,10 @@ def build_case_evaluation_metrics(
     )
     return {
         "execution_success": True,
+        "report_emitted": report_emitted,
+        "substantive_answer": substantive_answer,
+        "grounded_answer": grounded_answer,
+        "evidence_abstention": evidence_abstention,
         "task_format_valid": task_format_valid,
         "answer_quality": answer_quality,
         "citation_grounding": _round_optional(citation_grounding),
@@ -237,11 +262,49 @@ def build_case_evaluation_metrics(
 
 
 def attach_answer_quality(record: dict[str, Any], judgment: dict[str, Any] | None) -> None:
-    """Attach answer quality only when a configured judge returned a real score."""
+    """Attach the four-way answer verdict while retaining numeric compatibility fields."""
 
-    score = judgment.get("score") if judgment else None
+    verdict = _answer_verdict(record, judgment)
+    contradiction: str | None = None
+    if not str(record.get("answer") or "").strip() or record.get(
+        "evidence_abstention"
+    ) is True:
+        if verdict != "not_attempted":
+            contradiction = "local record state requires not_attempted"
+        verdict = "not_attempted"
+    elif verdict == "correct" and (
+        record.get("execution_success") is False
+        or record.get("report_emitted") is False
+        or record.get("substantive_answer") is False
+    ):
+        contradiction = "correct verdict contradicts failed or non-substantive output"
+        verdict = "unscored"
+    if contradiction and isinstance(judgment, dict):
+        judgment["verdict"] = verdict
+        judgment["score"] = None if verdict == "unscored" else 0.0
+        judgment["reason"] = "; ".join(
+            item
+            for item in (str(judgment.get("reason") or "").strip(), contradiction)
+            if item
+        )
+        categories = judgment.get("failure_categories")
+        normalized_categories = list(categories) if isinstance(categories, list) else []
+        category = "judge_uncertainty" if verdict == "unscored" else "abstention"
+        if category not in normalized_categories:
+            normalized_categories.append(category)
+        judgment["failure_categories"] = normalized_categories
+    if isinstance(judgment, dict):
+        record["answer_judgment"] = judgment
+    score = 1.0 if verdict == "correct" else 0.0 if verdict != "unscored" else None
     record["answer_quality"] = score
-    record.setdefault("metrics", {})["answer_quality"] = score
+    record["answer_verdict"] = verdict
+    record["grounded_correct"] = (
+        verdict == "correct" and record.get("grounded_answer") is True
+    )
+    metrics = record.setdefault("metrics", {})
+    metrics["answer_quality"] = score
+    metrics["answer_verdict"] = verdict
+    metrics["grounded_correct"] = record["grounded_correct"]
 
 
 def refresh_replayed_case_result(
@@ -344,6 +407,11 @@ def refresh_replayed_case_result(
         record["citation_retention_rate"] = None
         record["metrics"]["citation_retention_rate"] = None
     record["answer_quality"] = None
+    record["answer_verdict"] = "unscored"
+    record["grounded_correct"] = False
+    record["metrics"]["answer_quality"] = None
+    record["metrics"]["answer_verdict"] = "unscored"
+    record["metrics"]["grounded_correct"] = False
     return record
 
 
@@ -351,6 +419,11 @@ def evaluation_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     execution_success_count = sum(1 for record in records if record.get("execution_success"))
     task_format_valid_count = sum(1 for record in records if record.get("task_format_valid"))
     answer_quality = _present_numbers(records, "answer_quality")
+    answer_verdicts = [_answer_verdict(record) for record in records]
+    answer_verdict_counts = {
+        verdict: answer_verdicts.count(verdict)
+        for verdict in ("correct", "incorrect", "not_attempted", "unscored")
+    }
     citation_grounding = _present_numbers(records, "citation_grounding")
     citation_precision = _present_numbers(records, "citation_precision")
     citation_coverage = _present_numbers(records, "citation_coverage")
@@ -361,6 +434,15 @@ def evaluation_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         1 for record in records if record.get("claim_extraction_valid") is True
     )
     case_count = len(records)
+    grounded_correct_count = sum(
+        1 for record in records if record.get("grounded_correct") is True
+    )
+    self_judge_count = sum(
+        1
+        for record in records
+        if isinstance(record.get("answer_judgment"), dict)
+        and record["answer_judgment"].get("self_judge") is True
+    )
     return {
         "execution_success_count": execution_success_count,
         "execution_success_rate": round(execution_success_count / case_count, 4)
@@ -372,6 +454,34 @@ def evaluation_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         else 0.0,
         "answer_quality_scored_count": len(answer_quality),
         "answer_quality_avg": _average(answer_quality),
+        "answer_verdict_counts": answer_verdict_counts,
+        "answer_correct_count": answer_verdict_counts["correct"],
+        "answer_correct_rate": round(
+            answer_verdict_counts["correct"] / case_count, 4
+        )
+        if case_count
+        else 0.0,
+        "answer_incorrect_count": answer_verdict_counts["incorrect"],
+        "answer_not_attempted_count": answer_verdict_counts["not_attempted"],
+        "answer_unscored_count": answer_verdict_counts["unscored"],
+        "answer_fixed_denominator": case_count,
+        "grounded_correct_count": grounded_correct_count,
+        "grounded_correct_rate": round(grounded_correct_count / case_count, 4)
+        if case_count
+        else 0.0,
+        "self_judge_count": self_judge_count,
+        "report_emitted_count": sum(
+            1 for record in records if record.get("report_emitted") is True
+        ),
+        "substantive_answer_count": sum(
+            1 for record in records if record.get("substantive_answer") is True
+        ),
+        "grounded_answer_count": sum(
+            1 for record in records if record.get("grounded_answer") is True
+        ),
+        "evidence_abstention_count": sum(
+            1 for record in records if record.get("evidence_abstention") is True
+        ),
         "citation_grounding_avg": _average(citation_grounding),
         "citation_precision_avg": _average(citation_precision),
         "citation_coverage_avg": _average(citation_coverage),
@@ -389,6 +499,26 @@ def evaluation_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         "success_rate": round(execution_success_count / case_count, 4) if case_count else 0.0,
         "success_semantics": SUCCESS_SEMANTICS,
     }
+
+
+def _answer_verdict(
+    record: dict[str, Any],
+    judgment: dict[str, Any] | None = None,
+) -> str:
+    raw = (
+        (judgment or {}).get("verdict")
+        or record.get("answer_verdict")
+        or (record.get("answer_judgment") or {}).get("verdict")
+        or "unscored"
+    )
+    verdict = str(raw).strip().lower()
+    if verdict in {"correct", "incorrect", "not_attempted", "unscored"}:
+        return verdict
+    return {
+        "pass": "correct",
+        "partial": "incorrect",
+        "fail": "incorrect",
+    }.get(verdict, "unscored")
 
 
 def _task_format_valid(case: dict[str, Any], answer: str) -> bool:
@@ -444,6 +574,24 @@ def _sha256_json(value: Any) -> str:
         default=str,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _stable_dataset_cases(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Exclude run labels that are not stable question content."""
+
+    return [
+        {key: value for key, value in case.items() if key != "benchmark_name"}
+        for case in cases
+    ]
+
+
+def require_clean_worktree(manifest: dict[str, Any]) -> None:
+    """Fail closed when reproducibility requires a verified clean checkout."""
+
+    if manifest.get("git_dirty") is not False:
+        raise RuntimeError(
+            "--require-clean-worktree requires a verified clean git worktree"
+        )
 
 
 def portable_artifact_path(path: str | Path, root: Path) -> str:
@@ -662,6 +810,9 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "deadline_seconds": deadline_seconds,
         "min_evidence_items": min_evidence_items,
         "fallback_policy": fallback_policy,
+        "require_clean_worktree": bool(
+            getattr(args, "require_clean_worktree", False)
+        ),
     }
     manifest = build_benchmark_manifest(
         root=root,
@@ -676,6 +827,8 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         replay_dir=getattr(args, "replay_dir", None),
         cassette_id=getattr(args, "cassette_id", None),
     )
+    if getattr(args, "require_clean_worktree", False):
+        require_clean_worktree(manifest)
     mark_live_judge_nondeterminism(
         manifest,
         citation_judge_provider=effective_settings.citation_judge_provider,
@@ -1011,6 +1164,12 @@ def _summarize(
                 ),
                 "task_format_valid": record.get("task_format_valid", False),
                 "answer_quality": record.get("answer_quality"),
+                "answer_verdict": _answer_verdict(record),
+                "grounded_correct": record.get("grounded_correct"),
+                "report_emitted": record.get("report_emitted", False),
+                "substantive_answer": record.get("substantive_answer", False),
+                "grounded_answer": record.get("grounded_answer", False),
+                "evidence_abstention": record.get("evidence_abstention", False),
                 "citation_grounding": record.get("citation_grounding"),
                 "citation_precision": record.get("citation_precision"),
                 "citation_coverage": record.get("citation_coverage"),
@@ -1198,6 +1357,11 @@ def main() -> None:
         help="Optional case-result JSONL file or single-artifact directory for offline replay.",
     )
     parser.add_argument("--cassette-id", default=None)
+    parser.add_argument(
+        "--require-clean-worktree",
+        action="store_true",
+        help="Fail before running cases unless git reports a clean worktree.",
+    )
     args = parser.parse_args()
     summary = asyncio.run(run_benchmark(args))
     print(json.dumps(summary, ensure_ascii=False, indent=2))
