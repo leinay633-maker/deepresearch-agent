@@ -112,7 +112,60 @@ Opus 4.8 裁判目录：`~/.deepresearch-agent-eval/runs/v5b-judge-opus48-202607
 
 ## 阶段五：完成
 
-- ✅ pytest 267 passed、ruff、compileall、git diff --check 全通过
+### 🔥 关键 bug 发现与修复（commit 1a552af，v7 验证中）
+
+v5 评分答对率低（1/8），深挖发现**根因不是"冷门题搜不到"，而是 kimi web search 100% 失败**：
+
+- `GatewayWebSearchAdapter._request` 直接构造 httpx 请求，**没有像 `LLMGatewayClient` 那样对 kimi 模型添加 `thinking={type:enabled}` 参数**
+- kimi 模型要求 thinking 必须 type=enabled，否则 HTTP 400 `"invalid thinking: only type=enabled is allowed for this model"`
+- 这导致 kimi 的 web search 全部失败 → sources=0 → 全部 synthesis fallback 或诚实弃答 → 答对率 0
+
+修复：复用 `llm_gateway._requires_thinking`，对 kimi 在 web search 请求体加 enabled thinking block。修复后直接测试 kimi 搜索从 400 变为返回 5 候选。
+
+**附带诊断结论：**
+- glm-5.2 调用 web_search 工具时只返回 text block（用自身知识），不返回 `web_search_tool_result`——glm 模型/网关侧不支持 server-side web_search 工具，非代码 bug，fallback 到 bing
+- claude-4.6-opus 搜索间歇性超时（网络非确定性），直接测试多数成功
+- claude-opus-4-8 web search 最稳定
+
+### ✅ v7 双裁判评分完成（thinking 修复后，commit 1a552af）
+
+v7 生成目录：`~/.deepresearch-agent-eval/runs/single-model-dev-v7-20260714T051613`
+Kimi 裁判：`~/.deepresearch-agent-eval/runs/v7-judge-highspeed-20260714T054138`
+Opus 4.8 裁判：`~/.deepresearch-agent-eval/runs/v7-judge-8-20260714T054138`
+汇总报告：`~/.deepresearch-agent-eval/runs/v7-final-summary.txt`
+
+**答案正确率（两裁判一致答对，非执行成功率）：**
+
+| 模型 | v5 一致答对 | v7 一致答对 | 变化 |
+|------|-----------|-----------|------|
+| kimi-k2.7-code-highspeed | 0/8 | **4/8 (50%)** | +4 ⭐ |
+| claude-4.6-opus | 1/8 | 0/8 | -1（搜索非确定性） |
+| claude-opus-4-8 | 1/8 | 0/8 | -1（搜索非确定性） |
+| glm-5.2 | 0/8 | 0/8 | — |
+| **整体** | 2/32 (6.25%) | **4/32 (12.5%)** | **翻倍** |
+
+**kimi 4 题两裁判一致答对**：Q01(Thomas Ballard 1637)、Q02(TPLF 移除)、Q03(Kiyoshi Oka 学科)、Q07(Meyrick 1886)。
+
+**执行成功率（thinking 修复让 kimi 搜索恢复）：**
+
+| 模型 | v5 | v7 |
+|------|-----|-----|
+| kimi | 5/8 (grounding 0.4) | 7/8 (grounding **0.7143**) |
+| claude-4.6-opus | 6/8 | 7/8 |
+| glm-5.2 | 6/8 | 7/8 |
+| claude-opus-4-8 | 4/8 | 3/8（搜索间歇超时） |
+
+**核心结论：**
+- thinking 修复是决定性的：kimi web search 从 100% 失败恢复，答对率 0→50%，grounding 0.4→0.7143
+- claude 模型 v7 退步是 live search 非确定性：v5 答对的 Q3 在 v7 找到来源但判断不相关、诚实弃答（非代码问题）
+- glm 仍 0 答对：glm 不支持 server-side web_search 工具（只返回 text 用自身知识），靠 bing fallback 覆盖弱
+- 剩余瓶颈：claude/glm 的搜索查询质量（找到来源但不含答案）+ 冷门事实题搜索引擎覆盖
+
+---
+
+### 历史验收基线（v5，thinking 修复前）
+
+- ✅ pytest 269 passed、ruff、compileall、git diff --check 全通过
 - ✅ 不再出现大面积结构化输出兼容失败（_string_array/scope 修复）
 - ✅ 所有运行实际模型与目标模型一致（--single-model-run 校验）
 - ✅ 没有证据的答案继续诚实弃答（sources=0 时不编造）
