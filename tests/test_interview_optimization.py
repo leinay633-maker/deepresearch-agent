@@ -444,8 +444,81 @@ def test_crawler_failure_is_explicitly_degraded_or_failed() -> None:
     assert degraded.degraded is True
     assert degraded.sources[0].metadata["extract_status"] == "crawl_failed"
     assert degraded.sources[0].metadata["snippet_only"] is True
+    # Non-gateway-chain: fail policy still raises when all crawls fail
     with pytest.raises(SearchError, match="crawler extraction failed"):
         asyncio.run(failed_service.search("query", max_results=1))
+
+
+def test_gateway_chain_snippet_fallback_when_all_crawls_fail() -> None:
+    """Gateway-web chain: when all crawls fail, use snippets as degraded evidence."""
+
+    class GatewayStyleAdapter:
+        name = "gateway-web"
+
+        async def search(self, query: str, max_results: int, timeout: float) -> list[Source]:
+            return [
+                Source(
+                    title="Gateway result",
+                    url="https://example.com/article",
+                    content="search snippet with useful info",
+                    provider=self.name,
+                    query=query,
+                )
+            ]
+
+    class BingFallback:
+        name = "bing"
+
+        async def search(self, query: str, max_results: int, timeout: float) -> list[Source]:
+            return []
+
+    service = SearchService(
+        primary=GatewayStyleAdapter(),
+        fallback=BingFallback(),
+        settings=Settings(max_retries=0, circuit_breaker_failure_threshold=4),
+        crawler=FailingCrawler(),
+        fallback_policy="fail",
+    )
+    outcome = asyncio.run(service.search("query", max_results=1))
+    # Should succeed with snippet-grade evidence instead of failing
+    assert len(outcome.sources) >= 1
+    source = outcome.sources[0]
+    assert source.metadata.get("evidence_grade") == "snippet"
+    assert source.metadata.get("retrieval_degraded") is True
+
+
+def test_gateway_chain_raises_when_snippets_also_empty() -> None:
+    """Gateway-web chain: when crawl fails AND snippets are empty, should raise."""
+
+    class GatewayEmptyAdapter:
+        name = "gateway-web"
+
+        async def search(self, query: str, max_results: int, timeout: float) -> list[Source]:
+            return [
+                Source(
+                    title="Empty result",
+                    url="https://example.com/empty",
+                    content="",  # Empty — can't use as snippet evidence
+                    provider=self.name,
+                    query=query,
+                )
+            ]
+
+    class BingFallback:
+        name = "bing"
+
+        async def search(self, query: str, max_results: int, timeout: float) -> list[Source]:
+            return []
+
+    service = SearchService(
+        primary=GatewayEmptyAdapter(),
+        fallback=BingFallback(),
+        settings=Settings(max_retries=0, circuit_breaker_failure_threshold=4),
+        crawler=FailingCrawler(),
+        fallback_policy="fail",
+    )
+    with pytest.raises(SearchError, match="safe crawl required"):
+        asyncio.run(service.search("query", max_results=1))
 
 
 def test_search_service_applies_crawler_and_records_evidence_metadata() -> None:

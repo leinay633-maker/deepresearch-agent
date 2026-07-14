@@ -13,8 +13,8 @@ class Settings:
     max_retries: int = 2
     search_retry_backoff_seconds: float = 0.0
     search_rate_limit_per_second: float = 0.0
-    circuit_breaker_failure_threshold: int = 2
-    circuit_breaker_cooldown_seconds: float = 30.0
+    circuit_breaker_failure_threshold: int = 4
+    circuit_breaker_cooldown_seconds: float = 10.0
     max_researchers: int = 3
     mock_model_name: str = "mock-structured-tool-model"
     mock_input_cost_per_1m_tokens: float = 0.0
@@ -131,8 +131,8 @@ def load_settings() -> Settings:
         max_retries=_int_env("MAX_RETRIES", 2),
         search_retry_backoff_seconds=_float_env("SEARCH_RETRY_BACKOFF_SECONDS", 0.0),
         search_rate_limit_per_second=_float_env("SEARCH_RATE_LIMIT_PER_SECOND", 0.0),
-        circuit_breaker_failure_threshold=_int_env("CIRCUIT_BREAKER_FAILURE_THRESHOLD", 2),
-        circuit_breaker_cooldown_seconds=_float_env("CIRCUIT_BREAKER_COOLDOWN_SECONDS", 30.0),
+        circuit_breaker_failure_threshold=_int_env("CIRCUIT_BREAKER_FAILURE_THRESHOLD", 4),
+        circuit_breaker_cooldown_seconds=_float_env("CIRCUIT_BREAKER_COOLDOWN_SECONDS", 10.0),
         max_researchers=_int_env("MAX_RESEARCHERS", 3),
         trace_dir=os.getenv("TRACE_DIR", "logs"),
         trace_exporter=os.getenv("TRACE_EXPORTER", "jsonl").strip().lower() or "jsonl",

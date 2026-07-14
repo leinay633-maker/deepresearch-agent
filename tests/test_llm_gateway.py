@@ -578,9 +578,10 @@ def test_planner_preserves_distinctive_named_entities_in_each_subquestion() -> N
             },
             {
                 "id": "Q2",
-                "question": "Which householders were active in Putney?",
-                "search_query": "Putney householders 1637",
-                "rationale": "Too broad.",
+                # No original entities at all — completely off-topic
+                "question": "What are general local governance practices?",
+                "search_query": "local governance practices england",
+                "rationale": "Too generic — no original entity.",
             },
         ]
     }
@@ -592,9 +593,8 @@ def test_planner_preserves_distinctive_named_entities_in_each_subquestion() -> N
             original_query=original,
         )
 
-    payload["subquestions"][1]["search_query"] = (
-        "Thomas Ballard Richard Kestian Putney house 1637"
-    )
+    # With at least one entity (Putney or 1637) it should pass
+    payload["subquestions"][1]["search_query"] = "Putney householders 1637"
     result = _subquestions_from_payload(
         payload,
         max_researchers=2,
@@ -752,3 +752,104 @@ class _SequenceGatewayClient:
             }
         )
         return self.responses.pop(0)
+
+
+# ---------------------------------------------------------------------------
+# Tests for multi-model compatibility fixes
+# ---------------------------------------------------------------------------
+
+
+def test_string_array_tolerates_semicolon_separated_string():
+    """Opus sometimes outputs constraints as a single string instead of array."""
+    from deepresearch_agent.llm import _string_array
+
+    # Normal array case
+    result = _string_array({"items": ["a", "b"]}, "items")
+    assert result == ["a", "b"]
+
+    # Single string with semicolons — should split
+    result = _string_array(
+        {"items": "Use official sources; Limit to 3 claims; No speculation"}, "items"
+    )
+    assert result == ["Use official sources", "Limit to 3 claims", "No speculation"]
+
+    # Single string without semicolons — kept as one-element list
+    result = _string_array({"items": "Single constraint without semicolons"}, "items")
+    assert result == ["Single constraint without semicolons"]
+
+
+def test_string_array_rejects_non_string_non_list():
+    from deepresearch_agent.llm import _string_array
+
+    with pytest.raises(ValueError, match="must be an array of strings"):
+        _string_array({"items": 42}, "items")
+
+
+def test_brief_from_payload_tolerates_empty_scope():
+    """Opus 4.8 occasionally outputs scope as empty string."""
+    from deepresearch_agent.llm import _brief_from_payload
+
+    payload = {
+        "normalized_query": "What is X?",
+        "scope": "",
+        "constraints": ["c1"],
+        "assumptions": ["a1"],
+    }
+    brief = _brief_from_payload(payload, "What is X?")
+    assert brief.scope  # Should get default scope, not empty
+    assert "evidence" in brief.scope.lower()
+
+    # Missing scope entirely
+    payload2 = {
+        "normalized_query": "What is X?",
+        "constraints": ["c1"],
+        "assumptions": ["a1"],
+    }
+    brief2 = _brief_from_payload(payload2, "What is X?")
+    assert brief2.scope
+
+
+def test_planner_entity_anchors_includes_acronyms_and_numbers():
+    """Entity detection should catch TPLF, 1922, etc."""
+    from deepresearch_agent.llm import _planner_entity_anchors
+
+    # Original: only matched [A-Z][a-z]{2,}
+    anchors = _planner_entity_anchors(
+        "What month was the TPLF removed from the terrorist list in 1922?"
+    )
+    assert "tplf" in anchors
+    assert "1922" in anchors
+
+    # Mixed case proper nouns still work
+    anchors2 = _planner_entity_anchors("Thomas Ballard accused Richard Kestian in 1637")
+    assert "thomas" in anchors2
+    assert "ballard" in anchors2
+    assert "1637" in anchors2
+
+
+def test_planner_entity_check_requires_at_least_one_overlap():
+    """Relaxed check: subquestions need ≥1 entity overlap, not ≥2."""
+    payload = {
+        "subquestions": [
+            {
+                "id": "Q1",
+                "question": "What is Kiyoshi Oka's background?",
+                "search_query": "Kiyoshi Oka education 1922",
+                "rationale": "Direct search.",
+            },
+            {
+                "id": "Q2",
+                # Has "1922" from the original — should pass
+                "question": "What universities existed in 1922?",
+                "search_query": "Imperial University 1922 departments",
+                "rationale": "Related context.",
+            },
+        ]
+    }
+    # Should not raise — Q2 has "1922" which overlaps
+    result = _subquestions_from_payload(
+        payload,
+        max_researchers=2,
+        original_query="Kiyoshi Oka entered the Imperial University of Kyoto in 1922 to study what?",
+    )
+    assert len(result) == 2

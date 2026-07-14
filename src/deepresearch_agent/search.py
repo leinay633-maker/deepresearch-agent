@@ -854,11 +854,18 @@ class SearchService:
                             for source in sources
                             if not source.metadata.get("snippet_only", False)
                         ]
+                        # For gateway-chain with snippet fallback: sources marked
+                        # evidence_grade=snippet are usable degraded evidence
+                        snippet_evidence = [
+                            source
+                            for source in sources
+                            if source.metadata.get("evidence_grade") == "snippet"
+                        ]
                         if self.fallback_policy == "fail":
-                            if not extracted_sources:
+                            if not extracted_sources and not snippet_evidence:
                                 raise SearchError(f"crawler extraction failed: {error}")
-                            sources = extracted_sources
-                        elif self.fallback_policy == "mock" and not extracted_sources:
+                            sources = extracted_sources or snippet_evidence
+                        elif self.fallback_policy == "mock" and not extracted_sources and not snippet_evidence:
                             raise SearchError(f"crawler extraction failed: {error}")
                         return SearchOutcome(
                             sources=enrich_source_metadata(sources),
@@ -1067,6 +1074,24 @@ class SearchService:
             and source.metadata.get("crawler") not in {None, "", "none"}
         ]
         if not evidence_ready:
+            # Fallback: use snippet sources as degraded evidence instead of failing
+            # entirely. Mark them so citation grounding knows they are snippet-grade.
+            snippet_sources = [
+                source.model_copy(
+                    update={
+                        "metadata": {
+                            **source.metadata,
+                            "evidence_grade": "snippet",
+                            "retrieval_degraded": True,
+                            "degrade_reason": "crawl failed; using search snippet as evidence",
+                        }
+                    }
+                )
+                for source in sources
+                if source.content and source.content.strip()
+            ]
+            if snippet_sources:
+                return snippet_sources, crawl_errors
             detail = "; ".join(dict.fromkeys(crawl_errors)) or "no page body was extracted"
             raise SearchError(
                 f"{provider} returned only unverified candidates; safe crawl required: {detail}"

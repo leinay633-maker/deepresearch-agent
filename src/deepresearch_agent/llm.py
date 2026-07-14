@@ -49,6 +49,13 @@ RESEARCH_FOLLOW_UP_ACTION_ALIASES = {
 }
 MAX_SYNTHESIS_CLAIMS = 3
 
+_PLANNER_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
+    "has", "have", "how", "in", "is", "it", "its", "of", "on", "or",
+    "the", "to", "was", "were", "what", "when", "where", "which",
+    "who", "why", "with", "that", "this", "not", "did", "do", "does",
+}
+
 
 @dataclass(frozen=True)
 class LLMJsonResult:
@@ -1079,10 +1086,19 @@ def _brief_from_payload(
     original_query: str,
     expected_format: str = "markdown",
 ) -> ResearchBrief:
+    # scope: tolerate empty/missing — some models (Opus) occasionally output ""
+    scope_raw = payload.get("scope")
+    if isinstance(scope_raw, str) and scope_raw.strip():
+        scope = scope_raw.strip()
+    else:
+        scope = (
+            "Answer with implementation-oriented evidence, cite sources for concrete "
+            "claims, and call out limitations instead of over-claiming."
+        )
     brief = ResearchBrief(
         original_query=original_query,
         normalized_query=_required_text(payload, "normalized_query"),
-        scope=_required_text(payload, "scope"),
+        scope=scope,
         constraints=_string_array(payload, "constraints"),
         assumptions=_string_array(payload, "assumptions"),
         expected_format=expected_format,
@@ -1118,15 +1134,25 @@ def _subquestions_from_payload(
         )
     original_entity_anchors = _planner_entity_anchors(original_query or "")
     if len(original_entity_anchors) >= 2:
+        # Also build a broader keyword set from all non-stopword query tokens
+        # to catch abbreviations and synonyms that formal entity detection misses
+        query_keywords = tokenize(original_query or "") - _PLANNER_STOPWORDS
         for subquestion in subquestions:
             terms = tokenize(
                 f"{subquestion.question} {subquestion.search_query or ''}"
             )
-            if len(original_entity_anchors.intersection(terms)) < 2:
-                raise ValueError(
-                    "LLM planning subquestion dropped too many distinctive query entities"
-                )
+            # Primary check: at least 1 formal entity overlap
+            if original_entity_anchors.intersection(terms):
+                continue
+            # Fallback: at least 1 general keyword overlap (catches abbreviations
+            # and paraphrases that share topic-specific words like "terrorist")
+            if query_keywords.intersection(terms):
+                continue
+            raise ValueError(
+                "LLM planning subquestion dropped too many distinctive query entities"
+            )
     return subquestions
+
 
 
 def _planner_entity_anchors(query: str) -> set[str]:
@@ -1152,11 +1178,24 @@ def _planner_entity_anchors(query: str) -> set[str]:
         "who",
         "why",
     }
-    return {
+    # Match capitalized words (proper nouns) and uppercase acronyms ≥2 chars
+    proper_nouns = set(
         token.lower()
         for token in re.findall(r"\b[A-Z][a-z]{2,}\b", query)
         if token.lower() not in generic
-    }
+    )
+    acronyms = set(
+        token.lower()
+        for token in re.findall(r"\b[A-Z]{2,}\b", query)
+        if token.lower() not in generic
+    )
+    # Also capture tokens with digits embedded (e.g. "1922", "K2.7")
+    digit_entities = set(
+        token.lower()
+        for token in re.findall(r"\b\w*\d+\w*\b", query)
+        if len(token) >= 3
+    )
+    return proper_nouns | acronyms | digit_entities
 
 
 def _synthesis_from_payload(
@@ -1601,6 +1640,9 @@ def _required_text(payload: dict, field: str) -> str:
 
 def _string_array(payload: dict, field: str) -> list[str]:
     value = payload.get(field)
+    # Tolerate models (e.g. Opus) that emit a single string instead of an array
+    if isinstance(value, str):
+        value = [item.strip() for item in value.split(";") if item.strip()] or [value]
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError(f"LLM JSON field {field} must be an array of strings")
     return [item.strip() for item in value if item.strip()]
