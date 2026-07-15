@@ -400,6 +400,15 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 代价：不能使用结论式标题，也暂不提供 deep text/json；模型若把事实写进表头会触发一次 repair 或正式失败。后续若扩格式，必须分别定义可见事实单元、提取与对齐规则，而不是只改 prompt。
 面试怎么答：我会说长报告格式不是越多越好，关键是每一种格式都必须能证明“用户看到的事实都进入 CitationChecker”。当前先把 Markdown 这一条做成闭环。
 
+## 决策 42：如何解释 v11 真实锚点仍未产出报告
+
+背景：完成精确 empty-text retry、Markdown 结构正向授权和 actual-model alias 收紧后，我按固定 `task2+ × claude-opus-4-8` 同锚点运行 v11。5 个研究分支留下 17 个干净来源，context 约 14,766 tokens；但 synthesis 约 505.5 秒后返回了没有可用 text 的 `thinking + tool_use` 响应，而不是 v10 的单一空 `text`。
+可选方案：把所有 no-text 都重试；把 thinking/tool_use 当作正文或扩大 repair；按已审计协议继续 fail-closed，并把这次 provider 形状作为新的待证据问题。
+最终选择：只发起 1 次 synthesis 请求，不触发 empty-text retry，也不把 thinking/tool_use 回灌或当报告正文。`stop_reason=tool_use`、block types 为 `[thinking, tool_use]`、output tokens 为 4,602，均不满足 `end_turn + 单一 text + output=0` 白名单；最终 `execution_success/report_emitted/substantive_answer/grounded_answer/final_result_usable` 全为 false，不能把它记成证据弃答或报告成功。
+理由：这次运行证明重试策略没有被“无文本”泛化放宽，安全边界和成本账本优先于提高表面成功率。独立 artifact 审计确认 35 条成本记录与 142,319 tokens 对平，actual model 唯一为 `claude-opus-4-8`，denylist 命中均未越过 evidence 边界，ledger 不保存 response/thinking 正文。
+代价：当前 provider 的 thinking/tool-use-only 响应仍会让长报告失败；要继续优化，必须先取得同等级 provider 协议证据，不能凭一次失败扩大 retry 白名单，也不能启动四模型或 12×4 来掩盖单锚点未闭环。
+面试怎么答：我会把 v11 当成“评测本身发现了一个新的真实协议失败”，而不是把 17 个来源或检索执行成功包装成报告质量。系统能区分检索完成、生成失败、证据弃答和最终可用，失败仍完整计费且可审计。
+
 ## 问题 38：DRB II 第五次锚点暴露宽查询与长请求预算叠加
 
 现象：覆盖契约修复后，第五次 Opus 4.8 七国养老金锚点没有提前误停，但仍未生成报告。Q1/Q3 第二轮 trace 又变成原始长问题前 240 字符；Q2/Q4/Q5 打满 300 秒研究 deadline；synthesis 又连续耗时约 722.6 秒后 read timeout。整题 1104.3 秒、77,623 tokens，`fallback_policy=fail` 正确记执行失败。

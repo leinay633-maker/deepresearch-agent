@@ -321,6 +321,7 @@ Opus 4.8 裁判：`~/.deepresearch-agent-eval/runs/v7-judge-8-20260714T054138`
 - ⚠️ v11 总耗时 892.4s、142,319 tokens。coverage 仍不完整，尤其 Q5 只覆盖 ADB、Q1/Q2/Q4 缺多数国家/方案/公式字段；但本次最终阻塞首先是 provider 返回 thinking+tool_use 而无 text，不是 context 超限、模型漂移、污染或 citation sanitizer。报告未产出，因此两张必答表、多章节、多来源比较与逐项 citation 均应记“未达到/不可审计”，不能给结构质量分。
 - ✅ 独立只读 v11 artifact 审计未发现口径问题：raw/summary/stdout 状态一致；35 条成本记录与 142,319 tokens 对平；trace 47 次、成本账本 35 次 actual model 唯一都是 `claude-opus-4-8`；3 个 denylist 命中、5 个实际拦截候选均未越过 evidence 边界，ledger 无 response/thinking 正文泄漏。
 - 🚧 下一步入口：重新跑最终静态验收后中文 commit 并 push。当前仍禁止四模型同锚点和 12×4；若继续恢复 provider no-text，必须先取得 `tool_use` 无文本响应的协议证据，不能扩大 empty-text retry 或读取 thinking/tool body。
+- ✅ 最终代码与评测基线已以中文 commit `bcbff65 重构：完善 DRB II 深度报告评测与网关失败恢复` 提交并推送到 `origin/master`；工作树保持干净。v11 的 fail-closed 结论已同步到本文件、`KNOWLEDGE_BASE.md`、`INTERVIEW_QA.md` 与 AI 改动记录，后续若继续只围绕 provider `tool_use` 无文本证据推进，不启动四模型或 12×4。
 
 ## 已定决策及原因
 
