@@ -191,6 +191,37 @@ def test_fetch_allows_at_most_three_redirect_hops() -> None:
         )
 
 
+def test_fetch_redirects_share_one_absolute_timeout_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [100.0]
+    seen_timeouts: list[float] = []
+
+    monkeypatch.setattr(
+        "deepresearch_agent.url_policy.time.monotonic", lambda: now[0]
+    )
+
+    def opener(request: Any, timeout: float) -> FakeResponse:
+        seen_timeouts.append(timeout)
+        if request.full_url == "https://one.example/":
+            now[0] += 0.6
+            return FakeResponse(
+                status=302,
+                headers={"Location": "https://two.example/"},
+            )
+        return FakeResponse(b"final")
+
+    text = fetch_text_url(
+        "https://one.example/",
+        timeout=1.0,
+        resolver=resolver_with(PUBLIC_V4),
+        opener=opener,
+    )
+
+    assert text == "final"
+    assert seen_timeouts == pytest.approx([1.0, 0.4])
+
+
 def test_fetch_removes_jina_bearer_and_other_sensitive_headers_on_cross_origin_redirect() -> None:
     requested_headers: list[dict[str, str]] = []
 

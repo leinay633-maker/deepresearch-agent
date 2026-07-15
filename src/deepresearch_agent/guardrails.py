@@ -117,7 +117,6 @@ def safe_follow_up_query(
     raw = (candidate or "").strip()
     invalid_shape = (
         not raw
-        or len(raw) > max_chars
         or "\n" in raw
         or "\r" in raw
         or bool(_CONTROL_CHARACTERS.search(raw))
@@ -128,8 +127,17 @@ def safe_follow_up_query(
     if invalid_shape:
         return fallback[:max_chars].rstrip()
 
+    normalized = re.sub(r"\s+", " ", raw).strip()
+    bounded = normalized[:max_chars].rstrip()
+    if len(normalized) > max_chars and not normalized[max_chars].isspace():
+        boundary = bounded.rfind(" ")
+        if boundary > 0:
+            bounded = bounded[:boundary].rstrip()
+    if not bounded:
+        return fallback[:max_chars].rstrip()
+
     anchor_terms = tokenize(f"{original_question} {evidence_gap or ''}")
-    candidate_terms = tokenize(raw)
+    candidate_terms = tokenize(bounded)
     if anchor_terms and not anchor_terms.intersection(candidate_terms):
         return fallback[:max_chars].rstrip()
-    return re.sub(r"\s+", " ", raw)[:max_chars].rstrip()
+    return bounded

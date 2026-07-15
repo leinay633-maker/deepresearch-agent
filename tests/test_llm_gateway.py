@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 from collections.abc import Iterator
@@ -20,6 +21,9 @@ from deepresearch_agent.llm_gateway import (
     MAX_GATEWAY_RESPONSE_BYTES,
     GatewayMessageResult,
     LLMGatewayClient,
+    LLMGatewayModelMismatchError,
+    LLMGatewayNoTextContentError,
+    response_model_matches,
 )
 from deepresearch_agent.orchestrator import DeepResearchOrchestrator
 from deepresearch_agent.schemas import (
@@ -65,6 +69,25 @@ class _SizedFakeHTTPResponse:
         chunk = self.payload[self.offset : self.offset + size]
         self.offset += len(chunk)
         return chunk
+
+
+def _gateway_no_text_error(
+    *,
+    stop_reason: str | None = "end_turn",
+    content_block_types: tuple[str, ...] = ("text",),
+    usage: dict[str, int] | None = None,
+    actual_model: str | None = "claude-opus-4-8-20260701",
+    response_sha: str = "a" * 64,
+) -> LLMGatewayNoTextContentError:
+    return LLMGatewayNoTextContentError(
+        requested_model="claude-opus-4-8",
+        actual_model=actual_model,
+        stop_reason=stop_reason,
+        content_block_types=content_block_types,
+        usage={"input_tokens": 19, "output_tokens": 0} if usage is None else usage,
+        response_bytes=211,
+        raw_response_sha256=response_sha,
+    )
 
 
 @contextmanager
@@ -205,7 +228,9 @@ def test_gateway_client_rejects_model_routing_drift_when_strict(monkeypatch) -> 
 
     monkeypatch.setattr(gateway_module, "no_redirect_urlopen", fake_urlopen)
 
-    with pytest.raises(RuntimeError, match="response model did not match"):
+    with pytest.raises(
+        LLMGatewayModelMismatchError, match="response model did not match"
+    ) as captured:
         LLMGatewayClient(
             base_url="https://gateway.local",
             require_response_model_match=True,
@@ -214,6 +239,337 @@ def test_gateway_client_rejects_model_routing_drift_when_strict(monkeypatch) -> 
             messages=[{"role": "user", "content": "Return JSON."}],
             max_tokens=100,
         )
+
+    assert isinstance(captured.value, RuntimeError)
+    assert captured.value.requested_model == "claude-4.6-opus"
+    assert captured.value.actual_model == "glm-5.2"
+    assert captured.value.usage == {
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
+    assert not hasattr(captured.value, "raw_response")
+
+
+def test_gateway_client_retains_safe_metadata_for_thinking_only_response(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "test-gateway-key")
+    thinking_body = "private reasoning that must never enter artifacts"
+    payload = {
+        "model": "claude-opus-4-8-20260701",
+        "content": [{"type": "thinking", "thinking": thinking_body}],
+        "usage": {
+            "input_tokens": 101,
+            "output_tokens": 10000,
+            "cache_creation_input_tokens": 7,
+            "cache_read_input_tokens": 11,
+        },
+        "stop_reason": "max_tokens",
+    }
+    raw_response = json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setattr(
+        gateway_module,
+        "no_redirect_urlopen",
+        lambda request, timeout: _FakeHTTPResponse(payload),
+    )
+
+    with pytest.raises(LLMGatewayNoTextContentError) as captured:
+        LLMGatewayClient(base_url="https://gateway.local").create_message(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "Return JSON."}],
+            max_tokens=10_000,
+        )
+
+    error = captured.value
+    assert error.requested_model == "claude-opus-4-8"
+    assert error.actual_model == "claude-opus-4-8-20260701"
+    assert error.stop_reason == "max_tokens"
+    assert error.content_block_types == ("thinking",)
+    assert error.usage == {
+        "input_tokens": 101,
+        "output_tokens": 10000,
+        "cache_creation_input_tokens": 7,
+        "cache_read_input_tokens": 11,
+    }
+    assert error.response_bytes == len(raw_response)
+    assert error.raw_response_sha256 == hashlib.sha256(raw_response).hexdigest()
+    assert thinking_body not in str(error)
+    assert thinking_body not in repr(error)
+    assert not hasattr(error, "raw_response")
+
+
+def test_gateway_client_retains_safe_metadata_for_empty_content(monkeypatch) -> None:
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "test-gateway-key")
+    payload = {
+        "model": "claude-opus-4-8",
+        "content": [],
+        "usage": {"input_tokens": 13, "output_tokens": 0},
+        "stop_reason": "end_turn",
+    }
+    monkeypatch.setattr(
+        gateway_module,
+        "no_redirect_urlopen",
+        lambda request, timeout: _FakeHTTPResponse(payload),
+    )
+
+    with pytest.raises(LLMGatewayNoTextContentError) as captured:
+        LLMGatewayClient(base_url="https://gateway.local").create_message(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "Return JSON."}],
+            max_tokens=100,
+        )
+
+    assert captured.value.content_block_types == ()
+    assert captured.value.actual_model == "claude-opus-4-8"
+    assert captured.value.stop_reason == "end_turn"
+    assert captured.value.usage["input_tokens"] == 13
+
+
+def test_gateway_client_normalizes_v10_blank_text_shape_for_retry_policy(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "test-gateway-key")
+    payload = {
+        "model": "claude-opus-4-8-20260701",
+        "content": [{"type": "text", "text": " \n\t"}],
+        # v10 omitted output_tokens; the Gateway client normalizes it to zero.
+        "usage": {"input_tokens": 19_422},
+        "stop_reason": "end_turn",
+    }
+    monkeypatch.setattr(
+        gateway_module,
+        "no_redirect_urlopen",
+        lambda request, timeout: _FakeHTTPResponse(payload),
+    )
+
+    with pytest.raises(LLMGatewayNoTextContentError) as captured:
+        LLMGatewayClient(
+            base_url="https://gateway.local",
+            require_response_model_match=True,
+        ).create_message(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "Return report JSON."}],
+            max_tokens=10_000,
+        )
+
+    assert captured.value.actual_model == "claude-opus-4-8-20260701"
+    assert captured.value.stop_reason == "end_turn"
+    assert captured.value.content_block_types == ("text",)
+    assert captured.value.usage["input_tokens"] == 19_422
+    assert captured.value.usage["output_tokens"] == 0
+
+
+def test_gateway_unknown_stop_reason_never_reaches_exception_or_ledger(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "test-gateway-key")
+    private_stop_reason = "private reasoning that must never enter artifacts"
+    payload = {
+        "model": "claude-opus-4-8",
+        "content": [{"type": "text", "text": "   "}],
+        "usage": {"input_tokens": 19, "output_tokens": 0},
+        "stop_reason": private_stop_reason,
+    }
+    monkeypatch.setattr(
+        gateway_module,
+        "no_redirect_urlopen",
+        lambda request, timeout: _FakeHTTPResponse(payload),
+    )
+
+    with pytest.raises(LLMGatewayNoTextContentError) as gateway_error:
+        LLMGatewayClient(
+            base_url="https://gateway.local",
+            require_response_model_match=True,
+        ).create_message(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "Return report JSON."}],
+            max_tokens=10_000,
+        )
+
+    assert gateway_error.value.stop_reason == "unknown"
+    assert private_stop_reason not in str(gateway_error.value)
+    assert private_stop_reason not in repr(gateway_error.value)
+
+    client = _SequenceGatewayClient(
+        [gateway_error.value],
+        require_response_model_match=True,
+    )
+    provider = LLMGatewayLLMProvider(
+        model="claude-opus-4-8",
+        base_url="https://gateway.local",
+        max_retries=2,
+        client=client,
+    )
+    with pytest.raises(RuntimeError) as provider_error:
+        asyncio.run(
+            provider._chat_json_result(
+                stage="synthesis",
+                messages=[{"role": "user", "content": "Return report JSON."}],
+                max_tokens=10_000,
+            )
+        )
+
+    assert len(client.calls) == 1
+    assert provider_error.value.attempt_ledger[0]["stop_reason"] == "unknown"
+    assert private_stop_reason not in repr(provider_error.value)
+    assert private_stop_reason not in json.dumps(provider_error.value.attempt_ledger)
+
+
+def test_gateway_mismatch_bounds_untrusted_actual_model_metadata(monkeypatch) -> None:
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "test-gateway-key")
+    private_model = "claude-opus-4-8-private-reasoning-must-not-leak"
+    payload = {
+        "model": private_model,
+        "content": [{"type": "text", "text": "   "}],
+        "usage": {"input_tokens": 2, "output_tokens": 1},
+        "stop_reason": "end_turn",
+    }
+    monkeypatch.setattr(
+        gateway_module,
+        "no_redirect_urlopen",
+        lambda request, timeout: _FakeHTTPResponse(payload),
+    )
+
+    with pytest.raises(LLMGatewayModelMismatchError) as captured:
+        LLMGatewayClient(
+            base_url="https://gateway.local",
+            require_response_model_match=True,
+        ).create_message(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "Return report JSON."}],
+            max_tokens=100,
+        )
+
+    assert captured.value.actual_model == "unknown"
+    assert private_model not in str(captured.value)
+    assert private_model not in repr(captured.value)
+
+    client = _SequenceGatewayClient([captured.value])
+    provider = LLMGatewayLLMProvider(
+        model="claude-opus-4-8",
+        base_url="https://gateway.local",
+        client=client,
+    )
+    with pytest.raises(LLMGatewayModelMismatchError) as provider_error:
+        asyncio.run(
+            provider._chat_json_result(
+                stage="synthesis",
+                messages=[{"role": "user", "content": "Return report JSON."}],
+                max_tokens=100,
+            )
+        )
+
+    assert provider_error.value.attempt_ledger[0]["actual_model"] == "unknown"
+    assert private_model not in json.dumps(provider_error.value.attempt_ledger)
+
+
+def test_gateway_model_match_allows_only_exact_or_valid_date_alias() -> None:
+    requested = "claude-opus-4-8"
+
+    assert response_model_matches(requested, requested) is True
+    assert response_model_matches(requested, "claude-opus-4-8-20260701") is True
+    assert response_model_matches(
+        "kimi-k2.7-code-highspeed",
+        "kimi-k2.7-code-highspeed-202607",
+    ) is True
+    assert response_model_matches(
+        requested,
+        "claude-opus-4-8-private-reasoning",
+    ) is False
+    assert response_model_matches(requested, "claude-opus-4-8-20261340") is False
+    assert response_model_matches(
+        "kimi-k2.7-code-highspeed",
+        "kimi-k2.7-code-highspeed-202613",
+    ) is False
+    assert response_model_matches(requested, "claude-opus-4-8-20260701-extra") is False
+
+
+def test_gateway_client_preserves_duplicate_blank_text_block_types(monkeypatch) -> None:
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "test-gateway-key")
+    payload = {
+        "model": "claude-opus-4-8",
+        "content": [
+            {"type": "text", "text": ""},
+            {"type": "text", "text": " \n"},
+        ],
+        "usage": {"input_tokens": 21, "output_tokens": 0},
+        "stop_reason": "end_turn",
+    }
+    monkeypatch.setattr(
+        gateway_module,
+        "no_redirect_urlopen",
+        lambda request, timeout: _FakeHTTPResponse(payload),
+    )
+
+    with pytest.raises(LLMGatewayNoTextContentError) as captured:
+        LLMGatewayClient(
+            base_url="https://gateway.local",
+            require_response_model_match=True,
+        ).create_message(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "Return report JSON."}],
+            max_tokens=10_000,
+        )
+
+    assert captured.value.content_block_types == ("text", "text")
+    assert not hasattr(captured.value, "raw_response")
+
+
+def test_gateway_client_marks_content_block_type_metadata_truncation(monkeypatch) -> None:
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "test-gateway-key")
+    payload = {
+        "model": "claude-opus-4-8",
+        "content": [{"type": "text", "text": ""} for _index in range(33)],
+        "usage": {"input_tokens": 21, "output_tokens": 0},
+        "stop_reason": "end_turn",
+    }
+    monkeypatch.setattr(
+        gateway_module,
+        "no_redirect_urlopen",
+        lambda request, timeout: _FakeHTTPResponse(payload),
+    )
+
+    with pytest.raises(LLMGatewayNoTextContentError) as captured:
+        LLMGatewayClient(
+            base_url="https://gateway.local",
+            require_response_model_match=True,
+        ).create_message(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "Return report JSON."}],
+            max_tokens=10_000,
+        )
+
+    assert captured.value.content_block_types == ("text",) * 32 + ("truncated",)
+
+
+def test_gateway_strict_model_check_precedes_no_text_classification(monkeypatch) -> None:
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "test-gateway-key")
+    payload = {
+        "model": "glm-5.2",
+        "content": [{"type": "thinking", "thinking": "must not surface"}],
+        "usage": {"input_tokens": 1, "output_tokens": 2},
+        "stop_reason": "max_tokens",
+    }
+    monkeypatch.setattr(
+        gateway_module,
+        "no_redirect_urlopen",
+        lambda request, timeout: _FakeHTTPResponse(payload),
+    )
+
+    with pytest.raises(LLMGatewayModelMismatchError) as captured:
+        LLMGatewayClient(
+            base_url="https://gateway.local",
+            require_response_model_match=True,
+        ).create_message(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "Return JSON."}],
+            max_tokens=100,
+        )
+
+    assert captured.value.actual_model == "glm-5.2"
 
 
 def test_gateway_client_rejects_plain_http_for_non_loopback_hosts() -> None:
@@ -463,6 +819,792 @@ def test_gateway_provider_records_all_usage_when_retries_exhausted(monkeypatch) 
     assert cost.summary().total_tokens == 15
 
 
+def test_deep_synthesis_transport_timeout_is_single_fail_closed_attempt() -> None:
+    client = _SequenceGatewayClient(
+        [TimeoutError("The read operation timed out")]
+    )
+    provider = LLMGatewayLLMProvider(
+        model="claude-4.6-opus",
+        base_url="https://gateway.local",
+        timeout_seconds=240.0,
+        synthesis_timeout_seconds=360.0,
+        max_retries=2,
+        client=client,
+    )
+
+    with pytest.raises(RuntimeError, match="read operation timed out") as captured:
+        asyncio.run(
+            provider._chat_json_result(
+                stage="synthesis",
+                messages=[{"role": "user", "content": "Return the full report JSON."}],
+                max_tokens=10_000,
+            )
+        )
+
+    assert len(client.calls) == 1
+    assert client.calls[0]["timeout_seconds"] == 360.0
+    assert client.calls[0]["max_tokens"] == 10_000
+    assert captured.value.failure_class == "transport_timeout"
+    assert captured.value.attempt_ledger == [
+        {
+            "attempt": 1,
+            "request_kind": "initial",
+            "failure_class": "transport_timeout",
+            "duration_ms": captured.value.attempt_ledger[0]["duration_ms"],
+            "timeout_seconds": 360.0,
+            "max_tokens": 10_000,
+            "requested_model": "claude-4.6-opus",
+            "actual_model": None,
+            "usage": None,
+            "error": "The read operation timed out",
+        }
+    ]
+
+
+def test_deep_synthesis_retries_exact_empty_text_with_original_request_and_cost(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(llm_module.time, "sleep", lambda _seconds: None)
+    original_messages = [
+        {"role": "system", "content": "Return strict report JSON."},
+        {"role": "user", "content": "Use the complete evidence context."},
+    ]
+    client = _SequenceGatewayClient(
+        [
+            _gateway_no_text_error(usage={"input_tokens": 19, "output_tokens": 0}),
+            GatewayMessageResult(
+                content='{"answer":"Supported fact [S1]","claims":["Supported fact [S1]"]}',
+                model="claude-opus-4-8-20260701",
+                usage={"input_tokens": 23, "output_tokens": 7},
+            ),
+        ],
+        require_response_model_match=True,
+    )
+    provider = LLMGatewayLLMProvider(
+        model="claude-opus-4-8",
+        base_url="https://gateway.local",
+        synthesis_timeout_seconds=600.0,
+        max_retries=2,
+        client=client,
+    )
+    cost = CostTracker(provider=provider.name, model=provider.model)
+
+    with provider._capture_attempt_usage(cost, "synthesis"):
+        result = asyncio.run(
+            provider._chat_json_result(
+                stage="synthesis",
+                messages=original_messages,
+                max_tokens=10_000,
+            )
+        )
+
+    assert result.parsed["claims"] == ["Supported fact [S1]"]
+    assert result.final_request_kind == "retry"
+    assert [item["request_kind"] for item in result.attempt_ledger] == ["initial"]
+    assert len(client.calls) == 2
+    assert client.calls[0] == client.calls[1]
+    assert client.calls[1]["messages"] == original_messages
+    assert client.calls[1]["max_tokens"] == 10_000
+    assert client.calls[1]["timeout_seconds"] == 600.0
+    assert [(item.input_tokens, item.output_tokens) for item in cost.records] == [
+        (19, 0),
+        (23, 7),
+    ]
+
+
+def test_brief_generation_retries_exact_empty_text_with_original_request(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(llm_module.time, "sleep", lambda _seconds: None)
+    client = _SequenceGatewayClient(
+        [
+            _gateway_no_text_error(),
+            GatewayMessageResult(
+                content=(
+                    '{"normalized_query":"How does gateway routing work?",'
+                    '"scope":"Verify the provider path.",'
+                    '"constraints":["Use runtime credentials."],'
+                    '"assumptions":[]}'
+                ),
+                model="claude-opus-4-8-20260701",
+                usage={"input_tokens": 23, "output_tokens": 7},
+            ),
+        ],
+        require_response_model_match=True,
+    )
+    provider = LLMGatewayLLMProvider(
+        model="claude-opus-4-8",
+        base_url="https://gateway.local",
+        timeout_seconds=240.0,
+        synthesis_timeout_seconds=600.0,
+        max_retries=2,
+        client=client,
+    )
+
+    brief = asyncio.run(
+        provider.create_brief(
+            ResearchRequest(query="How does gateway routing work?"),
+            CostTracker(provider=provider.name, model=provider.model),
+        )
+    )
+
+    assert brief.scope == "Verify the provider path."
+    assert len(client.calls) == 2
+    assert client.calls[0] == client.calls[1]
+    assert client.calls[1]["timeout_seconds"] == 240.0
+    assert client.calls[1]["max_tokens"] == 1200
+
+
+def test_exact_empty_text_respects_zero_retry_budget() -> None:
+    client = _SequenceGatewayClient(
+        [_gateway_no_text_error()],
+        require_response_model_match=True,
+    )
+    provider = LLMGatewayLLMProvider(
+        model="claude-opus-4-8",
+        base_url="https://gateway.local",
+        max_retries=0,
+        client=client,
+    )
+
+    with pytest.raises(RuntimeError, match="returned no text content") as captured:
+        asyncio.run(
+            provider._chat_json_result(
+                stage="synthesis",
+                messages=[{"role": "user", "content": "Return report JSON."}],
+                max_tokens=10_000,
+            )
+        )
+
+    assert len(client.calls) == 1
+    assert [item["request_kind"] for item in captured.value.attempt_ledger] == [
+        "initial"
+    ]
+
+
+def test_one_retry_budget_does_not_add_repair_after_empty_retry(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(llm_module.time, "sleep", lambda _seconds: None)
+    client = _SequenceGatewayClient(
+        [
+            _gateway_no_text_error(),
+            GatewayMessageResult(
+                content='{"answer":"Uncited retry fact","claims":[]}',
+                model="claude-opus-4-8",
+                usage={"input_tokens": 23, "output_tokens": 4},
+            ),
+        ],
+        require_response_model_match=True,
+    )
+    provider = LLMGatewayLLMProvider(
+        model="claude-opus-4-8",
+        base_url="https://gateway.local",
+        max_retries=1,
+        client=client,
+    )
+
+    def require_claim(payload: dict) -> None:
+        if not payload.get("claims"):
+            raise ValueError("factual text lacks a cited claim")
+
+    with pytest.raises(RuntimeError, match="factual text lacks a cited claim") as captured:
+        asyncio.run(
+            provider._chat_json_result(
+                stage="synthesis",
+                messages=[{"role": "user", "content": "Return report JSON."}],
+                max_tokens=10_000,
+                validator=require_claim,
+            )
+        )
+
+    assert len(client.calls) == 2
+    assert [item["request_kind"] for item in captured.value.attempt_ledger] == [
+        "initial",
+        "retry",
+    ]
+
+
+def test_timeout_after_empty_text_retry_does_not_open_repair(monkeypatch) -> None:
+    monkeypatch.setattr(llm_module.time, "sleep", lambda _seconds: None)
+    client = _SequenceGatewayClient(
+        [_gateway_no_text_error(), TimeoutError("The read operation timed out")],
+        require_response_model_match=True,
+    )
+    provider = LLMGatewayLLMProvider(
+        model="claude-opus-4-8",
+        base_url="https://gateway.local",
+        max_retries=2,
+        client=client,
+    )
+
+    with pytest.raises(RuntimeError, match="read operation timed out") as captured:
+        asyncio.run(
+            provider._chat_json_result(
+                stage="synthesis",
+                messages=[{"role": "user", "content": "Return report JSON."}],
+                max_tokens=10_000,
+            )
+        )
+
+    assert len(client.calls) == 2
+    assert [item["request_kind"] for item in captured.value.attempt_ledger] == [
+        "initial",
+        "retry",
+    ]
+    assert [item["failure_class"] for item in captured.value.attempt_ledger] == [
+        "no_text_content",
+        "transport_timeout",
+    ]
+
+
+def test_no_text_during_repair_does_not_open_empty_text_retry(monkeypatch) -> None:
+    monkeypatch.setattr(llm_module.time, "sleep", lambda _seconds: None)
+    client = _SequenceGatewayClient(
+        [
+            GatewayMessageResult(
+                content='{"answer":"Uncited initial fact","claims":[]}',
+                model="claude-opus-4-8",
+                usage={"input_tokens": 21, "output_tokens": 4},
+            ),
+            _gateway_no_text_error(),
+        ],
+        require_response_model_match=True,
+    )
+    provider = LLMGatewayLLMProvider(
+        model="claude-opus-4-8",
+        base_url="https://gateway.local",
+        max_retries=2,
+        client=client,
+    )
+
+    def require_claim(payload: dict) -> None:
+        if not payload.get("claims"):
+            raise ValueError("factual text lacks a cited claim")
+
+    with pytest.raises(RuntimeError, match="returned no text content") as captured:
+        asyncio.run(
+            provider._chat_json_result(
+                stage="synthesis",
+                messages=[{"role": "user", "content": "Return report JSON."}],
+                max_tokens=10_000,
+                validator=require_claim,
+            )
+        )
+
+    assert len(client.calls) == 2
+    assert [item["request_kind"] for item in captured.value.attempt_ledger] == [
+        "initial",
+        "repair",
+    ]
+
+
+def test_successful_empty_text_retry_is_auditable_in_synthesis_context(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(llm_module.time, "sleep", lambda _seconds: None)
+    client = _SequenceGatewayClient(
+        [
+            _gateway_no_text_error(),
+            GatewayMessageResult(
+                content=(
+                    '{"answer":"Alpha has documented property A [S1].",'
+                    '"claims":["Alpha has documented property A [S1]."]}'
+                ),
+                model="claude-opus-4-8",
+                usage={"input_tokens": 23, "output_tokens": 7},
+            ),
+        ],
+        require_response_model_match=True,
+    )
+    provider = LLMGatewayLLMProvider(
+        model="claude-opus-4-8",
+        base_url="https://gateway.local",
+        max_retries=2,
+        client=client,
+    )
+    brief = ResearchBrief(
+        original_query="What property does Alpha have?",
+        normalized_query="What property does Alpha have?",
+        scope="Verify Alpha's property.",
+        constraints=[],
+        assumptions=[],
+    )
+    subquestion = SubQuestion(
+        id="Q1",
+        question="What property does Alpha have?",
+        rationale="Verify the property.",
+    )
+    source = Source(
+        id="S1",
+        title="Alpha source",
+        url="https://example.com/alpha",
+        content="Alpha has documented property A.",
+        provider="fixture",
+        query="Alpha property",
+    )
+    finding = Finding(
+        subquestion_id="Q1",
+        subquestion=subquestion.question,
+        summary="Alpha has documented property A.",
+        source_ids=["S1"],
+        sources=[source],
+    )
+
+    answer, _claims = asyncio.run(
+        provider.synthesize(
+            brief,
+            [subquestion],
+            [finding],
+            [source],
+            CostTracker(provider=provider.name, model=provider.model),
+        )
+    )
+
+    assert answer == "Alpha has documented property A [S1]."
+    assert len(client.calls) == 2
+    assert client.calls[0] == client.calls[1]
+    context = provider.last_synthesis_context
+    assert context["final_request_kind"] == "retry"
+    assert [item["request_kind"] for item in context["attempt_ledger"]] == [
+        "initial"
+    ]
+    assert context["attempt_ledger"][0]["failure_class"] == "no_text_content"
+    assert "Alpha has documented property A" not in str(context["attempt_ledger"])
+
+
+def test_deep_synthesis_two_empty_text_attempts_fail_closed_with_safe_ledger(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(llm_module.time, "sleep", lambda _seconds: None)
+    client = _SequenceGatewayClient(
+        [
+            _gateway_no_text_error(
+                usage={"input_tokens": 19, "output_tokens": 0},
+                response_sha="a" * 64,
+            ),
+            _gateway_no_text_error(
+                usage={"input_tokens": 21, "output_tokens": 0},
+                response_sha="b" * 64,
+            ),
+        ],
+        require_response_model_match=True,
+    )
+    provider = LLMGatewayLLMProvider(
+        model="claude-opus-4-8",
+        base_url="https://gateway.local",
+        synthesis_timeout_seconds=600.0,
+        max_retries=2,
+        client=client,
+    )
+    cost = CostTracker(provider=provider.name, model=provider.model)
+
+    with pytest.raises(RuntimeError, match="returned no text content") as captured:
+        with provider._capture_attempt_usage(cost, "synthesis"):
+            asyncio.run(
+                provider._chat_json_result(
+                    stage="synthesis",
+                    messages=[{"role": "user", "content": "Return report JSON."}],
+                    max_tokens=10_000,
+                )
+            )
+
+    assert len(client.calls) == 2
+    assert [item["request_kind"] for item in captured.value.attempt_ledger] == [
+        "initial",
+        "retry",
+    ]
+    assert [(item.input_tokens, item.output_tokens) for item in cost.records] == [
+        (19, 0),
+        (21, 0),
+    ]
+    for ledger_item in captured.value.attempt_ledger:
+        assert "response" not in ledger_item
+        assert "raw_response" not in ledger_item
+        assert "thinking" not in ledger_item
+        assert "content" not in ledger_item
+    assert "private reasoning" not in json.dumps(captured.value.attempt_ledger)
+
+
+def test_empty_text_retry_can_be_followed_by_only_one_content_repair(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(llm_module.time, "sleep", lambda _seconds: None)
+    invalid_draft = "draft body must never be replayed"
+    original_messages = [
+        {"role": "system", "content": "Return strict report JSON."},
+        {"role": "user", "content": "Use all supplied evidence."},
+    ]
+    client = _SequenceGatewayClient(
+        [
+            _gateway_no_text_error(),
+            GatewayMessageResult(
+                content=json.dumps({"answer": invalid_draft, "claims": []}),
+                model="claude-opus-4-8",
+                usage={"input_tokens": 23, "output_tokens": 4},
+            ),
+            GatewayMessageResult(
+                content=json.dumps({"answer": "still invalid", "claims": []}),
+                model="claude-opus-4-8",
+                usage={"input_tokens": 25, "output_tokens": 4},
+            ),
+        ],
+        require_response_model_match=True,
+    )
+    provider = LLMGatewayLLMProvider(
+        model="claude-opus-4-8",
+        base_url="https://gateway.local",
+        synthesis_timeout_seconds=600.0,
+        max_retries=2,
+        client=client,
+    )
+
+    def require_claim(payload: dict) -> None:
+        if not payload.get("claims"):
+            raise ValueError("factual text lacks a cited claim")
+
+    with pytest.raises(RuntimeError, match="factual text lacks a cited claim") as captured:
+        asyncio.run(
+            provider._chat_json_result(
+                stage="synthesis",
+                messages=original_messages,
+                max_tokens=10_000,
+                validator=require_claim,
+            )
+        )
+
+    assert len(client.calls) == 3
+    assert [item["request_kind"] for item in captured.value.attempt_ledger] == [
+        "initial",
+        "retry",
+        "repair",
+    ]
+    assert client.calls[0] == client.calls[1]
+    assert client.calls[2]["max_tokens"] == 10_000
+    assert client.calls[2]["timeout_seconds"] == 600.0
+    assert len(client.calls[2]["messages"]) == len(original_messages)
+    assert invalid_draft not in str(client.calls[2]["messages"])
+    assert "previous complete response was received" in client.calls[2]["messages"][-1][
+        "content"
+    ].lower()
+
+
+def test_synthesis_failure_context_preserves_three_bounded_attempts(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(llm_module.time, "sleep", lambda _seconds: None)
+    client = _SequenceGatewayClient(
+        [
+            _gateway_no_text_error(),
+            GatewayMessageResult(
+                content='{"answer":"Uncited retry fact","claims":[]}',
+                model="claude-opus-4-8",
+                usage={"input_tokens": 23, "output_tokens": 4},
+            ),
+            GatewayMessageResult(
+                content='{"answer":"Uncited repair fact","claims":[]}',
+                model="claude-opus-4-8",
+                usage={"input_tokens": 25, "output_tokens": 4},
+            ),
+        ],
+        require_response_model_match=True,
+    )
+    provider = LLMGatewayLLMProvider(
+        model="claude-opus-4-8",
+        base_url="https://gateway.local",
+        max_retries=2,
+        client=client,
+    )
+    brief = ResearchBrief(
+        original_query="Compare Alpha evidence.",
+        normalized_query="Compare Alpha evidence.",
+        scope="Compare verified Alpha evidence.",
+        constraints=[],
+        assumptions=[],
+        report_depth="deep",
+        expected_format="markdown",
+    )
+    subquestion = SubQuestion(
+        id="Q1",
+        question="What verified Alpha evidence exists?",
+        rationale="Collect evidence.",
+    )
+    source = Source(
+        id="S1",
+        title="Alpha source",
+        url="https://example.com/alpha",
+        content="Alpha has documented property A.",
+        provider="fixture",
+        query="Alpha evidence",
+    )
+    finding = Finding(
+        subquestion_id="Q1",
+        subquestion=subquestion.question,
+        summary="Alpha has documented property A.",
+        source_ids=["S1"],
+        sources=[source],
+    )
+
+    asyncio.run(
+        provider.synthesize(
+            brief,
+            [subquestion],
+            [finding],
+            [source],
+            CostTracker(provider=provider.name, model=provider.model),
+        )
+    )
+
+    assert [
+        item["request_kind"]
+        for item in provider.last_synthesis_context["attempt_ledger"]
+    ] == ["initial", "retry", "repair"]
+    assert "Uncited retry fact" not in str(
+        provider.last_synthesis_context["attempt_ledger"]
+    )
+    assert "Uncited repair fact" not in str(
+        provider.last_synthesis_context["attempt_ledger"]
+    )
+
+
+@pytest.mark.parametrize(
+    "no_text",
+    [
+        _gateway_no_text_error(
+            stop_reason="end_turn",
+            content_block_types=("thinking",),
+        ),
+        _gateway_no_text_error(stop_reason="max_tokens"),
+        _gateway_no_text_error(content_block_types=()),
+        _gateway_no_text_error(content_block_types=("text", "text")),
+        _gateway_no_text_error(content_block_types=("text", "thinking")),
+        _gateway_no_text_error(usage={"input_tokens": 19}),
+        _gateway_no_text_error(usage={"input_tokens": 0, "output_tokens": 0}),
+        _gateway_no_text_error(usage={"input_tokens": 19, "output_tokens": 1}),
+    ],
+    ids=[
+        "thinking-only",
+        "max-tokens",
+        "empty-content-array",
+        "duplicate-empty-text-blocks",
+        "mixed-text-thinking-blocks",
+        "missing-output-usage",
+        "missing-normalized-usage",
+        "nonzero-output",
+    ],
+)
+def test_non_exact_no_text_shapes_are_not_retried(no_text) -> None:
+    client = _SequenceGatewayClient(
+        [no_text],
+        require_response_model_match=True,
+    )
+    provider = LLMGatewayLLMProvider(
+        model="claude-opus-4-8",
+        base_url="https://gateway.local",
+        max_retries=2,
+        client=client,
+    )
+
+    with pytest.raises(RuntimeError, match="returned no text content"):
+        asyncio.run(
+            provider._chat_json_result(
+                stage="synthesis",
+                messages=[{"role": "user", "content": "Return report JSON."}],
+                max_tokens=10_000,
+            )
+        )
+
+    assert len(client.calls) == 1
+
+
+def test_exact_empty_text_is_not_retried_without_strict_model_check() -> None:
+    client = _SequenceGatewayClient(
+        [_gateway_no_text_error()],
+        require_response_model_match=False,
+    )
+    provider = LLMGatewayLLMProvider(
+        model="claude-opus-4-8",
+        base_url="https://gateway.local",
+        max_retries=2,
+        client=client,
+    )
+
+    with pytest.raises(RuntimeError, match="returned no text content"):
+        asyncio.run(
+            provider._chat_json_result(
+                stage="synthesis",
+                messages=[{"role": "user", "content": "Return report JSON."}],
+                max_tokens=10_000,
+            )
+        )
+
+    assert len(client.calls) == 1
+
+
+def test_deep_synthesis_allows_one_complete_targeted_repair(monkeypatch) -> None:
+    monkeypatch.setattr(llm_module.time, "sleep", lambda _seconds: None)
+    client = _SequenceGatewayClient(
+        [
+            GatewayMessageResult(
+                content='{"answer":"Uncited fact","claims":[]}',
+                model="claude-4.6-opus",
+                usage={"input_tokens": 20, "output_tokens": 5},
+            ),
+            GatewayMessageResult(
+                content=(
+                    '{"answer":"# Findings\\n\\nSupported fact [S1]",'
+                    '"claims":["Supported fact [S1]"]}'
+                ),
+                model="claude-4.6-opus",
+                usage={"input_tokens": 22, "output_tokens": 8},
+            ),
+        ]
+    )
+    provider = LLMGatewayLLMProvider(
+        model="claude-4.6-opus",
+        base_url="https://gateway.local",
+        synthesis_timeout_seconds=360.0,
+        max_retries=2,
+        client=client,
+    )
+
+    def require_claim(payload: dict) -> None:
+        if not payload.get("claims"):
+            raise ValueError("factual text lacks a cited claim")
+
+    result = asyncio.run(
+        provider._chat_json_result(
+            stage="synthesis",
+            messages=[
+                {"role": "system", "content": "Return strict report JSON."},
+                {
+                    "role": "user",
+                    "content": "Use the complete evidence context and preserve all tables.",
+                },
+            ],
+            max_tokens=10_000,
+            validator=require_claim,
+        )
+    )
+
+    assert result.parsed["claims"] == ["Supported fact [S1]"]
+    assert len(client.calls) == 2
+    assert all(call["timeout_seconds"] == 360.0 for call in client.calls)
+    repair_messages = client.calls[1]["messages"]
+    assert len(repair_messages) == 2
+    assert "Uncited fact" not in str(repair_messages)
+    assert "Preserve the requested multi-section report" in repair_messages[-1]["content"]
+    assert "do not collapse it into a short summary" in repair_messages[-1]["content"]
+
+
+def test_synthesis_model_mismatch_is_not_retried_and_preserves_actual_model() -> None:
+    mismatch = LLMGatewayModelMismatchError(
+        requested_model="claude-4.6-opus",
+        actual_model="glm-5.2",
+        usage={"input_tokens": 17, "output_tokens": 2},
+    )
+    client = _SequenceGatewayClient([mismatch])
+    provider = LLMGatewayLLMProvider(
+        model="claude-4.6-opus",
+        base_url="https://gateway.local",
+        synthesis_timeout_seconds=360.0,
+        max_retries=2,
+        client=client,
+    )
+    cost = CostTracker(provider=provider.name, model=provider.model)
+
+    with pytest.raises(LLMGatewayModelMismatchError) as captured:
+        with provider._capture_attempt_usage(cost, "synthesis"):
+            asyncio.run(
+                provider._chat_json_result(
+                    stage="synthesis",
+                    messages=[{"role": "user", "content": "Return report JSON."}],
+                    max_tokens=10_000,
+                )
+            )
+
+    assert len(client.calls) == 1
+    assert [(item.input_tokens, item.output_tokens) for item in cost.records] == [
+        (17, 2)
+    ]
+    assert captured.value.requested_model == "claude-4.6-opus"
+    assert captured.value.actual_model == "glm-5.2"
+    assert captured.value.attempt_ledger[0]["failure_class"] == "model_mismatch"
+    assert captured.value.attempt_ledger[0]["actual_model"] == "glm-5.2"
+    assert captured.value.attempt_ledger[0]["usage"] == {
+        "input_tokens": 17,
+        "output_tokens": 2,
+    }
+
+
+def test_synthesis_no_text_attempt_retains_only_safe_gateway_metadata() -> None:
+    no_text = LLMGatewayNoTextContentError(
+        requested_model="claude-opus-4-8",
+        actual_model="claude-opus-4-8-20260701",
+        stop_reason="max_tokens",
+        content_block_types=("thinking",),
+        usage={"input_tokens": 15881, "output_tokens": 10000},
+        response_bytes=654321,
+        raw_response_sha256="a" * 64,
+    )
+    client = _SequenceGatewayClient([no_text])
+    provider = LLMGatewayLLMProvider(
+        model="claude-opus-4-8",
+        base_url="https://gateway.local",
+        synthesis_timeout_seconds=360.0,
+        max_retries=2,
+        client=client,
+    )
+    cost = CostTracker(provider=provider.name, model=provider.model)
+
+    with pytest.raises(RuntimeError, match="returned no text content") as captured:
+        with provider._capture_attempt_usage(cost, "synthesis"):
+            asyncio.run(
+                provider._chat_json_result(
+                    stage="synthesis",
+                    messages=[{"role": "user", "content": "Return report JSON."}],
+                    max_tokens=10_000,
+                )
+            )
+
+    assert len(client.calls) == 1
+    assert cost.summary().total_tokens == 25_881
+    assert captured.value.failure_class == "no_text_content"
+    assert captured.value.actual_model == "claude-opus-4-8-20260701"
+    ledger = captured.value.attempt_ledger[0]
+    assert ledger["failure_class"] == "no_text_content"
+    assert ledger["requested_model"] == "claude-opus-4-8"
+    assert ledger["actual_model"] == "claude-opus-4-8-20260701"
+    assert ledger["usage"] == {"input_tokens": 15881, "output_tokens": 10000}
+    assert ledger["stop_reason"] == "max_tokens"
+    assert ledger["content_block_types"] == ["thinking"]
+    assert ledger["response_bytes"] == 654321
+    assert ledger["raw_response_sha256"] == "a" * 64
+    assert "thinking" not in ledger["error"]
+
+
+def test_deterministic_gateway_4xx_is_not_retried() -> None:
+    client = _SequenceGatewayClient([RuntimeError("LLM Gateway HTTP 403")])
+    provider = LLMGatewayLLMProvider(
+        model="claude-4.6-opus",
+        base_url="https://gateway.local",
+        max_retries=2,
+        client=client,
+    )
+
+    with pytest.raises(RuntimeError, match="HTTP 403") as captured:
+        asyncio.run(
+            provider._chat_json_result(
+                stage="synthesis",
+                messages=[{"role": "user", "content": "Return report JSON."}],
+                max_tokens=10_000,
+            )
+        )
+
+    assert len(client.calls) == 1
+    assert captured.value.failure_class == "http_4xx"
+
+
 def test_orchestrator_attaches_failed_gateway_usage_to_exception(monkeypatch) -> None:
     monkeypatch.setattr(llm_module.time, "sleep", lambda _seconds: None)
     provider = LLMGatewayLLMProvider(
@@ -607,6 +1749,7 @@ def test_gateway_settings_and_orchestrator_routing(monkeypatch) -> None:
     monkeypatch.setenv("LLM_GATEWAY_MODEL", "claude-opus-4-8")
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gateway.example")
     monkeypatch.setenv("LLM_GATEWAY_TIMEOUT_SECONDS", "45")
+    monkeypatch.setenv("LLM_SYNTHESIS_TIMEOUT_SECONDS", "390")
     monkeypatch.setenv("LLM_GATEWAY_THINKING_BUDGET_TOKENS", "2048")
     settings = load_settings()
     orchestrator = DeepResearchOrchestrator(
@@ -615,6 +1758,9 @@ def test_gateway_settings_and_orchestrator_routing(monkeypatch) -> None:
             llm_gateway_model=settings.llm_gateway_model,
             llm_gateway_base_url=settings.llm_gateway_base_url,
             llm_gateway_timeout_seconds=settings.llm_gateway_timeout_seconds,
+            llm_synthesis_timeout_seconds=(
+                settings.llm_synthesis_timeout_seconds
+            ),
             llm_gateway_thinking_budget_tokens=(
                 settings.llm_gateway_thinking_budget_tokens
             ),
@@ -630,6 +1776,7 @@ def test_gateway_settings_and_orchestrator_routing(monkeypatch) -> None:
     assert provider.model == "claude-opus-4-8"
     assert provider.base_url == "https://gateway.example"
     assert provider.timeout_seconds == 45.0
+    assert provider.synthesis_timeout_seconds == 390.0
     assert provider.client.thinking_budget_tokens == 2048
 
 
@@ -739,19 +1886,29 @@ def test_unknown_llm_provider_fails_closed() -> None:
 
 
 class _SequenceGatewayClient:
-    def __init__(self, responses: list[GatewayMessageResult]) -> None:
+    def __init__(
+        self,
+        responses: list[GatewayMessageResult | Exception],
+        *,
+        require_response_model_match: bool = False,
+    ) -> None:
         self.responses = list(responses)
         self.calls: list[dict] = []
+        self.require_response_model_match = require_response_model_match
 
-    def create_message(self, *, model, messages, max_tokens):
+    def create_message(self, *, model, messages, max_tokens, timeout_seconds=None):
         self.calls.append(
             {
                 "model": model,
                 "messages": [dict(message) for message in messages],
                 "max_tokens": max_tokens,
+                "timeout_seconds": timeout_seconds,
             }
         )
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 # ---------------------------------------------------------------------------

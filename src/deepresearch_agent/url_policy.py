@@ -14,6 +14,7 @@ import gzip
 import io
 import re
 import socket
+import time
 from collections.abc import Callable, Iterable
 from typing import Any
 from urllib.error import HTTPError
@@ -194,6 +195,59 @@ def validate_url(
     return url
 
 
+def canonical_url_identity(url: str) -> tuple[str, str, int | None, str]:
+    """Return the comparison identity for a public-source URL.
+
+    Query strings and fragments are deliberately excluded because benchmark
+    answer pages commonly add tracking parameters or anchors. Host case,
+    trailing root dots, IDNA and default ports are normalized without doing a
+    DNS lookup; path case remains significant.
+    """
+
+    if not isinstance(url, str) or not url:
+        raise URLPolicyError("URL must be a non-empty string")
+    try:
+        parsed = urlsplit(url)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise URLPolicyError(f"invalid URL: {exc}") from exc
+    if scheme not in _ALLOWED_SCHEMES or not parsed.netloc or not hostname:
+        raise URLPolicyError("blocked source URL must be an absolute HTTP(S) URL")
+    if "@" in parsed.netloc or parsed.username is not None or parsed.password is not None:
+        raise URLPolicyError("URL userinfo is not allowed")
+    normalized_host = _normalize_hostname(hostname)
+    if port == (443 if scheme == "https" else 80):
+        port = None
+    return scheme, normalized_host, port, parsed.path or "/"
+
+
+def url_identity_matches_blocked(
+    candidate: tuple[str, str, int | None, str],
+    blocked: tuple[str, str, int | None, str],
+) -> bool:
+    """Match an exact blocked URL or an HTML report's descendant chapter.
+
+    Some publishers expose one report as ``report.html`` while search results
+    point at chapters below ``report/...``.  Treat that narrow path family as
+    the same blocked source without denying unrelated pages on the host.
+    """
+
+    if candidate == blocked:
+        return True
+    candidate_origin = candidate[:3]
+    blocked_origin = blocked[:3]
+    if candidate_origin != blocked_origin:
+        return False
+    candidate_path = candidate[3]
+    blocked_path = blocked[3]
+    if not blocked_path.lower().endswith(".html"):
+        return False
+    report_root = blocked_path[:-5].rstrip("/")
+    return bool(report_root) and candidate_path.startswith(f"{report_root}/")
+
+
 def fetch_text_url(
     url: str,
     *,
@@ -203,6 +257,8 @@ def fetch_text_url(
     max_redirects: int = DEFAULT_MAX_REDIRECTS,
     resolver: Callable[..., Iterable[tuple[Any, ...]]] | None = None,
     opener: Callable[..., Any] | None = None,
+    url_guard: Callable[[str], None] | None = None,
+    deadline_at: float | None = None,
 ) -> str:
     """Fetch a textual HTTP(S) response with SSRF and resource protections."""
 
@@ -210,6 +266,14 @@ def fetch_text_url(
         raise ValueError("max_response_bytes must be positive")
     if max_redirects < 0:
         raise ValueError("max_redirects must be non-negative")
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
+
+    # ``timeout`` is a total fetch budget, not a fresh allowance for every
+    # redirect hop.  An upstream absolute deadline can narrow it further.
+    fetch_deadline = time.monotonic() + timeout
+    if deadline_at is not None:
+        fetch_deadline = min(fetch_deadline, deadline_at)
 
     request_headers = {
         "Accept": "text/*, application/json, application/*+json, application/xml, "
@@ -225,8 +289,16 @@ def fetch_text_url(
 
     while True:
         validate_url(current_url, resolver=resolver)
+        if url_guard is not None:
+            # Run after SSRF validation but before the transport opens this
+            # hop. This preserves the URL policy's fail-closed semantics while
+            # still allowing benchmark denylist enforcement at every hop.
+            url_guard(current_url)
+        remaining = fetch_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("HTTP fetch deadline exceeded")
         request = Request(current_url, headers=current_headers, method="GET")
-        response = _open_once(open_request, request, timeout)
+        response = _open_once(open_request, request, remaining)
         try:
             status = _response_status(response)
             if 300 <= status < 400:
@@ -236,9 +308,6 @@ def fetch_text_url(
                 if redirect_count >= max_redirects:
                     raise SafeHTTPError(f"redirect limit exceeded ({max_redirects})")
                 next_url = urljoin(current_url, location)
-                # Validate before opening the next hop.  This is what prevents a
-                # public endpoint from redirecting the crawler into a private net.
-                validate_url(next_url, resolver=resolver)
                 current_headers = _redirect_headers(
                     current_headers,
                     from_url=current_url,
@@ -247,6 +316,8 @@ def fetch_text_url(
                 current_url = next_url
                 redirect_chain.append(next_url)
                 redirect_count += 1
+                # The next loop iteration validates and guards this resolved
+                # Location before constructing or opening its request.
                 continue
             if not 200 <= status < 300:
                 raise SafeHTTPError(f"HTTP request failed with status {status}")

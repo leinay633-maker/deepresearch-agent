@@ -1,0 +1,68 @@
+{
+  "license": "CC BY 4.0",
+  "name": "drb2_public12_v1",
+  "rubric_counts": {
+    "analysis": 169,
+    "info_recall": 560,
+    "presentation": 78,
+    "total": 807
+  },
+  "rubrics_sha256": "fb473554d8b0a5793e8936d9f025ff8e6537ed2f9caacebde42ef071fea9c105",
+  "schema_version": "1.0",
+  "selection_algorithm": "fixed curated source indices, ordered exactly as recorded; selected to provide 6 English and 6 Chinese tasks across 6 themes with 2 tasks per theme; no random sampling",
+  "selection_count": 12,
+  "selection_distribution": {
+    "language": {
+      "en": 6,
+      "zh": 6
+    },
+    "theme": {
+      "Education & Jobs": 2,
+      "Finance & Business": 2,
+      "Health": 2,
+      "History": 2,
+      "Science & Technology": 2,
+      "Software Development": 2
+    }
+  },
+  "source_indices": [
+    4,
+    9,
+    23,
+    30,
+    43,
+    48,
+    54,
+    57,
+    63,
+    66,
+    82,
+    83
+  ],
+  "source_sha256": "263aaabb8c279fb16cbe7c9499afe82d657a8ab3ccfb07ace084387e367d921a",
+  "source_url": "https://raw.githubusercontent.com/imlrz/DeepResearch-Bench-II/11d87de486ba7a9e10190be0afd66a9a0fc5d5da/tasks_and_rubrics.jsonl",
+  "task_ids": [
+    "task2+",
+    "task4+",
+    "task10+",
+    "task13",
+    "task67",
+    "task69",
+    "task71",
+    "task72+",
+    "task25",
+    "task76",
+    "task32",
+    "task81+"
+  ],
+  "tasks_sha256": "df8f6001ee5a3db99fc7bc433d8714f687bd55d678d153d59ad8529e020512ef",
+  "upstream_commit": "11d87de486ba7a9e10190be0afd66a9a0fc5d5da",
+  "upstream_repository": "https://github.com/imlrz/DeepResearch-Bench-II",
+  "upstream_row_count": 132,
+  "upstream_rubric_counts": {
+    "analysis": 1686,
+    "info_recall": 6983,
+    "presentation": 746,
+    "total": 9415
+  }
+}

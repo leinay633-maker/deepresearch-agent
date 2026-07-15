@@ -23,6 +23,7 @@ from deepresearch_agent.schemas import ResearchRequest, Source, SubQuestion
 from deepresearch_agent.search import (
     BingRssSearchAdapter,
     SearchError,
+    SearchService,
     build_search_adapter,
     build_search_service,
 )
@@ -612,6 +613,148 @@ def test_gateway_web_search_drops_uncrawled_candidates_from_evidence(
         "error_classes": {"crawler_error": 1},
     }
     assert all(source.content != "Result 1" for source in outcome.sources)
+
+
+def test_crawl_batch_keeps_fast_clean_sources_and_timeboxes_slow_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Primary:
+        name = "gateway-web"
+
+        async def search(
+            self, query: str, max_results: int, timeout: float
+        ) -> list[Source]:
+            del max_results, timeout
+            return [
+                Source(
+                    title=f"Candidate {index}",
+                    url=f"https://example.com/{index}",
+                    content="snippet",
+                    provider=self.name,
+                    query=query,
+                    metadata={
+                        "snippet_only": True,
+                        "extract_status": "snippet",
+                        "provider_request_attempts": 1,
+                    },
+                )
+                for index in range(8)
+            ]
+
+    class Fallback:
+        name = "bing"
+
+        async def search(
+            self, query: str, max_results: int, timeout: float
+        ) -> list[Source]:
+            del query, max_results, timeout
+            raise AssertionError("partial primary evidence must avoid fallback")
+
+    class TimedCrawler:
+        name = "timed"
+
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+            self.never = asyncio.Event()
+
+        async def crawl(self, url: str, timeout: float) -> str:
+            del timeout
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                if url.endswith(("/0", "/1")):
+                    await asyncio.sleep(0)
+                    return f"Verified evidence from {url}"
+                await self.never.wait()
+                raise AssertionError("slow crawl unexpectedly released")
+            finally:
+                self.active -= 1
+
+    monkeypatch.setattr("deepresearch_agent.search.validate_url", lambda url: url)
+    crawler = TimedCrawler()
+    settings = Settings(
+        request_timeout_seconds=1.0,
+        crawler_concurrency_per_search=2,
+    )
+    service = SearchService(
+        Primary(),
+        Fallback(),
+        settings,
+        crawler=crawler,
+        fallback_policy="fail",
+    )
+
+    outcome = asyncio.run(
+        service.search(
+            "bounded crawl",
+            max_results=8,
+            deadline_at=time.monotonic() + 0.05,
+        )
+    )
+
+    assert [source.url for source in outcome.sources] == [
+        "https://example.com/0",
+        "https://example.com/1",
+    ]
+    assert outcome.degraded is True
+    assert outcome.retrieval_audit["candidate_count"] == 8
+    assert outcome.retrieval_audit["verified_count"] == 2
+    assert outcome.retrieval_audit["error_classes"] == {"batch_timeout": 6}
+    assert crawler.max_active <= 2
+
+
+def test_real_fallback_receives_only_the_remaining_search_budget() -> None:
+    class SlowFailingPrimary:
+        name = "primary"
+
+        async def search(
+            self, query: str, max_results: int, timeout: float
+        ) -> list[Source]:
+            del query, max_results, timeout
+            await asyncio.sleep(0.03)
+            raise SearchError("primary failed")
+
+    class RecordingFallback:
+        name = "bing"
+
+        def __init__(self) -> None:
+            self.timeout: float | None = None
+
+        async def search(
+            self, query: str, max_results: int, timeout: float
+        ) -> list[Source]:
+            del max_results
+            self.timeout = timeout
+            return [
+                Source(
+                    title="Fallback evidence",
+                    url="https://example.com/fallback",
+                    content="Fallback evidence body",
+                    provider=self.name,
+                    query=query,
+                )
+            ]
+
+    fallback = RecordingFallback()
+    service = SearchService(
+        SlowFailingPrimary(),
+        fallback,
+        Settings(request_timeout_seconds=1.0, max_retries=0),
+        fallback_policy="fail",
+    )
+
+    outcome = asyncio.run(
+        service.search(
+            "remaining budget",
+            max_results=1,
+            deadline_at=time.monotonic() + 0.1,
+        )
+    )
+
+    assert outcome.fallback_used is True
+    assert fallback.timeout is not None
+    assert 0 < fallback.timeout < 0.08
 
 
 def test_orchestrator_records_gateway_usage_once_after_crawl_and_multiple_sources(

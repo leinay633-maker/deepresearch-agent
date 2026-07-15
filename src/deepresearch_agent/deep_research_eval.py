@@ -74,6 +74,15 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
         load_settings(),
         getattr(args, "request_timeout_seconds", None),
     )
+    synthesis_timeout_seconds = getattr(args, "synthesis_timeout_seconds", None)
+    if synthesis_timeout_seconds is not None:
+        synthesis_timeout_seconds = float(synthesis_timeout_seconds)
+        if synthesis_timeout_seconds <= 0:
+            raise ValueError("synthesis timeout must be positive")
+        settings = replace(
+            settings,
+            llm_synthesis_timeout_seconds=synthesis_timeout_seconds,
+        )
     _validate_single_model_run_args(args, settings=settings)
     root = Path(__file__).resolve().parents[2]
     results_dir = root / "results"
@@ -214,6 +223,9 @@ async def run_public_deep_research_eval(args: argparse.Namespace) -> dict[str, A
             effective_settings.llm_gateway_timeout_seconds
         ),
         "llm_gateway_timeout_seconds": effective_settings.llm_gateway_timeout_seconds,
+        "llm_synthesis_timeout_seconds": (
+            effective_settings.llm_synthesis_timeout_seconds
+        ),
         "citation_judge_timeout_seconds": (
             effective_settings.citation_judge_timeout_seconds
         ),
@@ -578,7 +590,9 @@ async def _run_case(
         deadline_seconds=getattr(args, "deadline_seconds", None),
         min_evidence_items=getattr(args, "min_evidence_items", 1),
         fallback_policy=getattr(args, "fallback_policy", "fail"),
+        report_depth=(case.get("metadata") or {}).get("report_depth") or "concise",
         expected_format=(case.get("metadata") or {}).get("expected_format") or "markdown",
+        blocked_source_urls=(case.get("metadata") or {}).get("blocked_source_urls") or [],
     )
     try:
         report = await DeepResearchOrchestrator(settings=settings).run(request)
@@ -672,6 +686,13 @@ def _normalize_case(row: dict[str, Any], index: int, benchmark_name: str) -> dic
             "category",
         }
     }
+    report_depth = metadata.get("report_depth") or "concise"
+    expected_format = metadata.get("expected_format") or "markdown"
+    if report_depth == "deep" and expected_format != "markdown":
+        raise ValueError(
+            f"eval row {index} report_depth='deep' requires "
+            "expected_format='markdown'"
+        )
     return {
         "id": case_id,
         "query": str(query),
@@ -1188,8 +1209,17 @@ def main() -> None:
         type=float,
         default=8.0,
         help=(
-            "Common timeout for search/crawling, Gateway web search and LLM calls, "
-            "citation judging, answer judging, and remote dataset loading."
+            "Common timeout for search/crawling, Gateway web search, non-synthesis "
+            "LLM calls, citation judging, answer judging, and remote dataset loading."
+        ),
+    )
+    parser.add_argument(
+        "--synthesis-timeout-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Socket timeout for long synthesis calls; defaults to "
+            "LLM_SYNTHESIS_TIMEOUT_SECONDS (360 seconds)."
         ),
     )
     parser.add_argument("--reflection-enabled", action="store_true")

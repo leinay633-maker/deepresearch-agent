@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass
+from datetime import datetime
 from ipaddress import ip_address
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -23,6 +26,56 @@ class GatewayMessageResult:
     model: str
     usage: dict[str, int]
     stop_reason: str | None = None
+
+
+class LLMGatewayModelMismatchError(RuntimeError):
+    """Strict-routing failure that retains the auditable Gateway model identity."""
+
+    def __init__(
+        self,
+        *,
+        requested_model: str,
+        actual_model: str | None,
+        usage: dict[str, int] | None = None,
+    ) -> None:
+        self.requested_model = requested_model
+        self.actual_model = normalize_gateway_model_identifier(
+            actual_model,
+            requested_model=requested_model,
+        )
+        self.usage = dict(usage or {})
+        super().__init__("LLM Gateway response model did not match the requested model")
+
+
+class LLMGatewayNoTextContentError(RuntimeError):
+    """A response completed without a usable text block.
+
+    Only aggregate-safe metadata is retained. In particular, the raw response and
+    any thinking block body are intentionally absent from the exception.
+    """
+
+    def __init__(
+        self,
+        *,
+        requested_model: str,
+        actual_model: str | None,
+        stop_reason: str | None,
+        content_block_types: tuple[str, ...],
+        usage: dict[str, int],
+        response_bytes: int,
+        raw_response_sha256: str,
+    ) -> None:
+        self.requested_model = requested_model
+        self.actual_model = normalize_gateway_model_identifier(
+            actual_model,
+            requested_model=requested_model,
+        )
+        self.stop_reason = _safe_stop_reason(stop_reason)
+        self.content_block_types = content_block_types
+        self.usage = dict(usage)
+        self.response_bytes = max(int(response_bytes), 0)
+        self.raw_response_sha256 = raw_response_sha256
+        super().__init__("LLM Gateway returned no text content")
 
 
 class _RejectRedirectHandler(HTTPRedirectHandler):
@@ -66,9 +119,17 @@ class LLMGatewayClient:
         model: str,
         messages: list[dict[str, str]],
         max_tokens: int,
+        timeout_seconds: float | None = None,
     ) -> GatewayMessageResult:
         if max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
+        request_timeout_seconds = (
+            self.timeout_seconds
+            if timeout_seconds is None
+            else float(timeout_seconds)
+        )
+        if request_timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
         api_key = os.environ.get(LLM_GATEWAY_API_KEY_ENV)
         if not api_key:
             raise RuntimeError(
@@ -104,8 +165,12 @@ class LLMGatewayClient:
             },
         )
         try:
-            with no_redirect_urlopen(request, timeout=self.timeout_seconds) as response:
-                payload = json.loads(_read_response_bounded(response).decode("utf-8"))
+            with no_redirect_urlopen(
+                request,
+                timeout=request_timeout_seconds,
+            ) as response:
+                raw_response = _read_response_bounded(response)
+                payload = json.loads(raw_response.decode("utf-8"))
         except HTTPError as exc:
             # Do not include the response body: upstream proxies sometimes
             # echo request metadata and credentials in diagnostic payloads.
@@ -122,12 +187,37 @@ class LLMGatewayClient:
             not isinstance(raw_response_model, str)
             or not response_model_matches(model, raw_response_model)
         ):
-            raise RuntimeError("LLM Gateway response model did not match the requested model")
+            mismatch_error = LLMGatewayModelMismatchError(
+                requested_model=model,
+                actual_model=raw_response_model,
+                usage=_normalize_usage(payload.get("usage")),
+            )
+            # As with no-text failures, do not retain a response body (which may
+            # include thinking) in the raised exception's create_message frame.
+            del payload
+            del raw_response
+            raise mismatch_error
+        content = _extract_text_content(payload)
+        if not content:
+            no_text_error = LLMGatewayNoTextContentError(
+                requested_model=model,
+                actual_model=_actual_response_model(payload, requested_model=model),
+                stop_reason=_safe_stop_reason(payload.get("stop_reason")),
+                content_block_types=_content_block_types(payload),
+                usage=_normalize_usage(payload.get("usage")),
+                response_bytes=len(raw_response),
+                raw_response_sha256=hashlib.sha256(raw_response).hexdigest(),
+            )
+            # Do not retain the response (including thinking bodies) in the
+            # exception traceback's create_message frame.
+            del payload
+            del raw_response
+            raise no_text_error
         return GatewayMessageResult(
-            content=_extract_text_content(payload),
+            content=content,
             model=_response_model(payload, requested_model=model),
             usage=_normalize_usage(payload.get("usage")),
-            stop_reason=_optional_string(payload.get("stop_reason")),
+            stop_reason=_safe_stop_reason(payload.get("stop_reason")),
         )
 
 
@@ -243,7 +333,7 @@ def _requires_thinking(model: str) -> bool:
 def _extract_text_content(payload: dict[str, Any]) -> str:
     blocks = payload.get("content")
     if not isinstance(blocks, list):
-        raise ValueError("LLM Gateway response missing content blocks")
+        return ""
     text_parts = [
         str(block.get("text"))
         for block in blocks
@@ -252,10 +342,38 @@ def _extract_text_content(payload: dict[str, Any]) -> str:
         and isinstance(block.get("text"), str)
         and block.get("text", "").strip()
     ]
-    content = "\n".join(text_parts).strip()
-    if not content:
-        raise ValueError("LLM Gateway returned no text content")
-    return content
+    return "\n".join(text_parts).strip()
+
+
+def _content_block_types(payload: dict[str, Any]) -> tuple[str, ...]:
+    """Return bounded, ordered type names without retaining block bodies."""
+
+    blocks = payload.get("content")
+    if not isinstance(blocks, list):
+        return ()
+    known_types = {
+        "redacted_thinking",
+        "server_tool_use",
+        "text",
+        "thinking",
+        "tool_result",
+        "tool_use",
+        "web_search_tool_result",
+    }
+    normalized: list[str] = []
+    for block in blocks[:32]:
+        if not isinstance(block, dict):
+            normalized.append("invalid")
+            continue
+        block_type = block.get("type")
+        if not isinstance(block_type, str) or not block_type.strip():
+            normalized.append("missing")
+            continue
+        candidate = block_type.strip().lower()
+        normalized.append(candidate if candidate in known_types else "unknown")
+    if len(blocks) > 32:
+        normalized.append("truncated")
+    return tuple(normalized)
 
 
 def _normalize_usage(raw_usage: Any) -> dict[str, int]:
@@ -281,21 +399,85 @@ def _non_negative_int(value: Any) -> int:
 
 
 def _response_model(payload: dict[str, Any], *, requested_model: str) -> str:
-    model = payload.get("model")
-    if isinstance(model, str) and model.strip():
-        return model.strip()
-    return requested_model
-
-
-def response_model_matches(requested_model: str, response_model: str) -> bool:
-    """Allow a dated Gateway alias, but never a different model family."""
-
-    requested = requested_model.strip().lower()
-    response = response_model.strip().lower()
-    return bool(requested) and (
-        response == requested or response.startswith(f"{requested}-")
+    return (
+        normalize_gateway_model_identifier(
+            payload.get("model"),
+            requested_model=requested_model,
+        )
+        or requested_model
     )
 
 
-def _optional_string(value: Any) -> str | None:
-    return value if isinstance(value, str) and value else None
+def _actual_response_model(
+    payload: dict[str, Any],
+    *,
+    requested_model: str,
+) -> str | None:
+    return normalize_gateway_model_identifier(
+        payload.get("model"),
+        requested_model=requested_model,
+    )
+
+
+def response_model_matches(requested_model: str, response_model: str) -> bool:
+    """Allow exact models and the observed valid YYYYMM/YYYYMMDD aliases."""
+
+    requested = requested_model.strip().lower()
+    response = response_model.strip().lower()
+    if not requested:
+        return False
+    if response == requested:
+        return True
+    prefix = f"{requested}-"
+    if not response.startswith(prefix):
+        return False
+    suffix = response[len(prefix) :]
+    date_format = {6: "%Y%m", 8: "%Y%m%d"}.get(len(suffix))
+    if date_format is None or not suffix.isdigit():
+        return False
+    try:
+        datetime.strptime(suffix, date_format)
+    except ValueError:
+        return False
+    return True
+
+
+def normalize_gateway_model_identifier(
+    value: Any,
+    *,
+    requested_model: str | None = None,
+) -> str | None:
+    """Keep only bounded protocol-like model identifiers in audit metadata."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = value.strip()
+    if len(candidate) > 200 or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:/-]*",
+        candidate,
+    ):
+        return "unknown"
+    if (
+        requested_model
+        and candidate.lower().startswith(f"{requested_model.strip().lower()}-")
+        and not response_model_matches(requested_model, candidate)
+    ):
+        return "unknown"
+    return candidate
+
+
+def _safe_stop_reason(value: Any) -> str | None:
+    """Normalize only aggregate protocol enums; never retain provider prose."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = value.strip().lower().replace("-", "_")
+    allowed = {
+        "end_turn",
+        "max_tokens",
+        "pause_turn",
+        "refusal",
+        "stop_sequence",
+        "tool_use",
+    }
+    return candidate if candidate in allowed else "unknown"

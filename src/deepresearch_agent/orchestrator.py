@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from collections import Counter
@@ -51,10 +52,146 @@ from deepresearch_agent.search import (
     build_search_service,
     enrich_source_metadata,
 )
+from deepresearch_agent.text_utils import tokenize
 from deepresearch_agent.tracing import TraceLogger, build_trace_exporter
 from deepresearch_agent.verifier import SourceVerifier
 
 Emit = Callable[[dict[str, Any]], Awaitable[None]]
+
+_COVERAGE_TERM_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "by",
+    "for",
+    "from",
+    "in",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "with",
+}
+
+
+def _coverage_term_tokens(value: str) -> tuple[str, ...]:
+    return tuple(
+        token
+        for token in tokenize(value)
+        if token not in _COVERAGE_TERM_STOPWORDS
+    )
+
+
+def _text_covers_term(text: str, term: str, *, minimum_occurrences: int = 1) -> bool:
+    term_tokens = _coverage_term_tokens(term)
+    if not term_tokens:
+        return False
+    lowered = text.lower()
+    counts = Counter(
+        re.findall(r"[a-z0-9]+(?:[-_.][a-z0-9]+)*|[\u3400-\u9fff]", lowered)
+    )
+    # ``tokenize`` also exposes CJK bigrams for lightweight semantic matching;
+    # count those directly because the lexical occurrence stream above is
+    # intentionally character-based for Chinese text.
+    for token in term_tokens:
+        if any("\u3400" <= char <= "\u9fff" for char in token) and len(token) > 1:
+            counts[token] = lowered.count(token)
+    return min((counts[token] for token in set(term_tokens)), default=0) >= minimum_occurrences
+
+
+def _source_covers_entity(
+    source: Source,
+    entity: str,
+    *,
+    evidence_quotes: list[str] | None = None,
+    require_substantive_content: bool,
+) -> bool:
+    if _text_covers_term(source.title, entity):
+        return True
+    if any(_text_covers_term(quote, entity) for quote in (evidence_quotes or [])):
+        return True
+    return _text_covers_term(
+        source.content,
+        entity,
+        minimum_occurrences=2 if require_substantive_content else 1,
+    )
+
+
+def _coverage_status(
+    subquestion: SubQuestion,
+    sources: list[Source],
+    evidence: list[EvidenceItem],
+) -> dict[str, Any]:
+    required_entities = list(dict.fromkeys(subquestion.required_entities))
+    required_aspects = list(dict.fromkeys(subquestion.required_aspects))
+    quotes_by_url: dict[str, list[str]] = {}
+    for item in evidence:
+        quotes_by_url.setdefault(item.source_url, []).append(item.quote)
+
+    covered_entities = [
+        entity
+        for entity in required_entities
+        if any(
+            _source_covers_entity(
+                source,
+                entity,
+                evidence_quotes=quotes_by_url.get(source.url, []),
+                require_substantive_content=True,
+            )
+            for source in sources
+        )
+    ]
+    covered_aspects = [
+        aspect
+        for aspect in required_aspects
+        if any(
+            _text_covers_term(
+                " ".join(
+                    [
+                        source.title,
+                        source.content,
+                        *quotes_by_url.get(source.url, []),
+                    ]
+                ),
+                aspect,
+            )
+            for source in sources
+        )
+    ]
+    missing_entities = [
+        entity for entity in required_entities if entity not in covered_entities
+    ]
+    missing_aspects = [
+        aspect for aspect in required_aspects if aspect not in covered_aspects
+    ]
+    return {
+        "required_entities": required_entities,
+        "covered_entities": covered_entities,
+        "missing_entities": missing_entities,
+        "required_aspects": required_aspects,
+        "covered_aspects": covered_aspects,
+        "missing_aspects": missing_aspects,
+        "complete": not missing_entities and not missing_aspects,
+    }
+
+
+def _coverage_gap(status: dict[str, Any]) -> str | None:
+    parts = []
+    if status["missing_entities"]:
+        parts.append(f"entities={', '.join(status['missing_entities'])}")
+    if status["missing_aspects"]:
+        parts.append(f"aspects={', '.join(status['missing_aspects'])}")
+    if not parts:
+        return None
+    return "missing required coverage: " + "; ".join(parts)
+
+
+def _coverage_follow_up_query(status: dict[str, Any]) -> str:
+    targets = [*status["missing_entities"], *status["missing_aspects"]]
+    return " ".join([*targets, "official primary source"]).strip()
 
 class DeepResearchOrchestrator:
     def __init__(
@@ -199,6 +336,13 @@ class DeepResearchOrchestrator:
                     "synthesis fallback is disallowed by fallback_policy=fail"
                 )
         except Exception as exc:
+            if synthesis_context is None:
+                raw_synthesis_context = getattr(llm, "last_synthesis_context", None)
+                synthesis_context = (
+                    raw_synthesis_context
+                    if isinstance(raw_synthesis_context, dict)
+                    else None
+                )
             await self._record(
                 trace,
                 "synthesizer",
@@ -212,6 +356,7 @@ class DeepResearchOrchestrator:
                         and synthesis_context.get("synthesis_fallback")
                         else None
                     ),
+                    "context": synthesis_context,
                 },
                 stage_start,
                 emit,
@@ -404,6 +549,9 @@ class DeepResearchOrchestrator:
                 model=request.llm_model or self.settings.llm_gateway_model,
                 base_url=self.settings.llm_gateway_base_url,
                 timeout_seconds=self.settings.llm_gateway_timeout_seconds,
+                synthesis_timeout_seconds=(
+                    self.settings.llm_synthesis_timeout_seconds
+                ),
                 max_retries=self.settings.max_retries,
                 stage_models=stage_models,
                 thinking_budget_tokens=(
@@ -458,6 +606,11 @@ class DeepResearchOrchestrator:
             stage_start = trace.now()
             budget = request.research_budget()
             started_at = time.perf_counter()
+            deadline_at = (
+                time.monotonic() + budget.deadline_seconds
+                if budget.deadline_seconds is not None
+                else None
+            )
             query = safe_follow_up_query(
                 subquestion.search_query or subquestion.question,
                 original_question=subquestion.question,
@@ -478,6 +631,7 @@ class DeepResearchOrchestrator:
             retrieval_rounds: list[dict[str, Any]] = []
             provider = search_service.primary.name
             termination_reason = "max_rounds"
+            coverage_status = _coverage_status(subquestion, verified, evidence)
 
             def record_gateway_web_search_usage(
                 usage: GatewayWebSearchUsage,
@@ -495,11 +649,9 @@ class DeepResearchOrchestrator:
                 )
 
             async def await_with_deadline(awaitable):
-                if budget.deadline_seconds is None:
+                if deadline_at is None:
                     return await awaitable
-                remaining_seconds = budget.deadline_seconds - (
-                    time.perf_counter() - started_at
-                )
+                remaining_seconds = deadline_at - time.monotonic()
                 if remaining_seconds <= 0:
                     if hasattr(awaitable, "close"):
                         awaitable.close()
@@ -519,17 +671,58 @@ class DeepResearchOrchestrator:
                 # implementation details, not extra research-loop actions.
                 tool_calls += 1
                 try:
+                    search_kwargs: dict[str, Any] = {}
+                    if request.blocked_source_urls:
+                        search_kwargs["blocked_source_urls"] = (
+                            request.blocked_source_urls
+                        )
+                    if deadline_at is not None:
+                        remaining_global = max(deadline_at - time.monotonic(), 0.0)
+                        rounds_left = budget.max_rounds - round_index + 1
+                        # Keep every configured round reachable and reserve 20%
+                        # of this round's slice for local retrieval and the
+                        # evidence-decision LLM call.
+                        round_slice = remaining_global / max(rounds_left, 1)
+                        search_kwargs["deadline_at"] = min(
+                            deadline_at,
+                            time.monotonic() + (round_slice * 0.8),
+                        )
                     search_call = search_service.search(
                         query,
-                        max_results=request.max_results_per_researcher,
+                        max_results=request.search_results_per_researcher(),
+                        **search_kwargs,
                     )
                     with capture_gateway_web_search_usage(
                         record_gateway_web_search_usage
                     ):
                         outcome = await await_with_deadline(search_call)
-                except TimeoutError:
+                except TimeoutError as exc:
                     termination_reason = "deadline"
                     errors.append("research deadline exceeded")
+                    provider_tool_attempts += int(
+                        getattr(exc, "tool_attempts", 0) or 0
+                    )
+                    timeout_hints = list(
+                        getattr(exc, "failed_candidate_hints", []) or []
+                    )
+                    failed_candidate_hints = self._merge_audit_hints(
+                        failed_candidate_hints,
+                        timeout_hints,
+                    )
+                    timeout_audit = dict(
+                        getattr(exc, "retrieval_audit", {}) or {}
+                    )
+                    if timeout_audit:
+                        retrieval_rounds.append(
+                            self._retrieval_round_audit(
+                                claim=subquestion.question,
+                                query=query,
+                                round_index=round_index,
+                                audit=timeout_audit,
+                                sources=[],
+                                failed_candidate_hints=timeout_hints,
+                            )
+                        )
                     break
                 except Exception as exc:
                     failure_hints = list(
@@ -612,9 +805,10 @@ class DeepResearchOrchestrator:
                     if not source.metadata.get("snippet_only")
                     and source.metadata.get("extract_status")
                     not in {"snippet", "crawl_failed", "empty"}
-                    if source_is_relevant_to_claim(subquestion.question, source)
+                    if self._source_is_relevant_for_subquestion(subquestion, source)
                 ]
-                evidence = self._evidence_items(subquestion.question, verified)
+                evidence = self._evidence_items(subquestion, verified)
+                coverage_status = _coverage_status(subquestion, verified, evidence)
                 if (
                     budget.deadline_seconds is not None
                     and time.perf_counter() - started_at >= budget.deadline_seconds
@@ -653,6 +847,24 @@ class DeepResearchOrchestrator:
                             or f"{subquestion.question} {gap}",
                         }
                     )
+                coverage_gap = _coverage_gap(coverage_status)
+                if coverage_gap:
+                    focused_query = _coverage_follow_up_query(coverage_status)
+                    decision = decision.model_copy(
+                        update={
+                            "action": (
+                                "conflict_found"
+                                if decision.action == "conflict_found"
+                                else "need_follow_up"
+                            ),
+                            "reason": (
+                                "Python coverage contract rejected an early stop because "
+                                "verified evidence does not cover every required target"
+                            ),
+                            "evidence_gap": coverage_gap,
+                            "follow_up_query": focused_query,
+                        }
+                    )
                 if cancel_check is not None:
                     cancel_check()
                 if decision.evidence_gap:
@@ -687,13 +899,17 @@ class DeepResearchOrchestrator:
 
             budget_exhausted = (
                 termination_reason in {"deadline", "max_rounds", "max_tool_calls"}
-                and len(evidence) < budget.min_evidence_items
+                and (
+                    len(evidence) < budget.min_evidence_items
+                    or not coverage_status["complete"]
+                )
             )
             if budget_exhausted:
                 degraded = True
                 gaps.append(
                     f"research budget ended with {len(evidence)} of "
-                    f"{budget.min_evidence_items} required evidence items"
+                    f"{budget.min_evidence_items} required evidence items; "
+                    f"coverage_complete={coverage_status['complete']}"
                 )
             research_result = ResearchResult(
                 rounds=rounds,
@@ -714,6 +930,9 @@ class DeepResearchOrchestrator:
                 research=research_result,
             )
             status = "fallback" if fallback_used or degraded else "success"
+            aggregate_retrieval_audit = self._aggregate_retrieval_rounds(
+                retrieval_rounds
+            )
             payload = {
                 "subquestion": subquestion.question,
                 "provider": provider,
@@ -729,6 +948,16 @@ class DeepResearchOrchestrator:
                 "budget_exhausted": budget_exhausted,
                 "failed_candidate_hints": failed_candidate_hints,
                 "retrieval_rounds": retrieval_rounds,
+                "denylist_enforcement_hit": bool(
+                    aggregate_retrieval_audit.get("denylist_enforcement_hit")
+                ),
+                "benchmark_contamination": bool(
+                    aggregate_retrieval_audit.get("benchmark_contamination")
+                ),
+                "protocol_violation_count": int(
+                    aggregate_retrieval_audit.get("protocol_violation_count") or 0
+                ),
+                "coverage": coverage_status,
             }
             await self._record(trace, stage, status, payload, stage_start, emit)
             return finding, SearchOutcome(
@@ -739,12 +968,48 @@ class DeepResearchOrchestrator:
                 error=payload["error"],
                 tool_attempts=provider_tool_attempts,
                 failed_candidate_hints=failed_candidate_hints,
-                retrieval_audit=self._aggregate_retrieval_rounds(retrieval_rounds),
+                retrieval_audit=aggregate_retrieval_audit,
+                denylist_enforcement_hit=bool(
+                    aggregate_retrieval_audit.get("denylist_enforcement_hit")
+                ),
+                benchmark_contamination=bool(
+                    aggregate_retrieval_audit.get("benchmark_contamination")
+                ),
+                protocol_violations=list(
+                    aggregate_retrieval_audit.get("protocol_violations") or []
+                ),
             )
 
+    def _source_is_relevant_for_subquestion(
+        self,
+        subquestion: SubQuestion,
+        source: Source,
+    ) -> bool:
+        claim = subquestion.question
+        if source_is_relevant_to_claim(claim, source):
+            return True
+        if not subquestion.required_entities:
+            return False
+        quote, overlap = best_evidence_quote(claim, source)
+        if (
+            not quote
+            or overlap < self.citation_checker.minimum_overlap_for_claim(claim)
+        ):
+            return False
+        return any(
+            _source_covers_entity(
+                source,
+                entity,
+                evidence_quotes=[quote],
+                require_substantive_content=False,
+            )
+            for entity in subquestion.required_entities
+        )
+
     def _evidence_items(
-        self, claim: str, sources: list[Source]
+        self, subquestion: SubQuestion, sources: list[Source]
     ) -> list[EvidenceItem]:
+        claim = subquestion.question
         items: list[EvidenceItem] = []
         for source in sources:
             if source.metadata.get("snippet_only") or source.metadata.get(
@@ -755,7 +1020,7 @@ class DeepResearchOrchestrator:
             if (
                 not quote
                 or overlap < self.citation_checker.minimum_overlap_for_claim(claim)
-                or not source_is_relevant_to_claim(claim, source)
+                or not self._source_is_relevant_for_subquestion(subquestion, source)
             ):
                 continue
             items.append(
@@ -807,7 +1072,7 @@ class DeepResearchOrchestrator:
             if anchor_count
             else 0
         )
-        return {
+        result = {
             "round_index": round_index,
             "query": query,
             "candidate_count": int(
@@ -836,6 +1101,28 @@ class DeepResearchOrchestrator:
                 ),
             },
         }
+        protocol_violations = [
+            dict(violation)
+            for violation in (audit.get("protocol_violations") or [])
+            if isinstance(violation, dict)
+        ]
+        if protocol_violations:
+            result.update(
+                {
+                    "denylist_enforcement_hit": True,
+                    "benchmark_contamination": bool(
+                        audit.get("benchmark_contamination")
+                    ),
+                    "blocked_count": int(audit.get("blocked_count") or 0),
+                    "protocol_violation_count": int(
+                        audit.get("protocol_violation_count") or 0
+                    ),
+                    "protocol_violations": protocol_violations,
+                }
+            )
+        elif audit.get("benchmark_contamination"):
+            result["benchmark_contamination"] = True
+        return result
 
     @staticmethod
     def _merge_audit_hints(
@@ -859,13 +1146,39 @@ class DeepResearchOrchestrator:
         errors: Counter[str] = Counter()
         for item in rounds:
             errors.update(item.get("error_classes") or {})
-        return {
+        result = {
             "candidate_count": sum(int(item.get("candidate_count") or 0) for item in rounds),
             "fetchable_count": sum(int(item.get("fetchable_count") or 0) for item in rounds),
             "verified_count": sum(int(item.get("verified_count") or 0) for item in rounds),
             "crawl_attempts": sum(int(item.get("crawl_attempts") or 0) for item in rounds),
             "error_classes": dict(sorted(errors.items())),
         }
+        protocol_violations = [
+            dict(violation)
+            for item in rounds
+            for violation in (item.get("protocol_violations") or [])
+            if isinstance(violation, dict)
+        ]
+        if protocol_violations:
+            result.update(
+                {
+                    "denylist_enforcement_hit": True,
+                    "benchmark_contamination": any(
+                        bool(item.get("benchmark_contamination")) for item in rounds
+                    ),
+                    "blocked_count": sum(
+                        int(item.get("blocked_count") or 0) for item in rounds
+                    ),
+                    "protocol_violation_count": sum(
+                        int(item.get("protocol_violation_count") or 0)
+                        for item in rounds
+                    ),
+                    "protocol_violations": protocol_violations,
+                }
+            )
+        elif any(bool(item.get("benchmark_contamination")) for item in rounds):
+            result["benchmark_contamination"] = True
+        return result
 
     def _summarize_evidence(self, result: ResearchResult) -> str:
         if not result.evidence:

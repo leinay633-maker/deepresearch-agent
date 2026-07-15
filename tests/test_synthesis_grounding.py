@@ -69,6 +69,7 @@ def test_synthesis_rebuilds_uncited_visible_answer_from_cited_claims() -> None:
 
 
 def test_synthesis_discards_answer_facts_outside_checked_claims() -> None:
+    sanitization_audit: dict[str, int | bool] = {}
     answer, claims = _synthesis_from_payload(
         {
             "answer": "San Carlos was founded in 1900 [S1]. Python was created in 1991 [S1].",
@@ -76,9 +77,17 @@ def test_synthesis_discards_answer_facts_outside_checked_claims() -> None:
         },
         allowed_source_ids={"S1"},
         query="When was San Carlos founded?",
+        sanitization_audit=sanitization_audit,
     )
     assert answer == "Python was created in 1991 [S1]"
     assert claims == ["Python was created in 1991 [S1]"]
+    assert sanitization_audit == {
+        "enabled": False,
+        "applied": False,
+        "dropped_uncited_sentence_count": 0,
+        "dropped_uncited_line_count": 0,
+        "dropped_uncited_table_row_count": 0,
+    }
 
     with pytest.raises(ValueError, match="only contain claims"):
         _synthesis_from_payload(
@@ -233,16 +242,24 @@ def test_evidence_abstention_is_a_claim_free_user_language_response() -> None:
     assert "现有来源不足" in json.loads(chinese_answer)["limitations"][0]
 
 
+def test_empty_synthesis_is_an_abstention_only_without_verified_sources() -> None:
+    error = RuntimeError("LLM synthesis response contains no usable claims")
+
+    assert _is_evidence_abstention_error(error) is True
+    assert (
+        _is_evidence_abstention_error(error, has_verified_sources=True) is False
+    )
+
+
 @pytest.mark.parametrize(
     "message",
     [
-        "LLM synthesis response contains no usable claims",
         "LLM synthesis claim is missing a citation ID",
         "LLM synthesis answer is missing source citations",
     ],
 )
-def test_citation_free_synthesis_validation_becomes_an_abstention(message: str) -> None:
-    assert _is_evidence_abstention_error(RuntimeError(message)) is True
+def test_missing_citations_remain_validation_failures(message: str) -> None:
+    assert _is_evidence_abstention_error(RuntimeError(message)) is False
 
 
 class _EvidenceSearchAdapter:
@@ -316,6 +333,13 @@ class _FallbackSynthesisMockLLM(MockLLMProvider):
         self.last_synthesis_context = {
             "synthesis_fallback": True,
             "synthesis_fallback_reason": "fixture structured-output validation failed",
+            "estimated_tokens": 1234,
+            "attempt_ledger": [
+                {
+                    "attempt": 1,
+                    "failure_class": "structured_output_validation",
+                }
+            ],
         }
         claim = "The latest Python 3 release is Python 3.14.6 [S1]"
         cost.add("synthesis", "fallback", claim)
@@ -553,6 +577,13 @@ def test_orchestrator_rejects_synthesis_fallback_when_policy_is_fail() -> None:
     assert synthesizer_event.payload["synthesis_fallback_reason"] == (
         "fixture structured-output validation failed"
     )
+    assert synthesizer_event.payload["context"]["estimated_tokens"] == 1234
+    assert synthesizer_event.payload["context"]["attempt_ledger"] == [
+        {
+            "attempt": 1,
+            "failure_class": "structured_output_validation",
+        }
+    ]
 
 
 def test_orchestrator_preserves_direct_synthesis_error_and_trace_context() -> None:

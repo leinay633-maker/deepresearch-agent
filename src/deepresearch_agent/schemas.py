@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 def utc_now() -> datetime:
@@ -19,6 +19,8 @@ class ResearchBudget(BaseModel):
 
 class ResearchRequest(BaseModel):
     query: str = Field(..., min_length=3)
+    report_depth: Literal["concise", "deep"] = "concise"
+    blocked_source_urls: list[str] = Field(default_factory=list)
     max_researchers: int = Field(default=3, ge=1, le=5)
     max_results_per_researcher: int = Field(default=4, ge=1, le=10)
     llm_provider: str | None = None
@@ -40,13 +42,37 @@ class ResearchRequest(BaseModel):
     fallback_policy: Literal["mock", "degraded", "fail"] | None = None
     expected_format: Literal["text", "markdown", "json"] = "markdown"
 
+    @model_validator(mode="after")
+    def validate_deep_report_format(self) -> "ResearchRequest":
+        if self.report_depth == "deep" and self.expected_format != "markdown":
+            raise ValueError(
+                "report_depth='deep' requires expected_format='markdown'"
+            )
+        return self
+
     def research_budget(self) -> ResearchBudget:
+        if self.report_depth == "deep":
+            return ResearchBudget(
+                max_rounds=max(self.max_rounds, 2),
+                max_tool_calls=max(self.max_tool_calls, 2),
+                deadline_seconds=(
+                    self.deadline_seconds
+                    if self.deadline_seconds is not None
+                    else 300.0
+                ),
+                min_evidence_items=max(self.min_evidence_items, 2),
+            )
         return ResearchBudget(
             max_rounds=self.max_rounds,
             max_tool_calls=self.max_tool_calls,
             deadline_seconds=self.deadline_seconds,
             min_evidence_items=self.min_evidence_items,
         )
+
+    def search_results_per_researcher(self) -> int:
+        if self.report_depth == "deep":
+            return max(self.max_results_per_researcher, 8)
+        return self.max_results_per_researcher
 
 
 class ResearchBrief(BaseModel):
@@ -55,8 +81,17 @@ class ResearchBrief(BaseModel):
     scope: str
     constraints: list[str]
     assumptions: list[str]
+    report_depth: Literal["concise", "deep"] = "concise"
     expected_format: Literal["text", "markdown", "json"] = "markdown"
     generated_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def validate_deep_report_format(self) -> "ResearchBrief":
+        if self.report_depth == "deep" and self.expected_format != "markdown":
+            raise ValueError(
+                "report_depth='deep' requires expected_format='markdown'"
+            )
+        return self
 
 
 class SubQuestion(BaseModel):
@@ -64,6 +99,10 @@ class SubQuestion(BaseModel):
     question: str
     rationale: str
     search_query: str | None = None
+    # Deep-report branches can declare an executable coverage contract.  The
+    # defaults preserve concise-mode and replay compatibility with older plans.
+    required_entities: list[str] = Field(default_factory=list)
+    required_aspects: list[str] = Field(default_factory=list)
 
 
 class Source(BaseModel):

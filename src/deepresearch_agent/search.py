@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any, Awaitable, Callable, Protocol
-from urllib.parse import quote, quote_plus, urlencode, urlsplit, urlunsplit
+from urllib.parse import quote, quote_plus, unquote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from deepresearch_agent.config import Settings
@@ -31,6 +31,8 @@ from deepresearch_agent.url_policy import (
     SafeHTTPError,
     UnsupportedContentTypeError,
     URLPolicyError,
+    canonical_url_identity,
+    url_identity_matches_blocked,
     fetch_text_url,
     no_redirect_urlopen,
     validate_url,
@@ -47,6 +49,21 @@ class SearchError(RuntimeError):
 class BenchmarkContaminationError(SearchError):
     """A public benchmark answer page was discovered during an evaluation run."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str = "content",
+        benchmark_contamination: bool = True,
+        protocol_violation: dict[str, Any] | None = None,
+        retrieval_audit: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.benchmark_contamination = benchmark_contamination
+        self.protocol_violation = protocol_violation
+        self.retrieval_audit = retrieval_audit or {}
+
 
 class SearchEvidenceUnavailableError(SearchError):
     """Search found candidates, but none yielded safely crawled page evidence."""
@@ -61,6 +78,23 @@ class SearchEvidenceUnavailableError(SearchError):
         super().__init__(message)
         self.failed_candidate_hints = failed_candidate_hints
         self.retrieval_audit = retrieval_audit
+
+
+class SearchDeadlineExceeded(TimeoutError):
+    """A search phase exhausted its caller-owned absolute deadline."""
+
+    def __init__(
+        self,
+        message: str = "search deadline exceeded",
+        *,
+        failed_candidate_hints: list[dict[str, Any]] | None = None,
+        retrieval_audit: dict[str, Any] | None = None,
+        tool_attempts: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.failed_candidate_hints = failed_candidate_hints or []
+        self.retrieval_audit = retrieval_audit or {}
+        self.tool_attempts = max(int(tool_attempts), 0)
 
 
 def _crawler_urlopen(request: Request, timeout: float) -> Any:
@@ -95,6 +129,9 @@ class SearchOutcome:
     tool_attempts: int = 0
     failed_candidate_hints: list[dict[str, Any]] = field(default_factory=list)
     retrieval_audit: dict[str, Any] = field(default_factory=dict)
+    denylist_enforcement_hit: bool = False
+    benchmark_contamination: bool = False
+    protocol_violations: list[dict[str, Any]] = field(default_factory=list)
 
 
 class FetchedPage(str):
@@ -198,6 +235,28 @@ def _safe_audit_url(value: Any) -> str:
 def _failed_candidate_hints(sources: list[Source]) -> list[dict[str, Any]]:
     hints: list[dict[str, Any]] = []
     for index, source in enumerate(sources, 1):
+        protocol_violation = source.metadata.get("protocol_violation")
+        if isinstance(protocol_violation, dict):
+            hints.append(
+                {
+                    "title": _safe_audit_text(source.title),
+                    "url_identity_sha256": _safe_audit_text(
+                        protocol_violation.get("url_identity_sha256"), max_chars=64
+                    ),
+                    "query": _safe_audit_text(source.query, max_chars=320),
+                    "provider": _safe_audit_text(source.provider, max_chars=80),
+                    "rank": int(source.metadata.get("search_rank") or index),
+                    "crawl_status": "blocked",
+                    "error_class": "denylist_enforcement",
+                    "protocol_violation": dict(protocol_violation),
+                    "crawl_attempts": int(source.metadata.get("crawl_attempts") or 0),
+                    "actual_model": _safe_audit_text(
+                        source.metadata.get("gateway_model"), max_chars=120
+                    )
+                    or None,
+                }
+            )
+            continue
         if source.metadata.get("extract_status") != "crawl_failed":
             continue
         hints.append(
@@ -212,7 +271,11 @@ def _failed_candidate_hints(sources: list[Source]) -> list[dict[str, Any]]:
                     source.metadata.get("crawl_error_class") or "crawler_error",
                     max_chars=80,
                 ),
-                "crawl_attempts": int(source.metadata.get("crawl_attempts") or 1),
+                "crawl_attempts": (
+                    int(source.metadata["crawl_attempts"])
+                    if "crawl_attempts" in source.metadata
+                    else 1
+                ),
                 "actual_model": _safe_audit_text(
                     source.metadata.get("gateway_model"), max_chars=120
                 )
@@ -231,7 +294,7 @@ def _retrieval_audit(
         for source in candidates
         if source.metadata.get("extract_status") == "crawl_failed"
     )
-    return {
+    audit = {
         "candidate_count": len(candidates),
         "fetchable_count": sum(
             1 for source in candidates if source.url.startswith(("http://", "https://"))
@@ -242,6 +305,22 @@ def _retrieval_audit(
         ),
         "error_classes": dict(sorted(error_classes.items())),
     }
+    protocol_violations = [
+        dict(violation)
+        for source in candidates
+        if isinstance((violation := source.metadata.get("protocol_violation")), dict)
+    ]
+    if protocol_violations:
+        audit.update(
+            {
+                "denylist_enforcement_hit": True,
+                "benchmark_contamination": False,
+                "blocked_count": len(protocol_violations),
+                "protocol_violation_count": len(protocol_violations),
+                "protocol_violations": protocol_violations,
+            }
+        )
+    return audit
 
 
 def _merge_failed_candidate_hints(
@@ -266,13 +345,49 @@ def _merge_retrieval_audits(*audits: dict[str, Any]) -> dict[str, Any]:
     errors: Counter[str] = Counter()
     for audit in valid:
         errors.update(audit.get("error_classes") or {})
-    return {
+    merged = {
         "candidate_count": sum(int(audit.get("candidate_count") or 0) for audit in valid),
         "fetchable_count": sum(int(audit.get("fetchable_count") or 0) for audit in valid),
         "verified_count": sum(int(audit.get("verified_count") or 0) for audit in valid),
         "crawl_attempts": sum(int(audit.get("crawl_attempts") or 0) for audit in valid),
         "error_classes": dict(sorted(errors.items())),
     }
+    protocol_violations = [
+        dict(violation)
+        for audit in valid
+        for violation in (audit.get("protocol_violations") or [])
+        if isinstance(violation, dict)
+    ]
+    if protocol_violations:
+        merged.update(
+            {
+                "denylist_enforcement_hit": True,
+                "benchmark_contamination": False,
+                "blocked_count": sum(
+                    int(audit.get("blocked_count") or 0) for audit in valid
+                ),
+                "protocol_violation_count": sum(
+                    int(audit.get("protocol_violation_count") or 0)
+                    for audit in valid
+                ),
+                "protocol_violations": protocol_violations,
+            }
+        )
+    if any(bool(audit.get("benchmark_contamination")) for audit in valid):
+        merged["benchmark_contamination"] = True
+    return merged
+
+
+def _audit_has_denylist_hit(audit: dict[str, Any]) -> bool:
+    return bool(audit.get("denylist_enforcement_hit"))
+
+
+def _protocol_violations(audit: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        dict(violation)
+        for violation in (audit.get("protocol_violations") or [])
+        if isinstance(violation, dict)
+    ]
 
 
 class MockSearchAdapter:
@@ -434,13 +549,17 @@ class BingRssSearchAdapter:
     def _search_sync(self, query: str, max_results: int, timeout: float) -> list[Source]:
         errors: list[str] = []
         candidates = _bing_query_candidates(query)
+        deadline_at = time.monotonic() + timeout
         for request_attempt, candidate in enumerate(candidates, 1):
+            remaining = deadline_at - time.monotonic()
+            if remaining <= 0:
+                break
             try:
                 sources = self._search_once(
                     candidate,
                     query,
                     max_results,
-                    timeout,
+                    remaining,
                     request_attempt,
                 )
             except SearchError as exc:
@@ -605,16 +724,28 @@ class HtmlTextCrawler:
         self.max_chars = max_chars
         self.max_response_bytes = max_response_bytes
 
-    async def crawl(self, url: str, timeout: float) -> str:
-        return await asyncio.to_thread(self._crawl_sync, url, timeout)
+    async def crawl(
+        self,
+        url: str,
+        timeout: float,
+        *,
+        url_guard: Callable[[str], None] | None = None,
+    ) -> str:
+        return await asyncio.to_thread(self._crawl_sync, url, timeout, url_guard)
 
-    def _crawl_sync(self, url: str, timeout: float) -> FetchedPage:
+    def _crawl_sync(
+        self,
+        url: str,
+        timeout: float,
+        url_guard: Callable[[str], None] | None = None,
+    ) -> FetchedPage:
         response = fetch_text_url(
             url,
             timeout=timeout,
             headers={"User-Agent": "deepresearch-agent/0.1 local interview project"},
             max_response_bytes=self.max_response_bytes,
             opener=_crawler_urlopen,
+            url_guard=url_guard,
         )
         parser = _HtmlTextParser()
         parser.feed(response)
@@ -974,6 +1105,9 @@ class SearchService:
             raise ValueError(f"unknown fallback policy: {fallback_policy}")
         self.gateway_chain = self.primary.name == "gateway-web"
         self.benchmark_source_exclusion = settings.benchmark_source_exclusion
+        self.crawler_concurrency_per_search = max(
+            int(settings.crawler_concurrency_per_search), 1
+        )
         if self.gateway_chain and self.crawler is None:
             raise ValueError("gateway-web requires a configured safe web crawler")
         if self.gateway_chain and self.fallback.name == "mock":
@@ -983,17 +1117,54 @@ class SearchService:
             settings.circuit_breaker_cooldown_seconds,
         )
 
-    async def search(self, query: str, max_results: int) -> SearchOutcome:
+    async def search(
+        self,
+        query: str,
+        max_results: int,
+        *,
+        blocked_source_urls: list[str] | tuple[str, ...] = (),
+        deadline_at: float | None = None,
+    ) -> SearchOutcome:
+        blocked_source_identities = _blocked_source_identities(blocked_source_urls)
         if self.primary.name == self.fallback.name:
-            request_timeout = self._primary_timeout_seconds()
-            sources = await self.fallback.search(query, max_results, request_timeout)
-            enriched = enrich_source_metadata(sources)
+            request_timeout = self._operation_timeout(
+                self._primary_timeout_seconds(), deadline_at=deadline_at
+            )
+            candidates = await asyncio.wait_for(
+                self.fallback.search(query, max_results, request_timeout),
+                timeout=request_timeout,
+            )
+            clean_sources, blocked_sources = self._partition_blocked_sources(
+                candidates,
+                blocked_source_identities=blocked_source_identities,
+                stage="candidate",
+            )
+            self._raise_if_benchmark_contaminated(
+                clean_sources,
+                query=query,
+                stage="candidate_content",
+            )
+            audit_candidates = [*blocked_sources, *clean_sources]
+            audit = _retrieval_audit(audit_candidates, clean_sources)
+            if not clean_sources:
+                raise SearchEvidenceUnavailableError(
+                    f"{self.fallback.name} returned no safely usable candidates",
+                    failed_candidate_hints=_failed_candidate_hints(audit_candidates),
+                    retrieval_audit=audit,
+                )
+            self._assert_final_sources_clean(
+                clean_sources,
+                blocked_source_identities=blocked_source_identities,
+            )
+            enriched = enrich_source_metadata(clean_sources)
             return SearchOutcome(
                 sources=enriched,
                 provider=self.fallback.name,
                 tool_attempts=1,
-                failed_candidate_hints=_failed_candidate_hints(enriched),
-                retrieval_audit=_retrieval_audit(enriched, enriched),
+                failed_candidate_hints=_failed_candidate_hints(audit_candidates),
+                retrieval_audit=audit,
+                denylist_enforcement_hit=_audit_has_denylist_hit(audit),
+                protocol_violations=_protocol_violations(audit),
             )
 
         last_error: str | None = None
@@ -1001,24 +1172,47 @@ class SearchService:
         failed_candidate_hints: list[dict[str, Any]] = []
         retrieval_audit: dict[str, Any] = {}
         if self.breaker.allow():
-            request_timeout = self._primary_timeout_seconds()
+            request_timeout = self._operation_timeout(
+                self._primary_timeout_seconds(), deadline_at=deadline_at
+            )
             service_attempts = 1 if self.gateway_chain else self.settings.max_retries + 1
             for attempt in range(service_attempts):
                 try:
                     await self.rate_limiter.wait()
+                    request_timeout = self._operation_timeout(
+                        self._primary_timeout_seconds(), deadline_at=deadline_at
+                    )
                     tool_attempts += 1
                     sources = await asyncio.wait_for(
                         self.primary.search(query, max_results, request_timeout),
-                        timeout=request_timeout + 0.5,
+                        timeout=request_timeout,
                     )
                     if not sources:
                         raise SearchError(f"{self.primary.name} returned no results")
-                    self._raise_if_benchmark_contaminated(sources, query=query)
                     tool_attempts += self._provider_extra_attempts(sources)
+                    sources, blocked_sources = self._partition_blocked_sources(
+                        sources,
+                        blocked_source_identities=blocked_source_identities,
+                        stage="candidate",
+                    )
+                    self._raise_if_benchmark_contaminated(
+                        sources,
+                        query=query,
+                        stage="candidate_content",
+                    )
                     self.breaker.record_success()
-                    sources = await self._crawl_sources(sources)
-                    tool_attempts += self._crawl_attempt_count(sources)
-                    self._raise_if_benchmark_contaminated(sources, query=query)
+                    crawled_sources = await self._crawl_sources(
+                        sources,
+                        blocked_source_identities=blocked_source_identities,
+                        deadline_at=deadline_at,
+                    )
+                    sources = [*blocked_sources, *crawled_sources]
+                    tool_attempts += self._crawl_attempt_count(crawled_sources)
+                    self._raise_if_benchmark_contaminated(
+                        crawled_sources,
+                        query=query,
+                        stage="crawled_content",
+                    )
                     (
                         sources,
                         crawl_errors,
@@ -1027,6 +1221,24 @@ class SearchService:
                     ) = self._evidence_ready_sources(
                         sources, provider=self.primary.name
                     )
+                    if not sources:
+                        detail = "; ".join(dict.fromkeys(crawl_errors))
+                        if detail:
+                            message = (
+                                f"{self.primary.name} returned only unverified candidates; "
+                                f"safe crawl required: {detail}"
+                                if self.gateway_chain
+                                else f"crawler extraction failed: {detail}"
+                            )
+                        else:
+                            message = (
+                                f"{self.primary.name} returned no safely usable candidates"
+                            )
+                        raise SearchEvidenceUnavailableError(
+                            message,
+                            failed_candidate_hints=current_hints,
+                            retrieval_audit=current_audit,
+                        )
                     if crawl_errors:
                         error = "; ".join(dict.fromkeys(crawl_errors))
                         if not self.gateway_chain and self.fallback_policy != "degraded":
@@ -1054,6 +1266,10 @@ class SearchService:
                         retrieval_audit = _merge_retrieval_audits(
                             retrieval_audit, current_audit
                         )
+                        self._assert_final_sources_clean(
+                            sources,
+                            blocked_source_identities=blocked_source_identities,
+                        )
                         return SearchOutcome(
                             sources=enrich_source_metadata(sources),
                             provider=self.primary.name,
@@ -1062,6 +1278,10 @@ class SearchService:
                             tool_attempts=tool_attempts,
                             failed_candidate_hints=failed_candidate_hints,
                             retrieval_audit=retrieval_audit,
+                            denylist_enforcement_hit=_audit_has_denylist_hit(
+                                retrieval_audit
+                            ),
+                            protocol_violations=_protocol_violations(retrieval_audit),
                         )
                     failed_candidate_hints = _merge_failed_candidate_hints(
                         failed_candidate_hints, current_hints
@@ -1069,17 +1289,34 @@ class SearchService:
                     retrieval_audit = _merge_retrieval_audits(
                         retrieval_audit, current_audit
                     )
+                    self._assert_final_sources_clean(
+                        sources,
+                        blocked_source_identities=blocked_source_identities,
+                    )
                     return SearchOutcome(
                         sources=enrich_source_metadata(sources),
                         provider=self.primary.name,
                         tool_attempts=tool_attempts,
                         failed_candidate_hints=failed_candidate_hints,
                         retrieval_audit=retrieval_audit,
+                        denylist_enforcement_hit=_audit_has_denylist_hit(
+                            retrieval_audit
+                        ),
+                        protocol_violations=_protocol_violations(retrieval_audit),
                     )
                 except BenchmarkContaminationError:
                     # A benchmark answer page is not an ordinary transient search
                     # failure. Do not silently fall through to another provider and
                     # score the case as though retrieval were clean.
+                    raise
+                except SearchDeadlineExceeded as exc:
+                    exc.failed_candidate_hints = _merge_failed_candidate_hints(
+                        failed_candidate_hints, exc.failed_candidate_hints
+                    )
+                    exc.retrieval_audit = _merge_retrieval_audits(
+                        retrieval_audit, exc.retrieval_audit
+                    )
+                    exc.tool_attempts += tool_attempts
                     raise
                 except Exception as exc:
                     last_error = str(exc)
@@ -1092,11 +1329,20 @@ class SearchService:
                         getattr(exc, "retrieval_audit", {}),
                     )
                     tool_attempts += self._exception_extra_attempts(exc)
-                    self.breaker.record_failure()
+                    if not _audit_has_denylist_hit(
+                        getattr(exc, "retrieval_audit", {})
+                    ):
+                        self.breaker.record_failure()
                     if isinstance(exc, GatewayWebSearchNoResultsError):
                         break
+                    if _audit_has_denylist_hit(
+                        getattr(exc, "retrieval_audit", {})
+                    ):
+                        # Retrying the same provider can rediscover the same
+                        # forbidden URL. Move directly to a configured real fallback.
+                        break
                     if attempt < service_attempts - 1:
-                        await self._retry_backoff(attempt)
+                        await self._retry_backoff(attempt, deadline_at=deadline_at)
         else:
             last_error = "circuit breaker open"
 
@@ -1106,6 +1352,14 @@ class SearchService:
                 max_results,
                 primary_error=last_error,
                 tool_attempts=tool_attempts,
+                failed_candidate_hints=failed_candidate_hints,
+                retrieval_audit=retrieval_audit,
+                blocked_source_identities=blocked_source_identities,
+                deadline_at=deadline_at,
+            )
+        if _audit_has_denylist_hit(retrieval_audit):
+            raise SearchEvidenceUnavailableError(
+                last_error or f"{self.primary.name} candidates were denylist-blocked",
                 failed_candidate_hints=failed_candidate_hints,
                 retrieval_audit=retrieval_audit,
             )
@@ -1128,10 +1382,40 @@ class SearchService:
                 retrieval_audit=retrieval_audit,
             )
 
-        tool_attempts += 1
-        fallback_sources = await self.fallback.search(
-            query, max_results, self.settings.request_timeout_seconds
+        fallback_timeout = self._operation_timeout(
+            self.settings.request_timeout_seconds, deadline_at=deadline_at
         )
+        tool_attempts += 1
+        fallback_sources = await asyncio.wait_for(
+            self.fallback.search(query, max_results, fallback_timeout),
+            timeout=fallback_timeout,
+        )
+        fallback_sources, blocked_fallback_sources = self._partition_blocked_sources(
+            fallback_sources,
+            blocked_source_identities=blocked_source_identities,
+            stage="candidate",
+        )
+        self._raise_if_benchmark_contaminated(
+            fallback_sources, query=query, stage="candidate_content"
+        )
+        fallback_audit = _retrieval_audit(
+            [*blocked_fallback_sources, *fallback_sources], fallback_sources
+        )
+        if not fallback_sources:
+            raise SearchEvidenceUnavailableError(
+                f"{self.fallback.name} returned no safely usable candidates",
+                failed_candidate_hints=_failed_candidate_hints(
+                    [*blocked_fallback_sources, *fallback_sources]
+                ),
+                retrieval_audit=_merge_retrieval_audits(
+                    retrieval_audit, fallback_audit
+                ),
+            )
+        self._assert_final_sources_clean(
+            fallback_sources,
+            blocked_source_identities=blocked_source_identities,
+        )
+        retrieval_audit = _merge_retrieval_audits(retrieval_audit, fallback_audit)
         return SearchOutcome(
             sources=enrich_source_metadata(
                 fallback_sources,
@@ -1142,7 +1426,9 @@ class SearchService:
             fallback_used=True,
             error=last_error,
             tool_attempts=tool_attempts,
-            retrieval_audit=_retrieval_audit(fallback_sources, fallback_sources),
+            retrieval_audit=retrieval_audit,
+            denylist_enforcement_hit=_audit_has_denylist_hit(retrieval_audit),
+            protocol_violations=_protocol_violations(retrieval_audit),
         )
 
     async def _search_real_fallback(
@@ -1154,23 +1440,45 @@ class SearchService:
         tool_attempts: int,
         failed_candidate_hints: list[dict[str, Any]],
         retrieval_audit: dict[str, Any],
+        blocked_source_identities: frozenset[tuple[str, str, int | None, str]],
+        deadline_at: float | None,
     ) -> SearchOutcome:
         fallback_error: str | None = None
         try:
             await self.rate_limiter.wait()
+            timeout = self._operation_timeout(
+                self.settings.request_timeout_seconds, deadline_at=deadline_at
+            )
             tool_attempts += 1
-            timeout = self.settings.request_timeout_seconds
             fallback_sources = await asyncio.wait_for(
                 self.fallback.search(query, max_results, timeout),
-                timeout=timeout + 0.5,
+                timeout=timeout,
             )
             if not fallback_sources:
                 raise SearchError(f"{self.fallback.name} returned no results")
-            self._raise_if_benchmark_contaminated(fallback_sources, query=query)
             tool_attempts += self._provider_extra_attempts(fallback_sources)
-            fallback_sources = await self._crawl_sources(fallback_sources)
-            tool_attempts += self._crawl_attempt_count(fallback_sources)
-            self._raise_if_benchmark_contaminated(fallback_sources, query=query)
+            fallback_sources, blocked_fallback_sources = self._partition_blocked_sources(
+                fallback_sources,
+                blocked_source_identities=blocked_source_identities,
+                stage="candidate",
+            )
+            self._raise_if_benchmark_contaminated(
+                fallback_sources,
+                query=query,
+                stage="candidate_content",
+            )
+            crawled_fallback_sources = await self._crawl_sources(
+                fallback_sources,
+                blocked_source_identities=blocked_source_identities,
+                deadline_at=deadline_at,
+            )
+            fallback_sources = [*blocked_fallback_sources, *crawled_fallback_sources]
+            tool_attempts += self._crawl_attempt_count(crawled_fallback_sources)
+            self._raise_if_benchmark_contaminated(
+                crawled_fallback_sources,
+                query=query,
+                stage="crawled_content",
+            )
             (
                 fallback_sources,
                 crawl_errors,
@@ -1181,7 +1489,7 @@ class SearchService:
             )
             fallback_error = "; ".join(dict.fromkeys(crawl_errors)) or None
             if not fallback_sources:
-                detail = fallback_error or "no page body was extracted"
+                detail = fallback_error or "no safely usable candidates remained"
                 raise SearchEvidenceUnavailableError(
                     f"crawler extraction failed: {detail}",
                     failed_candidate_hints=fallback_hints,
@@ -1192,6 +1500,10 @@ class SearchService:
             )
             retrieval_audit = _merge_retrieval_audits(
                 retrieval_audit, fallback_audit
+            )
+            self._assert_final_sources_clean(
+                fallback_sources,
+                blocked_source_identities=blocked_source_identities,
             )
             audit_error = "; ".join(
                 item
@@ -1227,8 +1539,19 @@ class SearchService:
                 tool_attempts=tool_attempts,
                 failed_candidate_hints=failed_candidate_hints,
                 retrieval_audit=retrieval_audit,
+                denylist_enforcement_hit=_audit_has_denylist_hit(retrieval_audit),
+                protocol_violations=_protocol_violations(retrieval_audit),
             )
         except BenchmarkContaminationError:
+            raise
+        except SearchDeadlineExceeded as exc:
+            exc.failed_candidate_hints = _merge_failed_candidate_hints(
+                failed_candidate_hints, exc.failed_candidate_hints
+            )
+            exc.retrieval_audit = _merge_retrieval_audits(
+                retrieval_audit, exc.retrieval_audit
+            )
+            exc.tool_attempts += tool_attempts
             raise
         except Exception as exc:
             failed_candidate_hints = _merge_failed_candidate_hints(
@@ -1241,6 +1564,12 @@ class SearchService:
             )
             tool_attempts += self._exception_extra_attempts(exc)
             fallback_error = str(exc)
+            if deadline_at is not None and time.monotonic() >= deadline_at:
+                raise SearchDeadlineExceeded(
+                    failed_candidate_hints=failed_candidate_hints,
+                    retrieval_audit=retrieval_audit,
+                    tool_attempts=tool_attempts,
+                ) from exc
 
         combined_error = "; ".join(
             item
@@ -1250,6 +1579,12 @@ class SearchService:
             )
             if item
         )
+        if _audit_has_denylist_hit(retrieval_audit):
+            raise SearchEvidenceUnavailableError(
+                combined_error or "all real search candidates were denylist-blocked",
+                failed_candidate_hints=failed_candidate_hints,
+                retrieval_audit=retrieval_audit,
+            )
         if self.fallback_policy == "degraded":
             return SearchOutcome(
                 sources=[],
@@ -1283,15 +1618,191 @@ class SearchService:
         sources: list[Source],
         *,
         query: str,
+        stage: str = "content",
     ) -> None:
-        if not self.benchmark_source_exclusion:
-            return
         for source in sources:
-            reason = _benchmark_contamination_reason(source, query=query)
+            if source.metadata.get("extract_status") == "blocked":
+                continue
+            reason = (
+                _benchmark_content_contamination_reason(source, query=query)
+                if self.benchmark_source_exclusion
+                else None
+            )
             if reason:
-                raise BenchmarkContaminationError(
-                    f"benchmark contamination blocked: {reason}"
+                violation = self._protocol_violation(
+                    source.url,
+                    stage=stage,
+                    reason="benchmark answer content reached retrieval",
                 )
+                audit = {
+                    "benchmark_contamination": True,
+                    "denylist_enforcement_hit": False,
+                    "protocol_violation_count": 1,
+                    "protocol_violations": [violation],
+                }
+                raise BenchmarkContaminationError(
+                    f"benchmark contamination detected: {reason}",
+                    stage=stage,
+                    benchmark_contamination=True,
+                    protocol_violation=violation,
+                    retrieval_audit=audit,
+                )
+
+    def _partition_blocked_sources(
+        self,
+        sources: list[Source],
+        *,
+        blocked_source_identities: frozenset[
+            tuple[str, str, int | None, str]
+        ],
+        stage: str,
+    ) -> tuple[list[Source], list[Source]]:
+        clean: list[Source] = []
+        blocked: list[Source] = []
+        for source in sources:
+            violation = self._url_protocol_violation(
+                source.url,
+                blocked_source_identities=blocked_source_identities,
+                stage=stage,
+            )
+            if violation is None:
+                clean.append(source)
+                continue
+            blocked.append(self._mark_source_blocked(source, violation=violation))
+        return clean, blocked
+
+    def _url_contamination_reason(
+        self,
+        url: str,
+        *,
+        blocked_source_identities: frozenset[
+            tuple[str, str, int | None, str]
+        ],
+    ) -> str | None:
+        if blocked_source_identities and url.startswith(("http://", "https://")):
+            candidate_identity = canonical_url_identity(url)
+            if any(
+                url_identity_matches_blocked(candidate_identity, blocked_identity)
+                for blocked_identity in blocked_source_identities
+            ):
+                return "URL matches this evaluation case's blocked reference source"
+        if self.benchmark_source_exclusion:
+            return _benchmark_url_contamination_reason(url)
+        return None
+
+    @staticmethod
+    def _protocol_violation(
+        url: str,
+        *,
+        stage: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        try:
+            identity = canonical_url_identity(url)
+            serialized_identity = json.dumps(identity, ensure_ascii=True, separators=(",", ":"))
+        except URLPolicyError:
+            serialized_identity = _safe_audit_url(url)
+        return {
+            "type": "BenchmarkContaminationError",
+            "category": "denylist_enforcement",
+            "stage": stage,
+            "action": "blocked_before_evidence",
+            "reason": reason,
+            "blocked_count": 1,
+            "url_identity_sha256": hashlib.sha256(
+                serialized_identity.encode("utf-8")
+            ).hexdigest(),
+        }
+
+    def _url_protocol_violation(
+        self,
+        url: str,
+        *,
+        blocked_source_identities: frozenset[
+            tuple[str, str, int | None, str]
+        ],
+        stage: str,
+    ) -> dict[str, Any] | None:
+        reason = self._url_contamination_reason(
+            url,
+            blocked_source_identities=blocked_source_identities,
+        )
+        if reason is None:
+            return None
+        return self._protocol_violation(url, stage=stage, reason=reason)
+
+    @staticmethod
+    def _mark_source_blocked(
+        source: Source,
+        *,
+        violation: dict[str, Any],
+        crawl_attempts: int = 0,
+    ) -> Source:
+        metadata = {
+            **source.metadata,
+            "extract_status": "blocked",
+            "snippet_only": True,
+            "candidate_only": True,
+            "requires_crawl": False,
+            "verification_status": "denylist_blocked",
+            "degrade_reason": "denylist_enforcement",
+            "protocol_violation": dict(violation),
+            "crawl_attempts": crawl_attempts,
+        }
+        return source.model_copy(update={"content": "", "metadata": metadata})
+
+    def _raise_if_url_contaminated(
+        self,
+        url: str,
+        *,
+        blocked_source_identities: frozenset[
+            tuple[str, str, int | None, str]
+        ],
+        stage: str,
+    ) -> None:
+        violation = self._url_protocol_violation(
+            url,
+            blocked_source_identities=blocked_source_identities,
+            stage=stage,
+        )
+        if violation:
+            raise BenchmarkContaminationError(
+                "benchmark source denylist enforcement blocked a URL before evidence",
+                stage=stage,
+                benchmark_contamination=False,
+                protocol_violation=violation,
+            )
+
+    def _assert_final_sources_clean(
+        self,
+        sources: list[Source],
+        *,
+        blocked_source_identities: frozenset[
+            tuple[str, str, int | None, str]
+        ],
+    ) -> None:
+        for source in sources:
+            violation = self._url_protocol_violation(
+                source.url,
+                blocked_source_identities=blocked_source_identities,
+                stage="evidence",
+            )
+            if violation is None and not source.metadata.get("protocol_violation"):
+                continue
+            violation = violation or dict(source.metadata["protocol_violation"])
+            audit = {
+                "benchmark_contamination": True,
+                "denylist_enforcement_hit": False,
+                "protocol_violation_count": 1,
+                "protocol_violations": [violation],
+            }
+            raise BenchmarkContaminationError(
+                "blocked benchmark source crossed the final evidence boundary",
+                stage="evidence",
+                benchmark_contamination=True,
+                protocol_violation=violation,
+                retrieval_audit=audit,
+            )
 
     @staticmethod
     def _exception_extra_attempts(error: Exception) -> int:
@@ -1312,9 +1823,15 @@ class SearchService:
         list[dict[str, Any]],
         dict[str, Any],
     ]:
+        safe_sources = [
+            source
+            for source in sources
+            if source.metadata.get("extract_status") != "blocked"
+            and not source.metadata.get("protocol_violation")
+        ]
         crawl_errors = [
             str(source.metadata.get("crawl_error_class") or "crawler_error")
-            for source in sources
+            for source in safe_sources
             if source.metadata.get("extract_status") == "crawl_failed"
         ]
         requires_crawl = self.gateway_chain and provider in {
@@ -1322,12 +1839,12 @@ class SearchService:
             self.fallback.name,
         }
         if not requires_crawl:
-            return sources, crawl_errors, _failed_candidate_hints(sources), _retrieval_audit(
-                sources, sources
+            return safe_sources, crawl_errors, _failed_candidate_hints(sources), _retrieval_audit(
+                sources, safe_sources
             )
         evidence_ready = [
             source
-            for source in sources
+            for source in safe_sources
             if source.metadata.get("extract_status") == "ok"
             and source.metadata.get("snippet_only") is False
             and source.metadata.get("crawler") not in {None, "", "none"}
@@ -1351,11 +1868,59 @@ class SearchService:
             return float(timeout)
         return self.settings.request_timeout_seconds
 
-    async def _crawl_sources(self, sources: list[Source]) -> list[Source]:
+    @staticmethod
+    def _operation_timeout(
+        configured_timeout: float,
+        *,
+        deadline_at: float | None,
+    ) -> float:
+        if configured_timeout <= 0:
+            raise ValueError("configured timeout must be positive")
+        if deadline_at is None:
+            return configured_timeout
+        remaining = deadline_at - time.monotonic()
+        if remaining <= 0:
+            raise SearchDeadlineExceeded
+        return min(configured_timeout, remaining)
+
+    def _mark_source_crawl_timeout(
+        self,
+        source: Source,
+        *,
+        crawl_attempts: int,
+    ) -> Source:
+        metadata = {
+            **source.metadata,
+            "search_snippet": source.metadata.get("search_snippet", source.content),
+            "crawler": self.crawler.name if self.crawler is not None else "none",
+            "extract_status": "crawl_failed",
+            "crawler_error": "crawl batch deadline exceeded",
+            "crawl_error_class": "batch_timeout",
+            "crawl_retryable": True,
+            "crawl_attempts": crawl_attempts,
+            "degrade_reason": "batch_timeout",
+            "snippet_only": True,
+            "candidate_only": True,
+            "verification_status": "crawl_failed",
+        }
+        return source.model_copy(update={"metadata": metadata})
+
+    async def _crawl_sources(
+        self,
+        sources: list[Source],
+        *,
+        blocked_source_identities: frozenset[
+            tuple[str, str, int | None, str]
+        ] = frozenset(),
+        deadline_at: float | None = None,
+    ) -> list[Source]:
         if self.crawler is None:
             return sources
 
-        async def crawl_one(source: Source) -> Source:
+        semaphore = asyncio.Semaphore(self.crawler_concurrency_per_search)
+        attempts_by_index: dict[int, int] = {}
+
+        async def crawl_one(index: int, source: Source) -> Source:
             if (
                 source.provider == "mock"
                 or not source.url.startswith(("http://", "https://"))
@@ -1365,70 +1930,178 @@ class SearchService:
             metadata = dict(source.metadata)
             metadata.setdefault("search_snippet", source.content)
             metadata["crawler"] = self.crawler.name
-            for attempt in (1, 2):
-                try:
-                    crawled = await self.crawler.crawl(
-                        source.url,
-                        self.settings.request_timeout_seconds,
-                    )
-                    if isinstance(crawled, FetchedPage):
-                        content = crawled.content
-                        final_url = crawled.final_url
-                        redirect_chain = crawled.redirect_chain
-                    else:
-                        content = str(crawled)
-                        final_url = source.url
-                        redirect_chain = (source.url,)
-                    if not content.strip():
-                        raise SearchError("crawler returned empty content")
-                    # The fetcher validated each redirect target. Preserve the final
-                    # canonical URL so evidence, deduplication and diversity metrics
-                    # do not count several aliases as independent pages.
-                    validate_url(final_url)
-                    metadata.update(
-                        {
-                            "extract_status": "ok",
-                            "content_type": "text/plain",
-                            "snippet_only": False,
-                            "candidate_only": False,
-                            "requires_crawl": False,
-                            "verification_status": "crawled",
-                            "redirect_chain": list(redirect_chain),
-                            "crawl_attempts": attempt,
-                        }
-                    )
-                    return source.model_copy(
-                        update={"url": final_url, "content": content, "metadata": metadata}
-                    )
-                except Exception as exc:  # noqa: BLE001 - classify before bounded retry.
-                    error_info = _classify_crawl_error(exc)
-                    if attempt == 1 and error_info.retryable:
-                        await self._retry_backoff(0)
-                        continue
-                    metadata.update(
-                        {
-                            "extract_status": "crawl_failed",
-                            "crawler_error": str(exc),
-                            "crawl_error_class": error_info.error_class,
-                            "crawl_retryable": error_info.retryable,
-                            "crawl_attempts": attempt,
-                            "degrade_reason": error_info.error_class,
-                            "snippet_only": True,
-                            "candidate_only": True,
-                            "verification_status": "crawl_failed",
-                        }
-                    )
-                    return source.model_copy(update={"metadata": metadata})
+            async with semaphore:
+                for attempt in (1, 2):
+                    attempts_by_index[index] = attempt
+                    try:
+                        crawl_timeout = self._operation_timeout(
+                            self.settings.request_timeout_seconds,
+                            deadline_at=deadline_at,
+                        )
+                        self._raise_if_url_contaminated(
+                            source.url,
+                            blocked_source_identities=blocked_source_identities,
+                            stage="candidate",
+                        )
+                        if isinstance(self.crawler, HtmlTextCrawler) and (
+                            blocked_source_identities or self.benchmark_source_exclusion
+                        ):
+                            crawled = await self.crawler.crawl(
+                                source.url,
+                                crawl_timeout,
+                                url_guard=lambda url: self._raise_if_url_contaminated(
+                                    url,
+                                    blocked_source_identities=blocked_source_identities,
+                                    stage="redirect",
+                                ),
+                            )
+                        else:
+                            # Preserve compatibility with custom two-argument
+                            # crawlers when no pre-request redirect guard is needed.
+                            crawled = await self.crawler.crawl(
+                                source.url,
+                                crawl_timeout,
+                            )
+                        if isinstance(crawled, FetchedPage):
+                            content = crawled.content
+                            final_url = crawled.final_url
+                            redirect_chain = crawled.redirect_chain
+                        else:
+                            content = str(crawled)
+                            final_url = source.url
+                            redirect_chain = (source.url,)
+                        for redirect_url in redirect_chain[1:-1]:
+                            self._raise_if_url_contaminated(
+                                redirect_url,
+                                blocked_source_identities=blocked_source_identities,
+                                stage="redirect",
+                            )
+                        self._raise_if_url_contaminated(
+                            final_url,
+                            blocked_source_identities=blocked_source_identities,
+                            stage="final_url",
+                        )
+                        if not content.strip():
+                            raise SearchError("crawler returned empty content")
+                        # The fetcher validated each redirect target. Preserve the final
+                        # canonical URL so evidence, deduplication and diversity metrics
+                        # do not count several aliases as independent pages.
+                        validate_url(final_url)
+                        metadata.update(
+                            {
+                                "extract_status": "ok",
+                                "content_type": "text/plain",
+                                "snippet_only": False,
+                                "candidate_only": False,
+                                "requires_crawl": False,
+                                "verification_status": "crawled",
+                                "redirect_chain": list(redirect_chain),
+                                "crawl_attempts": attempt,
+                            }
+                        )
+                        return source.model_copy(
+                            update={
+                                "url": final_url,
+                                "content": content,
+                                "metadata": metadata,
+                            }
+                        )
+                    except BenchmarkContaminationError as exc:
+                        if exc.benchmark_contamination:
+                            raise
+                        violation = exc.protocol_violation or self._protocol_violation(
+                            source.url,
+                            stage=exc.stage,
+                            reason="benchmark source denylist enforcement",
+                        )
+                        return self._mark_source_blocked(
+                            source,
+                            violation=violation,
+                            crawl_attempts=attempt,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - classify before bounded retry.
+                        error_info = _classify_crawl_error(exc)
+                        if attempt == 1 and error_info.retryable:
+                            await self._retry_backoff(0, deadline_at=deadline_at)
+                            continue
+                        metadata.update(
+                            {
+                                "extract_status": "crawl_failed",
+                                "crawler_error": str(exc),
+                                "crawl_error_class": error_info.error_class,
+                                "crawl_retryable": error_info.retryable,
+                                "crawl_attempts": attempt,
+                                "degrade_reason": error_info.error_class,
+                                "snippet_only": True,
+                                "candidate_only": True,
+                                "verification_status": "crawl_failed",
+                            }
+                        )
+                        return source.model_copy(update={"metadata": metadata})
 
             raise AssertionError("crawler retry loop exhausted without a result")
 
-        return list(await asyncio.gather(*(crawl_one(source) for source in sources)))
+        tasks = {
+            asyncio.create_task(crawl_one(index, source)): index
+            for index, source in enumerate(sources)
+        }
+        if deadline_at is None:
+            return list(await asyncio.gather(*tasks))
 
-    async def _retry_backoff(self, attempt: int) -> None:
+        remaining = max(deadline_at - time.monotonic(), 0.0)
+        done, pending = await asyncio.wait(tasks, timeout=remaining)
+        results: list[Source | None] = [None] * len(sources)
+        fatal_error: BaseException | None = None
+        for task in done:
+            index = tasks[task]
+            try:
+                results[index] = task.result()
+            except SearchDeadlineExceeded:
+                results[index] = self._mark_source_crawl_timeout(
+                    sources[index],
+                    crawl_attempts=attempts_by_index.get(index, 0),
+                )
+            except BaseException as exc:  # preserve fatal contamination/cancellation.
+                fatal_error = exc
+                break
+
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if fatal_error is not None:
+            raise fatal_error
+        for task in pending:
+            index = tasks[task]
+            results[index] = self._mark_source_crawl_timeout(
+                sources[index],
+                crawl_attempts=attempts_by_index.get(index, 0),
+            )
+        return [
+            result
+            if result is not None
+            else self._mark_source_crawl_timeout(
+                sources[index],
+                crawl_attempts=attempts_by_index.get(index, 0),
+            )
+            for index, result in enumerate(results)
+        ]
+
+    async def _retry_backoff(
+        self,
+        attempt: int,
+        *,
+        deadline_at: float | None = None,
+    ) -> None:
         base_delay = self.settings.search_retry_backoff_seconds
         if base_delay <= 0:
             return
-        await self.retry_sleep(base_delay * (2**attempt))
+        delay = base_delay * (2**attempt)
+        if deadline_at is not None:
+            remaining = deadline_at - time.monotonic()
+            if remaining <= 0 or delay >= remaining:
+                raise SearchDeadlineExceeded
+        await self.retry_sleep(delay)
 
 
 def enrich_source_metadata(
@@ -1754,7 +2427,9 @@ WIKIPEDIA_STOPWORDS = {
 }
 
 _BENCHMARK_PATH_MARKER = re.compile(
-    r"(?:^|[/_\-.])(?:simpleqa|simple-evals?|livedrbench)(?:$|[/_\-.])",
+    r"(?:^|[/_\-.])(?:simpleqa|simple-evals?|livedrbench|"
+    r"deepresearch-bench|deepresearchbench|drb2|deep_research_bench)"
+    r"(?:$|[/_\-.])",
     re.IGNORECASE,
 )
 _BENCHMARK_ANSWER_FIELD = re.compile(
@@ -1763,25 +2438,47 @@ _BENCHMARK_ANSWER_FIELD = re.compile(
 )
 
 
-def _benchmark_contamination_reason(source: Source, *, query: str) -> str | None:
-    """Identify known public benchmark pages before they can become evidence.
-
-    We deliberately do not block GitHub or Hugging Face broadly: legitimate
-    technical documentation remains useful. The policy targets known benchmark
-    paths, plus pages that expose a query together with answer-key fields.
-    """
-
-    parsed = urlsplit(source.url)
-    host = (parsed.hostname or "").lower().removeprefix("www.")
-    path_and_title = f"{parsed.path} {source.title}".lower()
-    if host in {
+_BENCHMARK_DATA_HOSTS = frozenset(
+    {
         "github.com",
         "raw.githubusercontent.com",
         "huggingface.co",
         "hf.co",
         "datasets-server.huggingface.co",
-    } and _BENCHMARK_PATH_MARKER.search(path_and_title):
+    }
+)
+
+
+def _blocked_source_identities(
+    urls: list[str] | tuple[str, ...],
+) -> frozenset[tuple[str, str, int | None, str]]:
+    try:
+        return frozenset(canonical_url_identity(url) for url in urls)
+    except URLPolicyError as exc:
+        raise ValueError(f"invalid blocked source URL: {exc}") from exc
+
+
+def _benchmark_url_contamination_reason(url: str) -> str | None:
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").lower().rstrip(".").removeprefix("www.")
+    marker_target = parsed.path.lower()
+    if host == "datasets-server.huggingface.co":
+        # The dataset identity for HF's rows/parquet endpoints lives in the
+        # query string rather than the path. This is a static benchmark marker
+        # check, distinct from dynamic source canonicalization (which ignores
+        # query and fragment by design).
+        marker_target = f"{marker_target} {unquote(parsed.query).lower()}"
+    if host in _BENCHMARK_DATA_HOSTS and _BENCHMARK_PATH_MARKER.search(marker_target):
         return "known benchmark repository or dataset path"
+    return None
+
+
+def _benchmark_content_contamination_reason(
+    source: Source,
+    *,
+    query: str,
+) -> str | None:
+    """Detect answer-key content that has already crossed the URL filter."""
 
     content = source.content.lower()
     normalized_query = re.sub(r"\s+", " ", query.strip().lower())

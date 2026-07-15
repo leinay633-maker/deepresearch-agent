@@ -364,17 +364,62 @@ Run Control Plane：`src/deepresearch_agent/run_models.py`、`src/deepresearch_a
 代价：评测成本和总时长显著增加；32 题仍不是完整 SimpleQA，双裁判也不是官方真值，分歧和自评仍需人工披露；没有保存原始 HTML 的历史运行无法做严格 extractor A/B。
 面试怎么答：我会主动讲这次纠偏：真正的评测工程不是不断调参让数字上涨，而是先保证数据分布、固定分母、actual model、replay、自评和 `unscored` 都能审计。Kimi thinking 缺失是确定性协议 bug，但“HTML 是最大损耗”目前只有个案证据，不能外推。
 
+## 决策 38：为什么 Deep Research 不能只用“来源数达到阈值”决定停止
+
+背景：我把主评测从 SimpleQA 纠偏为 DeepResearch Bench II 后，首个七国养老金锚点暴露出一个结构性问题：系统虽然并发了 5 个 researcher，但停止条件只看 `min_evidence_items=2`。一次真实运行最终有 7 个来源，却主要覆盖印度尼西亚和越南，七国方案、DB benefit formula 和两张必答表都没有完成；这说明“多来源”不等于“多目标覆盖”。
+可选方案：继续增加轮次和来源数；放松引用后让模型补全缺失内容；把用户任务拆成可执行 coverage contract，并让 Python executor 对覆盖负责。
+最终选择：给 deep plan 的每个 `SubQuestion` 增加向后兼容的 `required_entities` 和 `required_aspects`。planner 必须枚举该分支负责的国家、机构、方案、比较字段或必答维度；researcher 只有证据数量和 coverage 都满足才允许 stop，下一轮 query 只搜索缺失目标。复合多国问题允许一个单国权威页面在通过 lexical evidence 阈值后覆盖对应国家，但不允许未命中任何目标实体的泛化页面进入 evidence。
+理由：覆盖判断由确定性执行器约束，模型负责提出计划和查询，不再让“2 条来源”替代任务完成度；同时最终 claim 仍经过 CitationChecker，没有通过放松引用刷成功率。
+代价：coverage contract 依赖 planner 正确枚举原子目标，字段名或同义词可能造成漏判；2 轮预算也可能在覆盖未完成时正常结束并标记 degraded。它提高的是失败可解释性和检索方向，不代表已经证明报告质量提升。
+面试怎么答：我会说长报告的停止条件必须同时回答“证据够不够”和“用户要求覆盖完没有”。我把后者做成 schema + Python hard gate，而不是只靠 prompt 让模型自觉。
+
+## 决策 39：为什么格式校验失败不能伪装成诚实弃答
+
+背景：DRB II 第四次锚点三次 synthesis 都生成了约 3600 output tokens，但最终 artifact 只有 77 字符和 0 claims。固定 artifact 审计发现，代码把 `claim missing citation`、`answer missing citations` 和 `no usable claims` 都归成“证据不足”，即使已有 verified sources 也返回 execution success 的弃答。
+可选方案：继续把任何空 claim 当诚实弃答；保留无引用长草稿；严格区分证据为空和结构/引用协议失败。
+最终选择：只有“没有 verified source 且没有 usable claim”才允许 evidence abstention；有来源时空 claim，以及任何 missing-citation，都按 synthesis validation failure 处理。`fallback_policy=fail` 会让正式评测失败，不会返回无证据答案；审计只保存最多 500 字符原因和输出 SHA，不落失败长草稿。
+理由：弃答是答案语义，格式失败是执行状态，两者混在一起会虚增 execution success，也会掩盖真正可修复的 schema/prompt 问题。
+代价：正式运行的执行成功率可能下降，但账本更可信；模型偶发格式漂移会被明确暴露，需要依赖 repair 和固定测试继续提高兼容性。
+面试怎么答：我会强调“宁可把协议失败记失败，也不把它包装成安全能力”。诚实弃答必须有可验证前提，不是所有空输出的兜底标签。
+
+## 决策 40：为什么只对一种 Gateway 空文本形状做一次原请求重试
+
+背景：DRB II 第十次 Opus 4.8 锚点在约 154.5 秒后返回 strict actual model 匹配、`stop_reason=end_turn`、唯一空 `text` block、`input_tokens=19,422`、`output_tokens=0` 的完整 Gateway 响应。它既不是 transport timeout，也不是 thinking-only、`max_tokens` 或模型漂移；单次 fail-closed 会丢掉一个更像 provider 瞬时空响应的可恢复机会，但无差别重试所有 no-text 又会重复昂贵长请求并扩大安全边界。
+可选方案：所有 no-text 都不重试；所有 no-text 都重试；只识别已审计的精确形状并在原总重试预算内允许一次原请求 retry。
+最终选择：`llm.py::_chat_json_sync` 只有在 strict model check 已开启、requested/actual model 匹配、`end_turn`、唯一 block type 为单个 `text`、`input_tokens>0`、`output_tokens=0` 时才把下一次请求标为 `retry`。retry 冻结并复用原 model/messages/max_tokens/timeout，不回灌空响应或 thinking；若 retry 返回完整但校验失败，剩余预算最多再做一次 `repair`。thinking-only、`max_tokens`、空/重复/混合 blocks、usage 不完整、model mismatch、timeout 和确定性 4xx 继续单次 fail-closed。
+理由：这把恢复范围绑定到 v10 的真实证据，而不是把“模型没给正文”泛化成可重试错误；状态机的 `initial/retry/repair` 最多三次且服从 `max_retries`，不会重新引入三次相同长请求。失败 usage 和 strict mismatch usage 都进入成本账本，artifact 只保存聚合 ledger、SHA 和 `final_request_kind`，不保存 response/thinking 正文。
+代价：未来 provider 若返回另一种可恢复空响应形状，当前策略仍会拒绝，需要先取得同等级安全证据再扩展；成功请求本身不复制进失败 ledger，而以 `final_request_kind` 标明最终请求类型。Gateway 的 `stop_reason` 只保留协议白名单，未知值统一记 `unknown`；actual model 只接受 exact 或经过真实年月校验的 `YYYYMM` / `YYYYMMDD` 版本后缀，同前缀任意文本、非法年月/日期和日期后追加内容都会 mismatch，并在安全异常/ledger 中记为 `unknown`，避免上游把正文塞进审计字段。
+面试怎么答：我会说这不是普通网络 retry，而是协议级白名单恢复：先用真实 artifact 精确刻画瞬时错误，再做一次原请求重试；任何不满足形状的 no-text 都保持 fail-closed。
+
+## 决策 41：为什么 deep report 只允许 Markdown，且结构行不能承载事实
+
+背景：deep synthesis 为避免把长报告在 `answer` 与 `claims` 中重复生成，固定让模型输出完整 Markdown answer 和空 claims，再由 Python 从可见报告提取带引用事实单元。独立评审发现两个边界：如果允许 deep+text/json，空 claims 没有等价的安全提取契约；如果无条件信任 Markdown 标题和表头，模型可以把事实写进结构行绕过 CitationChecker。
+可选方案：为三种格式各实现一套复杂提取器；继续把所有标题/表头视为无害结构；收窄 deep 为 Markdown，并对结构标签做保守判定。
+最终选择：`ResearchRequest`、`ResearchBrief` 和评测 case 入口都要求 `report_depth=deep` 时 `expected_format=markdown`；concise 仍支持 text/markdown/json。deep sanitizer 与最终 alignment 共用结构标签正向授权：只允许固定通用结构/字段、用户 query 中明确出现的连续主题短语，以及 query 命名实体与已授权主题字段的组合；`universal/full/complete/mandatory` 等断言修饰词只有在 query 明确连续声明时才能成为结构。事实型标题（即使带 citation）删除，事实/带引事实表头直接 fail-closed；具体事实必须放在正文、列表项或表格数据行并带 citation。固定回归同时覆盖 task2+ 两张养老金表的完整列名与另一 DRB 主题的 AI Scaffolding 自定义表头，避免把规则写成单题硬编码。
+理由：当前可信能力就是“结构化 Markdown 报告 + 确定性 claim 提取”，收窄公开契约比声称支持但稳定失败更诚实；正向授权不依赖有限谓词黑名单，能阻止 `Vietnam: Universal private-sector pension coverage` 这类名词化事实绕过，同时保留用户明确要求的多章节与比较表展示能力。
+代价：不能使用结论式标题，也暂不提供 deep text/json；模型若把事实写进表头会触发一次 repair 或正式失败。后续若扩格式，必须分别定义可见事实单元、提取与对齐规则，而不是只改 prompt。
+面试怎么答：我会说长报告格式不是越多越好，关键是每一种格式都必须能证明“用户看到的事实都进入 CitationChecker”。当前先把 Markdown 这一条做成闭环。
+
+## 问题 38：DRB II 第五次锚点暴露宽查询与长请求预算叠加
+
+现象：覆盖契约修复后，第五次 Opus 4.8 七国养老金锚点没有提前误停，但仍未生成报告。Q1/Q3 第二轮 trace 又变成原始长问题前 240 字符；Q2/Q4/Q5 打满 300 秒研究 deadline；synthesis 又连续耗时约 722.6 秒后 read timeout。整题 1104.3 秒、77,623 tokens，`fallback_policy=fail` 正确记执行失败。
+原因：这是三层独立预算问题。第一，coverage follow-up 把全部缺失实体拼成 448–560 字符，`safe_follow_up_query` 因超过 240 直接回退到原问题截断，缺口信息全丢。第二，5 个 researcher、每个最多 8 个候选同时进入默认约 12 线程的 `to_thread` 池；SearchService/HTML redirect/fallback 各自重拿完整 240 秒，外层取消又不能终止已运行线程，最慢候选会拖住整批。第三，deep synthesis 的 `max_retries=2` 对 read timeout 也无差别重试，实际是三次完全相同的 240 秒长请求，而不是内容修复。
+排查：我用 v5 固定 artifact 复现 Q1/Q3 candidate 长度分别 448/560，确认无 URL、注入或相关性问题；Q4 `round_count=0/provider_tool_attempts=0` 但成本账本有大量成功 gateway 请求，说明整批 outcome 前超时会丢部分进度；synthesis 的 `3×240 + 0.8 + 1.6 ≈ 722.4s` 与 trace 的 722.6 秒吻合。
+修复：已完成。查询层先对完整 raw 做安全检查，再按词边界截断并对最终发送片段做相关性校验；检索层传递 absolute deadline/round slice，crawl 并发 2 且保留已完成结果；synthesis 把 transport timeout、精确 empty-text 瞬时错误和内容校验失败分开，分别对应单次 fail-closed、至多一次原请求 retry、至多一次定向 repair。所有修复都保持 denylist、SSRF、重定向凭证隔离、逐 claim 引用和 `fallback_policy=fail`。
+复盘：单独设置“请求超时 240 秒”并不等于端到端有界；只要 provider、redirect、candidate retry、fallback 和模型重试各自重置同一 timeout，组合最坏时间仍可成倍增长。长任务必须传 absolute deadline，并把失败阶段写进 attempt ledger。
+面试可能追问：为什么不直接把 timeout 调大？回答：调大只会把组合爆炸放大。应该先保证预算从上到下单调递减，再针对确实需要长输出的 synthesis 单独给可审计的阶段预算。
+
 # 5 实现细节
 
-Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。默认 deterministic mock planner 会生成 background、evidence、tradeoffs 三类问题，用于离线可复现；DeepSeek planner 会用 JSON mode 生成符合同一 Pydantic schema 的子问题。`ResearchRequest.planner_model` 或 `LLM_PLANNER_MODEL` 可以覆盖 planning stage 的模型名。局限是 planner 还不会根据 researcher 中间结果做 LLM 语义级动态追加子问题。
+Planner：`src/deepresearch_agent/llm.py`。输入是 `ResearchBrief`，输出是 `SubQuestion` 列表。concise 模式保持历史 schema；deep 模式最多 5 个分支，并要求每个分支用 `required_entities / required_aspects` 声明可执行 coverage contract，覆盖报告章节、命名目标、比较字段和必答项。默认 deterministic mock planner 用于离线可复现；Gateway/DeepSeek planner 用结构化 JSON 生成同一 Pydantic schema。`ResearchRequest.planner_model` 或 `LLM_PLANNER_MODEL` 可以覆盖 planning stage 的模型名。局限是 coverage 仍依赖 planner 枚举质量，reflection 也还不是完整的 LLM 语义级动态规划。
 
 DeepSeek Planner 验证：`src/deepresearch_agent/llm.py` 里新增了 `DeepSeekLLMProvider.plan`，第一步先独立验证结构化输出；验证脚本是 `src/deepresearch_agent/validate_deepseek_structured_output.py`，它从环境变量读取 `DEEPSEEK_API_KEY`，用 JSON mode 请求默认 `deepseek-v4-flash`，并用现有 `SubQuestion` Pydantic schema 解析输出。后续步骤再把同一个 provider 扩展到 `create_brief` 和 `synthesize`，避免一次性接太多导致错误边界不清。
 
-DeepSeek Synthesizer 接入：步骤 2 以后，`DeepSeekLLMProvider.create_brief`、`plan`、`synthesize` 都走 DeepSeek JSON mode。CLI 和 API 可以通过 `llm_provider="deepseek"` 或 CLI 参数 `--llm-provider deepseek` 显式启用；默认仍是 mock，保证离线测试不受 API key 影响。当前 synthesis 要求模型输出 `{"answer": "...", "claims": [...]}`，并要求每条 factual claim 使用输入 sources 中已有的 `[Sx]` citation ID。`brief_model`、`planner_model`、`synthesis_model` 会分别覆盖 DeepSeek 请求体中的 `model` 字段；不填时回落到 `llm_model` / `DEEPSEEK_MODEL`。
+DeepSeek Synthesizer 接入：步骤 2 以后，`DeepSeekLLMProvider.create_brief`、`plan`、`synthesize` 都走 DeepSeek JSON mode。CLI 和 API 可以通过 `llm_provider="deepseek"` 或 CLI 参数 `--llm-provider deepseek` 显式启用；默认仍是 mock，保证离线测试不受 API key 影响。concise synthesis 要求模型输出 `{"answer": "...", "claims": [...]}`；deep 只支持 Markdown，要求完整带逐项引用的 answer 和 `claims: []`，再由 Python 从清洗后的正文、列表项和表格数据行确定提取 claims。`brief_model`、`planner_model`、`synthesis_model` 会分别覆盖请求模型；不填时回落到 `llm_model` / provider 默认模型。
 
 OpenAI-compatible LLM Provider：`src/deepresearch_agent/llm.py` 的 `OpenAICompatibleLLMProvider` 复用 DeepSeek provider 的 brief/plan/synthesis JSON prompt 和 schema validation，但 `_post_chat_completions()` 改为读取通用 `base_url`、model 和可选 API key。`orchestrator.py` 里 `llm_provider="openai-compatible"` 或 `openai_compatible` 会构造它；`cli.py`、`benchmark.py`、`deep_research_eval.py` 的 provider choices 也已同步。成本记录不使用 DeepSeek 官方价格，而是用 `OPENAI_COMPATIBLE_INPUT_COST_PER_1M_TOKENS` / `OPENAI_COMPATIBLE_OUTPUT_COST_PER_1M_TOKENS` 这两个显式配置，默认 0。局限是尚未 live 测试任何真实 OpenAI-compatible endpoint。
 
-Researcher：`src/deepresearch_agent/orchestrator.py` 的 `_research_one` 和共享 `src/deepresearch_agent/execution.py`。输入是子问题、预算和 provider，输出是带 `ResearchResult` 的 `Finding`：每轮记录 query、来源数、evidence 数、agent-level tool action 数、provider attempt 数、fallback/degraded 状态和结构化决策。`max_rounds`、`max_tool_calls`、`deadline_seconds`、`min_evidence_items` 都是硬边界；Mock 决策确定性，DeepSeek 决策使用 JSON structured output；Python executor 会校验 stop 是否满足最低 grounded evidence。当前仍由 Python executor 执行搜索，provider 没有声明原生 tool calling。summary 会保留 evidence/gaps/conflicts/termination reason，而不是只取第一条来源的第一句话。
+Researcher：`src/deepresearch_agent/orchestrator.py` 的 `_research_one` 和共享 `src/deepresearch_agent/execution.py`。输入是子问题、预算、coverage contract 和 provider，输出是带 `ResearchResult` 的 `Finding`：每轮记录 query、来源数、evidence 数、coverage、agent-level tool action 数、provider attempt 数、fallback/degraded 状态和结构化决策。`max_rounds`、`max_tool_calls`、`deadline_seconds`、`min_evidence_items` 都是硬边界；Python executor 会同时校验最低 grounded evidence 与 required entities/aspects，缺失时把 follow-up query 聚焦到未覆盖目标。复合多国分支允许单国权威页在通过 lexical evidence 阈值后成为该国证据，泛化页仍拒绝。当前仍由 Python executor 执行搜索，provider 没有声明原生 tool calling。summary 会保留 evidence/gaps/conflicts/termination reason，而不是只取第一条来源的第一句话。
 
 Reflection / Compression Loop：`src/deepresearch_agent/orchestrator.py` 的 `_run_reflection_rounds`、`_compress_findings`、`_reflect_on_evidence`。输入是初始 plan 和 researcher results，输出是可能扩展后的 plan/results。开启 `reflection_enabled` 后，每轮先把 findings 压成短文本写入 `compression.roundN` trace，再根据 fallback_count 和每个 finding 的唯一 source 数是否低于 `reflection_min_sources` 来决定是否追加 `R<N>` 子问题。`run_control.py` 的 researcher 阶段也调用同一个 helper，所以 `/research` 和 `/runs` 语义一致。局限是当前 policy 是启发式，不是 LLM reflection。
 

@@ -86,6 +86,28 @@ def test_load_eval_cases_from_csv_accepts_query_column(tmp_path: Path) -> None:
     assert cases[0]["category"] == "systems"
 
 
+def test_eval_case_parser_rejects_non_markdown_deep_case(tmp_path: Path) -> None:
+    path = tmp_path / "deep-text.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "id": "deep-text",
+                "query": "Produce a detailed comparison report.",
+                "report_depth": "deep",
+                "expected_format": "text",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="report_depth='deep' requires expected_format='markdown'",
+    ):
+        load_eval_cases_from_file(path, "custom")
+
+
 def test_load_eval_cases_applies_offset_to_local_case_files(tmp_path: Path) -> None:
     path = tmp_path / "cases.jsonl"
     path.write_text(
@@ -495,16 +517,22 @@ def test_run_public_eval_with_mock_writes_artifacts(tmp_path: Path) -> None:
     assert summary["config"]["request_timeout_seconds"] == 4.0
     assert summary["config"]["gateway_web_search_timeout_seconds"] == 4.0
     assert summary["config"]["llm_gateway_timeout_seconds"] == 4.0
+    assert summary["config"]["llm_synthesis_timeout_seconds"] == 360.0
     assert summary["config"]["citation_judge_timeout_seconds"] == 4.0
     assert summary["config"]["answer_judge_timeout_seconds"] == 4.0
     assert summary["config"]["settings"]["request_timeout_seconds"] == 4.0
     assert summary["config"]["settings"]["llm_gateway_timeout_seconds"] == 4.0
+    assert summary["config"]["settings"]["llm_synthesis_timeout_seconds"] == 360.0
     assert summary["config"]["settings"]["citation_judge_timeout_seconds"] == 4.0
     assert summary["manifest"]["git_commit_sha"]
     assert summary["manifest"]["dataset_version"].startswith("sha256:")
     assert summary["manifest"]["prompt_bundle_hash"].startswith("sha256:")
     assert summary["manifest"]["llm_provider"] == "mock"
     assert summary["manifest"]["config_snapshot"]["llm_gateway_timeout_seconds"] == 4.0
+    assert (
+        summary["manifest"]["config_snapshot"]["llm_synthesis_timeout_seconds"]
+        == 360.0
+    )
     assert summary["manifest"]["deterministic"] is True
     assert summary["deterministic"] is True
     assert raw_log.exists()

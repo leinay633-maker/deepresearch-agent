@@ -15,7 +15,7 @@ class Settings:
     search_rate_limit_per_second: float = 0.0
     circuit_breaker_failure_threshold: int = 4
     circuit_breaker_cooldown_seconds: float = 10.0
-    max_researchers: int = 3
+    max_researchers: int = 5
     mock_model_name: str = "mock-structured-tool-model"
     mock_input_cost_per_1m_tokens: float = 0.0
     mock_output_cost_per_1m_tokens: float = 0.0
@@ -42,6 +42,9 @@ class Settings:
     llm_gateway_model: str = "claude-4.6-opus"
     llm_gateway_base_url: str = "https://llmapi.bilibili.co"
     llm_gateway_timeout_seconds: float = 120.0
+    # Deep synthesis can emit a 10k-token structured report. Keep its socket
+    # timeout independent from the shorter search/planning request timeout.
+    llm_synthesis_timeout_seconds: float = 360.0
     llm_gateway_thinking_budget_tokens: int = 1024
     # Evaluation runs can require the Gateway to prove it served the requested
     # model, rather than merely trusting the model name in the request body.
@@ -87,6 +90,9 @@ class Settings:
     jina_reader_base_url: str = "https://r.jina.ai/"
     jina_search_base_url: str = "https://s.jina.ai/"
     crawler_max_chars: int = 8000
+    # Keep concurrent deep-report branches from exhausting asyncio's shared
+    # default thread pool with blocking HTML fetches.
+    crawler_concurrency_per_search: int = 2
     mcp_transport: str = "stdio"
     mcp_command: str = ""
     mcp_args: str = ""
@@ -133,7 +139,7 @@ def load_settings() -> Settings:
         search_rate_limit_per_second=_float_env("SEARCH_RATE_LIMIT_PER_SECOND", 0.0),
         circuit_breaker_failure_threshold=_int_env("CIRCUIT_BREAKER_FAILURE_THRESHOLD", 4),
         circuit_breaker_cooldown_seconds=_float_env("CIRCUIT_BREAKER_COOLDOWN_SECONDS", 10.0),
-        max_researchers=_int_env("MAX_RESEARCHERS", 3),
+        max_researchers=_int_env("MAX_RESEARCHERS", 5),
         trace_dir=os.getenv("TRACE_DIR", "logs"),
         trace_exporter=os.getenv("TRACE_EXPORTER", "jsonl").strip().lower() or "jsonl",
         trace_write_enabled=_bool_env("TRACE_WRITE_ENABLED", True),
@@ -179,6 +185,9 @@ def load_settings() -> Settings:
             or "https://llmapi.bilibili.co"
         ),
         llm_gateway_timeout_seconds=_float_env("LLM_GATEWAY_TIMEOUT_SECONDS", 120.0),
+        llm_synthesis_timeout_seconds=_float_env(
+            "LLM_SYNTHESIS_TIMEOUT_SECONDS", 360.0
+        ),
         llm_gateway_thinking_budget_tokens=_int_env(
             "LLM_GATEWAY_THINKING_BUDGET_TOKENS", 1024
         ),
@@ -272,6 +281,9 @@ def load_settings() -> Settings:
         jina_search_base_url=os.getenv("JINA_SEARCH_BASE_URL", "https://s.jina.ai/").strip()
         or "https://s.jina.ai/",
         crawler_max_chars=_int_env("CRAWLER_MAX_CHARS", 8000),
+        crawler_concurrency_per_search=_int_env(
+            "CRAWLER_CONCURRENCY_PER_SEARCH", 2
+        ),
         mcp_transport=os.getenv("MCP_TRANSPORT", "stdio").strip().lower() or "stdio",
         mcp_command=os.getenv("MCP_COMMAND", "").strip(),
         mcp_args=os.getenv("MCP_ARGS", "").strip(),
@@ -286,7 +298,7 @@ def with_request_timeout(
     settings: Settings,
     request_timeout_seconds: float | None,
 ) -> Settings:
-    """Apply one CLI timeout consistently to search, Gateway, and citation judging."""
+    """Apply one CLI timeout to search, non-synthesis Gateway, and judging calls."""
 
     if request_timeout_seconds is None:
         return settings

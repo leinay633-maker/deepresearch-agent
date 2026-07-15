@@ -9,13 +9,13 @@ import pytest
 
 from deepresearch_agent.config import Settings
 from deepresearch_agent.search import (
-    BenchmarkContaminationError,
     BingRssSearchAdapter,
     BraveSearchAdapter,
     HtmlTextCrawler,
     JinaReaderCrawler,
     JinaSearchAdapter,
     SearchError,
+    SearchEvidenceUnavailableError,
     SearxngSearchAdapter,
     TavilySearchAdapter,
     build_search_adapter,
@@ -149,8 +149,11 @@ def test_benchmark_source_exclusion_blocks_known_answer_key_paths() -> None:
         fallback_policy="fail",
     )
 
-    with pytest.raises(BenchmarkContaminationError, match="benchmark contamination"):
+    with pytest.raises(SearchEvidenceUnavailableError) as exc_info:
         asyncio.run(service.search("What year was San Carlos founded?", max_results=1))
+
+    assert exc_info.value.retrieval_audit["denylist_enforcement_hit"] is True
+    assert exc_info.value.retrieval_audit["benchmark_contamination"] is False
 
 
 def test_benchmark_source_exclusion_keeps_non_benchmark_github_docs() -> None:

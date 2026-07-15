@@ -170,10 +170,23 @@ def _passages(text: str, window_chars: int = 1_200, overlap_chars: int = 160) ->
         current: list[str] = []
         current_chars = 0
         for sentence in sentences:
+            if len(sentence) > window_chars:
+                if current:
+                    passages.append(" ".join(current))
+                    current = []
+                    current_chars = 0
+                passages.extend(
+                    _overlapping_windows(
+                        sentence,
+                        window_chars=window_chars,
+                        overlap_chars=overlap_chars,
+                    )
+                )
+                continue
             if current and current_chars + len(sentence) > window_chars:
                 passages.append(" ".join(current))
-                current = current[-1:]
-                current_chars = sum(len(item) for item in current)
+                current = []
+                current_chars = 0
             current.append(sentence)
             current_chars += len(sentence)
         if current:
@@ -181,8 +194,31 @@ def _passages(text: str, window_chars: int = 1_200, overlap_chars: int = 160) ->
         return passages
     if len(text) <= window_chars:
         return [text]
-    step = max(1, window_chars - overlap_chars)
-    return [text[start : start + window_chars] for start in range(0, len(text), step)]
+
+    return _overlapping_windows(
+        text,
+        window_chars=window_chars,
+        overlap_chars=overlap_chars,
+    )
+
+
+def _overlapping_windows(
+    text: str,
+    *,
+    window_chars: int,
+    overlap_chars: int,
+) -> list[str]:
+    """Split one oversized passage into bounded windows with local overlap."""
+
+    if window_chars <= 0:
+        return []
+    overlap = min(max(0, overlap_chars), max(0, window_chars - 1))
+    step = max(1, window_chars - overlap)
+    return [
+        text[start : start + window_chars]
+        for start in range(0, len(text), step)
+        if text[start : start + window_chars].strip()
+    ]
 
 
 def _truncate_to_tokens(text: str, token_limit: int) -> str:

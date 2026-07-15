@@ -28,10 +28,12 @@ class CountingSearchAdapter:
 
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.timeouts: list[float] = []
 
     async def search(self, query: str, max_results: int, timeout: float) -> list[Source]:
-        del max_results, timeout
+        del max_results
         self.calls.append(query)
+        self.timeouts.append(timeout)
         return [
             Source(
                 title="同一份证据",
@@ -324,6 +326,45 @@ def test_timed_out_search_still_consumes_agent_tool_budget() -> None:
     assert next(
         event for event in report.trace_events if event.stage == "run" and event.status == "success"
     ).payload["degraded"] is True
+
+
+def test_researcher_passes_a_bounded_round_slice_to_search_service() -> None:
+    settings = Settings(
+        request_timeout_seconds=4.0,
+        local_retrieval_mode="keyword",
+        max_retries=0,
+    )
+    adapter = CountingSearchAdapter()
+    service = SearchService(
+        adapter,
+        MockSearchAdapter(),
+        settings,
+        fallback_policy="fail",
+    )
+    orchestrator = DeepResearchOrchestrator(
+        settings=settings,
+        search_service=service,
+    )
+    orchestrator.rag = EmptyRag()  # type: ignore[assignment]
+
+    asyncio.run(
+        orchestrator.run(
+            ResearchRequest(
+                query="研究系统如何在预算耗尽时停止搜索并保留证据？",
+                llm_provider="mock",
+                max_researchers=1,
+                max_rounds=2,
+                max_tool_calls=2,
+                deadline_seconds=1.0,
+                min_evidence_items=1,
+                fallback_policy="fail",
+            )
+        )
+    )
+
+    # First of two rounds receives 80% of its half of the global deadline.
+    assert adapter.timeouts
+    assert 0.2 < adapter.timeouts[0] <= 0.45
 
 
 def test_research_deadline_covers_rag_and_decision() -> None:

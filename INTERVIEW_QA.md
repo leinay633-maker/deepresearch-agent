@@ -741,6 +741,50 @@
 2. 如何保存原始 HTML 又不扩大安全风险？
 3. 搜索候选变化怎么控制？
 
+## Q：长报告为什么不能只用“来源数达到 2 条”就停止研究？
+[状态: 待消化]
+标签：Agent / Planning / Coverage
+检索关键词：coverage contract, required entities, early stop
+回答：因为来源数只是数量，不代表任务覆盖。真实 DRB II 七国养老金锚点里，我拿到了 7 个来源，但主要覆盖印度尼西亚和越南，七国方案和两张必答表仍然缺失。后来我给 deep plan 的每个分支增加 `required_entities` 和 `required_aspects`，让 planner 明确该分支负责哪些国家、方案和比较字段；Python executor 只有在证据数量和覆盖都满足时才接受 stop，下一轮查询只聚焦缺失目标。这样不会靠增加无关来源或放松引用制造“完成”。
+关联模块：`schemas.py`, `llm.py`, `orchestrator.py`, `tests/test_coverage_aware_research.py`
+可追问：
+1. planner 漏列 required entity 怎么办？
+2. 同义词和简称如何匹配？
+3. coverage 未完成但预算耗尽怎么呈现？
+
+## Q：为什么 citation 格式失败不能算诚实弃答？
+[状态: 待消化]
+标签：Evaluation / Citation / Failure semantics
+检索关键词：evidence abstention, synthesis validation, fallback policy
+回答：诚实弃答表示“没有足够证据回答”，而 citation 缺失表示“模型没有遵守输出协议”，两者不是同一件事。一次真实锚点中三次 synthesis 都生成了长输出，但因为 claims/citation 校验失败，旧代码最后返回 77 字符空 claims 并记 execution success。我把规则收紧为：只有没有 verified source 且没有 usable claim 才允许 evidence abstention；只要已有来源，空 claims 或 missing citation 都是 validation failure，正式 `fallback_policy=fail` 会失败并保留 bounded reason 与输出 SHA。这样执行成功、弃答和协议失败不会混账。
+关联模块：`llm.py`, `orchestrator.py`, `tests/test_synthesis_grounding.py`
+可追问：
+1. 为什么不保留无引用草稿？
+2. 如何避免错误原因泄露敏感正文？
+3. repair 失败后为什么不降级成 deterministic answer？
+
+## Q：为什么 Gateway 空文本不能一律重试？
+[状态: 待消化]
+标签：LLM Gateway / Failure recovery / Observability
+检索关键词：empty text retry, no_text_content, initial retry repair
+回答：因为“没有可用正文”包含完全不同的失败：thinking-only、`max_tokens`、模型漂移、transport timeout 和 provider 瞬时空 text，恢复策略不能混在一起。真实 DRB II v10 锚点给了一个很精确的形状：actual model 匹配、`end_turn`、唯一空 `text` block、输入 token 大于 0、输出 token 为 0。我只对白名单形状允许一次完整原请求 retry，messages、model、max tokens 和 timeout 全部不变，也不把空响应或 thinking 回灌给模型。actual model 只接受 exact 或有效 `YYYYMM` / `YYYYMMDD` 日期 alias，恶意同前缀文本和非法日期会先 mismatch，审计字段只记 `unknown`。retry 得到完整内容但校验失败时，剩余预算最多再做一次 repair；总请求仍由 `max_retries` 限制。attempt ledger 区分 `initial/retry/repair`，成功 artifact 记录 `final_request_kind`，失败 usage 全计费但不保存正文。
+关联模块：`llm.py`, `llm_gateway.py`, `tests/test_llm_gateway.py`
+可追问：
+1. 为什么两个空 text block 不算同一形状？
+2. retry 成功后如何证明没有回灌空响应？
+3. 如何避免失败 usage 重复计费？
+
+## Q：为什么 deep report 只支持 Markdown？
+[状态: 待消化]
+标签：Synthesis / Citation / Output contract
+检索关键词：deep markdown, structure sanitizer, claim extraction
+回答：因为 deep 模式为了避免长报告在 `answer` 和 `claims` 里生成两份，只让模型生成一次完整 Markdown，`claims` 固定为空，再由 Python 从清洗后的事实句、列表项和表格数据行提取 claims。这个安全闭环目前只为 Markdown 定义，所以我在 `ResearchRequest`、`ResearchBrief` 和评测入口明确拒绝 deep+text/json，concise 三种格式仍兼容。标题和表头也不能偷渡事实：sanitizer 与 alignment 共用正向授权，只允许通用结构/字段、query 中明确连续出现的主题短语和 query 命名实体组合；`universal/full/mandatory` 这类断言修饰词不能由模型任意拼成新结论。事实型标题删除、事实型表头 fail-closed，具体事实必须回到正文或表格数据行并带 `[Sx]`，这样用户可见内容才能全部经过 CitationChecker。
+关联模块：`schemas.py`, `llm.py`, `deep_research_eval.py`, `tests/test_deep_report_mode.py`
+可追问：
+1. 为什么不让带 citation 的标题直接进入 claims？
+2. 如何避免养老金表格列名被误杀？
+3. 以后扩 deep JSON 需要补什么？
+
 ## Q：为什么搜索 snippet 不能作为最终证据？
 [状态: 待消化]
 标签：Search / Citation / 安全
